@@ -3155,6 +3155,37 @@ async def test_post_external_session_status_publishes_session_status(
     assert "response_id" not in published[0][1]
 
 
+async def test_post_external_session_status_omits_unset_driver_generation_from_forward(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lease-free status forwarding retains the legacy runner payload shape."""
+    forwarded: list[dict[str, Any]] = []
+
+    async def capture_forward(
+        _session_id: str,
+        _runner_router: Any,
+        event: dict[str, Any],
+    ) -> None:
+        forwarded.append(event)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        capture_forward,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_status", "data": {"status": "idle"}},
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert len(forwarded) == 1
+    assert "driver_generation" not in forwarded[0]
+
+
 async def test_post_external_session_status_failed_surfaces_output_and_reauth(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

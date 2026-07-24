@@ -21,6 +21,28 @@ ALICE = "alice@example.com"
 BOB = "bob@example.com"
 
 
+def _disconnect_on_next_commit(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Close the DBAPI connection so SQLAlchemy exercises disconnect handling."""
+    original_commit = conversation_store._conv_engine.dialect.do_commit
+    fail_next_commit = True
+
+    def _disconnect(dbapi_connection: Any) -> None:
+        nonlocal fail_next_commit
+        if fail_next_commit:
+            fail_next_commit = False
+            dbapi_connection.driver_connection.close()
+        original_commit(dbapi_connection)
+
+    monkeypatch.setattr(
+        conversation_store._conv_engine.dialect,
+        "do_commit",
+        _disconnect,
+    )
+
+
 def _hold_driver_event_in_process(
     db_uri: str,
     session_id: str,
@@ -171,28 +193,11 @@ def test_driver_acceptance_commit_connection_loss_rolls_back_dispatch(
     """A lost acceptance commit cannot leave an unaudited active dispatch."""
     session_id = conversation_store.create_conversation().id
     conversation_store.acquire_driver_lease(session_id, ALICE, 30)
-    original_commit = conversation_store._conv_engine.dialect.do_commit
-    fail_next_commit = True
+    _disconnect_on_next_commit(conversation_store, monkeypatch)
 
-    def _disconnect_on_commit(dbapi_connection: Any) -> None:
-        nonlocal fail_next_commit
-        if fail_next_commit:
-            fail_next_commit = False
-            raise sa.exc.OperationalError(
-                "COMMIT",
-                {},
-                ConnectionError("simulated connection loss"),
-                connection_invalidated=True,
-            )
-        original_commit(dbapi_connection)
-
-    monkeypatch.setattr(
-        conversation_store._conv_engine.dialect,
-        "do_commit",
-        _disconnect_on_commit,
-    )
-    with pytest.raises(sa.exc.OperationalError, match="simulated connection loss"):
+    with pytest.raises(sa.exc.DBAPIError) as error:
         conversation_store.begin_driver_event(session_id, ALICE, 1, "message")
+    assert error.value.connection_invalidated
 
     dispatch_id = conversation_store.begin_driver_event(session_id, ALICE, 1, "message")
     assert dispatch_id is not None
@@ -218,28 +223,11 @@ def test_driver_completion_commit_connection_loss_remains_fenced_until_retry(
     conversation_store.acquire_driver_lease(session_id, ALICE, 30)
     dispatch_id = conversation_store.begin_driver_event(session_id, ALICE, 1, "message")
     assert dispatch_id is not None
-    original_commit = conversation_store._conv_engine.dialect.do_commit
-    fail_next_commit = True
+    _disconnect_on_next_commit(conversation_store, monkeypatch)
 
-    def _disconnect_on_commit(dbapi_connection: Any) -> None:
-        nonlocal fail_next_commit
-        if fail_next_commit:
-            fail_next_commit = False
-            raise sa.exc.OperationalError(
-                "COMMIT",
-                {},
-                ConnectionError("simulated connection loss"),
-                connection_invalidated=True,
-            )
-        original_commit(dbapi_connection)
-
-    monkeypatch.setattr(
-        conversation_store._conv_engine.dialect,
-        "do_commit",
-        _disconnect_on_commit,
-    )
-    with pytest.raises(sa.exc.OperationalError, match="simulated connection loss"):
+    with pytest.raises(sa.exc.DBAPIError) as error:
         conversation_store.complete_driver_event(session_id, dispatch_id, succeeded=True)
+    assert error.value.connection_invalidated
 
     with pytest.raises(DriverLeaseConflictError, match="dispatch is in progress"):
         conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
