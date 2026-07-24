@@ -1,15 +1,18 @@
 """Project entity — persisted in the ``projects`` table.
 
 A :class:`Project` is a user-defined, owner-private container that groups
-related sessions. It exists independently of its member sessions (it can be
-empty), which is why it is a first-class row rather than the implicit
-``omni_project`` label it supersedes. Session membership lives on the
-conversation's metadata row (``project_id``), not here.
+related sessions and typed resource references. It exists independently of its
+member sessions (it can be empty), which is why it is a first-class row rather
+than the implicit ``omni_project`` label it supersedes. Session membership lives
+on the conversation's metadata row (``project_id``), not here.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
+
+ProjectResourceKind = Literal["repository", "task", "decision", "open_question"]
 
 
 @dataclass
@@ -33,3 +36,20 @@ class Project:
     owner_user_id: str | None
     created_at: int
     updated_at: int | None = None
+
+
+@dataclass
+class ProjectResource:
+    """A typed reference grouped into a project.
+
+    Project resources are intentionally lightweight associations. The source
+    object keeps its own lifecycle; this row only gives the project a stable
+    reference and display title.
+    """
+
+    id: str
+    project_id: str
+    kind: ProjectResourceKind
+    title: str
+    reference: str | None
+    created_at: int

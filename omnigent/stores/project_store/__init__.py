@@ -2,9 +2,9 @@
 
 A project is a user-defined container that groups sessions and exists
 independently of its members (see ``designs/PROJECTS_PRD.md``). This store owns
-the ``projects`` table. Session→project membership lives on the conversation's
-metadata row (``project_id``) and is managed by the conversation store, not
-here.
+the ``projects`` and ``project_resources`` tables. Session→project membership
+lives on the conversation's metadata row (``project_id``) and is managed by the
+conversation store, not here.
 
 Projects have no ACL of their own (PRD §9): every method is scoped by
 ``owner_user_id`` so a caller only ever sees and mutates their own projects.
@@ -12,9 +12,10 @@ Projects have no ACL of their own (PRD §9): every method is scoped by
 
 from __future__ import annotations
 
+import builtins
 from abc import ABC, abstractmethod
 
-from omnigent.entities import Project
+from omnigent.entities import Project, ProjectResource, ProjectResourceKind
 
 
 class ProjectStore(ABC):
@@ -112,4 +113,48 @@ class ProjectStore(ABC):
         :param owner_user_id: The requesting owner.
         :returns: ``True`` if removed; ``False`` if not found / not owned.
         """
+        ...
+
+    @abstractmethod
+    def add_resource(
+        self,
+        resource_id: str,
+        project_id: str,
+        *,
+        owner_user_id: str | None,
+        kind: ProjectResourceKind,
+        title: str,
+        reference: str | None,
+    ) -> ProjectResource | None:
+        """Associate a typed resource with an owned project.
+
+        Returns ``None`` when the project does not exist or is not owned by the
+        caller. The association does not take ownership of the source object.
+        """
+        ...
+
+    @abstractmethod
+    def list_resources(
+        self,
+        project_id: str,
+        *,
+        owner_user_id: str | None,
+        kind: ProjectResourceKind | None = None,
+    ) -> builtins.list[ProjectResource] | None:
+        """List an owned project's resources, optionally filtered by kind.
+
+        Returns ``None`` when the project is absent or not owned; an empty list
+        means the project exists but has no matching resources.
+        """
+        ...
+
+    @abstractmethod
+    def remove_resource(
+        self,
+        project_id: str,
+        resource_id: str,
+        *,
+        owner_user_id: str | None,
+    ) -> bool:
+        """Remove one association from an owned project."""
         ...

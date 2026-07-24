@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
-from sqlalchemy import asc, select
-from sqlalchemy.exc import IntegrityError
+import builtins
+from typing import cast
 
-from omnigent.db.db_models import SqlProject, current_workspace_id
+from sqlalchemy import asc, delete, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from omnigent.db.db_models import SqlProject, SqlProjectResource, current_workspace_id
+from omnigent.db.enum_codecs import decode_project_resource_kind, encode_project_resource_kind
 from omnigent.db.utils import (
     get_or_create_engine,
     make_managed_session_maker,
     now_epoch,
 )
-from omnigent.entities import Project
+from omnigent.entities import Project, ProjectResource, ProjectResourceKind
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.project_store import ProjectStore
 
@@ -46,6 +51,18 @@ def _to_entity(row: SqlProject) -> Project:
     )
 
 
+def _to_resource_entity(row: SqlProjectResource) -> ProjectResource:
+    """Convert a project-resource row to its public entity."""
+    return ProjectResource(
+        id=row.id,
+        project_id=row.project_id,
+        kind=cast(ProjectResourceKind, decode_project_resource_kind(row.kind)),
+        title=row.title,
+        reference=row.reference,
+        created_at=row.created_at,
+    )
+
+
 class SqlAlchemyProjectStore(ProjectStore):
     """
     SQLAlchemy-backed implementation of :class:`ProjectStore`.
@@ -71,7 +88,7 @@ class SqlAlchemyProjectStore(ProjectStore):
 
     def _name_taken(
         self,
-        session,  # type: ignore[no-untyped-def]
+        session: Session,
         *,
         owner_user_id: str | None,
         name: str,
@@ -207,5 +224,79 @@ class SqlAlchemyProjectStore(ProjectStore):
             row = session.get(SqlProject, (current_workspace_id(), project_id))
             if row is None or row.owner_user_id != owner_user_id:
                 return False
+            session.execute(
+                delete(SqlProjectResource).where(
+                    SqlProjectResource.workspace_id == current_workspace_id(),
+                    SqlProjectResource.project_id == project_id,
+                )
+            )
             session.delete(row)
+            return True
+
+    def add_resource(
+        self,
+        resource_id: str,
+        project_id: str,
+        *,
+        owner_user_id: str | None,
+        kind: ProjectResourceKind,
+        title: str,
+        reference: str | None,
+    ) -> ProjectResource | None:
+        """Associate a typed resource with an owned project."""
+        with self._session() as session:
+            project = session.get(SqlProject, (current_workspace_id(), project_id))
+            if project is None or project.owner_user_id != owner_user_id:
+                return None
+            row = SqlProjectResource(
+                id=resource_id,
+                project_id=project_id,
+                kind=encode_project_resource_kind(kind),
+                title=title,
+                reference=reference,
+                created_at=now_epoch(),
+            )
+            session.add(row)
+            session.flush()
+            return _to_resource_entity(row)
+
+    def list_resources(
+        self,
+        project_id: str,
+        *,
+        owner_user_id: str | None,
+        kind: ProjectResourceKind | None = None,
+    ) -> builtins.list[ProjectResource] | None:
+        """List an owned project's resources in stable creation order."""
+        with self._session() as session:
+            project = session.get(SqlProject, (current_workspace_id(), project_id))
+            if project is None or project.owner_user_id != owner_user_id:
+                return None
+            stmt = select(SqlProjectResource).where(
+                SqlProjectResource.workspace_id == current_workspace_id(),
+                SqlProjectResource.project_id == project_id,
+            )
+            if kind is not None:
+                stmt = stmt.where(SqlProjectResource.kind == encode_project_resource_kind(kind))
+            rows = session.execute(
+                stmt.order_by(asc(SqlProjectResource.created_at), asc(SqlProjectResource.id))
+            ).scalars()
+            return [_to_resource_entity(row) for row in rows]
+
+    def remove_resource(
+        self,
+        project_id: str,
+        resource_id: str,
+        *,
+        owner_user_id: str | None,
+    ) -> bool:
+        """Remove one association from an owned project."""
+        with self._session() as session:
+            project = session.get(SqlProject, (current_workspace_id(), project_id))
+            if project is None or project.owner_user_id != owner_user_id:
+                return False
+            resource = session.get(SqlProjectResource, (current_workspace_id(), resource_id))
+            if resource is None or resource.project_id != project_id:
+                return False
+            session.delete(resource)
             return True
