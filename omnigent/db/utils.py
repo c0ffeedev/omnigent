@@ -341,10 +341,21 @@ def get_or_create_conversation_engine(conv_uri: str) -> Engine:
 
 
 def _ensure_conversation_tables(engine: Engine) -> None:
-    """Create AP tables (conversations, conversation_items, conversation_labels) if absent."""
+    """Create and minimally upgrade tables owned by the separate AP database."""
     from omnigent.db.db_models import ConversationBase
 
     ConversationBase.metadata.create_all(bind=engine, checkfirst=True)
+    # Split-DB deployments do not run the Omnigent Alembic chain against the AP
+    # database. create_all cannot add columns to an existing table, so apply
+    # additive AP-schema upgrades explicitly.
+    inspector = inspect(engine)
+    if "conversation_items" in inspector.get_table_names() and "driver_generation" not in {
+        column["name"] for column in inspector.get_columns("conversation_items")
+    }:
+        with engine.begin() as connection:
+            connection.execute(
+                text("ALTER TABLE conversation_items ADD COLUMN driver_generation INTEGER")
+            )
     ensure_fts_table(engine)
 
 

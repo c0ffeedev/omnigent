@@ -312,6 +312,16 @@ class ConversationStore(ABC):
         """
         raise NotImplementedError
 
+    def accept_driver_event(
+        self,
+        session_id: str,
+        actor_user_id: str,
+        generation: int | None,
+        event_type: str,
+    ) -> SessionDriverLease | None:
+        """Atomically fence and durably accept a human turn/control event."""
+        raise NotImplementedError
+
     def acquire_driver_lease(
         self,
         session_id: str,

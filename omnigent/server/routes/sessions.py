@@ -9842,6 +9842,24 @@ async def _dispatch_session_event_to_runner(
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
+    # Linearize ownership immediately before persistence/enqueue. The earlier
+    # route check is fail-fast only; a takeover may happen during policy or
+    # routing work.
+    accept_driver_event = getattr(conversation_store, "accept_driver_event", None)
+    if created_by is not None and _requires_driver_fence(body) and accept_driver_event is not None:
+        try:
+            await asyncio.to_thread(
+                accept_driver_event,
+                session_id,
+                created_by,
+                body.driver_generation,
+                body.type,
+            )
+        except NotImplementedError:
+            pass
+        except DriverLeaseConflictError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+
     if body.type == "message" and _is_native_terminal_session(conv):
         # Validate before touching the runner. The ensure probe is only
         # for syntactically valid user messages; assistant/system-shaped
@@ -20669,19 +20687,40 @@ def create_sessions_router(
         # expired/released lease requires reacquisition and a current generation.
         if _requires_driver_fence(body):
             actor_user_id = user_id or RESERVED_USER_PUBLIC
+            validate_driver_lease = getattr(conversation_store, "validate_driver_lease", None)
             try:
-                await asyncio.to_thread(
-                    conversation_store.validate_driver_lease,
-                    session_id,
-                    actor_user_id,
-                    body.driver_generation,
-                )
+                if validate_driver_lease is not None:
+                    await asyncio.to_thread(
+                        validate_driver_lease,
+                        session_id,
+                        actor_user_id,
+                        body.driver_generation,
+                    )
             except NotImplementedError:
                 # Alternate stores that predate leases retain legacy input
                 # behavior, matching the snapshot's optional lease projection.
                 pass
             except DriverLeaseConflictError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+
+        async def _accept_driver_fence() -> None:
+            if not _requires_driver_fence(body):
+                return
+            accept_driver_event = getattr(conversation_store, "accept_driver_event", None)
+            try:
+                if accept_driver_event is not None:
+                    await asyncio.to_thread(
+                        accept_driver_event,
+                        session_id,
+                        user_id or RESERVED_USER_PUBLIC,
+                        body.driver_generation,
+                        body.type,
+                    )
+            except NotImplementedError:
+                pass
+            except DriverLeaseConflictError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+
         # ── Policy evaluation (path-agnostic) ────────────────
         # Evaluate policies BEFORE persistence/runner forwarding so
         # enforcement fires on both paths. On DENY, persist the
@@ -20833,6 +20872,7 @@ def create_sessions_router(
             return {"verdict": "allow"}
 
         if body.type == _INTERRUPT_TYPE:
+            await _accept_driver_fence()
             _publish_interrupted(session_id)
             # Fence the cancelled turn (see _interrupt_fenced_sessions).
             _interrupt_fenced_sessions.add(session_id)
@@ -20868,6 +20908,7 @@ def create_sessions_router(
             await _require_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
+            await _accept_driver_fence()
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
             # Harness-agnostic forward: the runner kills the external
@@ -20944,6 +20985,7 @@ def create_sessions_router(
                 pass
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
+            await _accept_driver_fence()
             # Deliver the verdict through the shared resolver: it
             # sets any server-side harness Future (owner-checked),
             # clears the sidebar badge, and forwards
@@ -20995,6 +21037,7 @@ def create_sessions_router(
             )
             return {"queued": False, "elicitation_id": elicit_id}
         if body.type == _COMPACT_TYPE:
+            await _accept_driver_fence()
             # Unified control dispatch (designs/CLAUDE_NATIVE.md
             # "Control events dispatch on the runner"): forward /compact
             # to the bound runner first, regardless of harness. The
@@ -21312,6 +21355,7 @@ def create_sessions_router(
             )
             return {"queued": False, "child_session_id": child_id}
         if body.type == "function_call_output":
+            await _accept_driver_fence()
             # A client-side tool's result tunneling back to a parked turn.
             # The harness scaffold resolves the parked tool Future on a
             # ``tool_result`` event (ToolResultEvent {call_id, output}), so
@@ -23245,13 +23289,16 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+    get_driver_lease = getattr(conv_store, "get_driver_lease", None)
     try:
-        raw_driver_lease = await asyncio.to_thread(conv_store.get_driver_lease, session_id)
-        driver_lease = (
-            raw_driver_lease if isinstance(raw_driver_lease, SessionDriverLease) else None
+        raw_driver_lease = (
+            await asyncio.to_thread(get_driver_lease, session_id)
+            if get_driver_lease is not None
+            else None
         )
     except NotImplementedError:
-        driver_lease = None
+        raw_driver_lease = None
+    driver_lease = raw_driver_lease if isinstance(raw_driver_lease, SessionDriverLease) else None
     root_id = conv.root_conversation_id or conv.id
     current_presence = presence.presence_state(root_id, conv.id)
     return _build_session_response(

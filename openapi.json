@@ -3446,6 +3446,7 @@
             "session.child_session.updated": "#/components/schemas/SessionChildSessionUpdatedEvent",
             "session.collaboration_mode": "#/components/schemas/SessionCollaborationModeEvent",
             "session.created": "#/components/schemas/SessionCreatedEvent",
+            "session.driver_lease": "#/components/schemas/SessionDriverLeaseEvent",
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
@@ -3522,6 +3523,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionPresenceEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionDriverLeaseEvent"
           },
           {
             "$ref": "#/components/schemas/SessionResourceCreatedEvent"
@@ -3867,6 +3871,49 @@
           "child_session_id"
         ],
         "title": "SessionCreatedEvent",
+        "type": "object"
+      },
+      "SessionDriverLeaseEvent": {
+        "description": "The authoritative driver lease changed; clients replace local state.",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "driver_lease": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DriverLeaseResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.driver_lease",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "driver_lease"
+        ],
+        "title": "SessionDriverLeaseEvent",
         "type": "object"
       },
       "SessionForkRequest": {

@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import sqlalchemy as sa
 
 from omnigent.stores.conversation_store import DriverLeaseConflictError
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -52,6 +53,7 @@ def test_driver_lease_lifecycle_is_generation_fenced(
     reacquired = conversation_store.acquire_driver_lease(session_id, ALICE, 30)
     assert reacquired.generation == 3
 
+
 def test_expiry_fences_old_holder_and_allows_takeover(
     conversation_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
@@ -69,6 +71,44 @@ def test_expiry_fences_old_holder_and_allows_takeover(
     reacquired = conversation_store.acquire_driver_lease(session_id, BOB, 30)
     assert reacquired.generation == 2
     assert reacquired.holder_user_id == BOB
+
+
+def test_acceptance_rechecks_generation_after_takeover(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A takeover between an early check and acceptance fences stale work."""
+    session_id = conversation_store.create_conversation().id
+    conversation_store.acquire_driver_lease(session_id, ALICE, 30)
+
+    conversation_store.validate_driver_lease(session_id, ALICE, 1)
+    conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
+
+    with pytest.raises(DriverLeaseConflictError):
+        conversation_store.accept_driver_event(session_id, ALICE, 1, "message")
+    accepted = conversation_store.accept_driver_event(session_id, BOB, 2, "message")
+    assert accepted is not None
+    assert accepted.generation == 2
+
+
+def test_leases_use_conversation_database_in_split_db_mode(tmp_path) -> None:
+    """Lease fencing and accepted inputs share the AP transaction database."""
+    meta_uri = f"sqlite:///{tmp_path / 'meta.db'}"
+    conversation_uri = f"sqlite:///{tmp_path / 'conversation.db'}"
+    store = SqlAlchemyConversationStore(meta_uri, conversation_uri)
+    session_id = store.create_conversation().id
+
+    acquired = store.acquire_driver_lease(session_id, ALICE, 30)
+    accepted = store.accept_driver_event(session_id, ALICE, acquired.generation, "message")
+
+    assert accepted == acquired
+    inspector = sa.inspect(sa.create_engine(conversation_uri))
+    assert "session_driver_leases" in inspector.get_table_names()
+    assert "session_driver_events" in inspector.get_table_names()
+    assert "driver_generation" in {
+        column["name"] for column in inspector.get_columns("conversation_items")
+    }
+
+
 def test_concurrent_acquire_has_one_winner_across_store_instances(db_uri: str) -> None:
     """Two replicas racing an absent lease cannot both become generation one."""
     first = SqlAlchemyConversationStore(db_uri)

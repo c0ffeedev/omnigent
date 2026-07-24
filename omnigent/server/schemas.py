@@ -3411,6 +3411,14 @@ class SessionPresenceEvent(_SSEEventBase):
     viewers: list[PresenceViewer]
 
 
+class SessionDriverLeaseEvent(_SSEEventBase):
+    """The authoritative driver lease changed; clients replace local state."""
+
+    type: Literal["session.driver_lease"]
+    conversation_id: str
+    driver_lease: DriverLeaseResponse | None
+
+
 class ElicitationRequestParams(BaseModel):
     """
     Inner ``params`` block of a :class:`ElicitationRequestEvent`.
@@ -4078,6 +4086,7 @@ ServerStreamEvent = Annotated[
     | SessionCreatedEvent
     | SessionSupersededEvent
     | SessionPresenceEvent
+    | SessionDriverLeaseEvent
     # ── Transient (SSE-only) — session resource lifecycle ─────
     | SessionResourceCreatedEvent
     | SessionResourceDeletedEvent
