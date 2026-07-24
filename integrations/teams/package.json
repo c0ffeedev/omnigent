@@ -20,6 +20,7 @@
   "dependencies": {
     "@microsoft/teams.api": "2.0.14",
     "@microsoft/teams.apps": "2.0.14",
+    "@microsoft/teams.common": "2.0.14",
     "better-sqlite3": "12.11.1"
   },
   "devDependencies": {

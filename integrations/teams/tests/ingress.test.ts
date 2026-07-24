@@ -14,6 +14,7 @@ import { ActivityDedupeStore } from "../src/dedupe.js";
 
 const appId = "11111111-1111-4111-8111-111111111111";
 const tenantId = "22222222-2222-4222-8222-222222222222";
+const objectId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const issuer = "https://api.botframework.com";
 const serviceUrl = "https://smba.trafficmanager.net/amer/";
 const kid = "mock-channel-key";
@@ -48,7 +49,7 @@ function body(overrides: Record<string, unknown> = {}) {
     id: `activity-${Math.random()}`,
     channelId: "msteams",
     serviceUrl,
-    from: { id: "sender-1", aadObjectId: "object-1" },
+    from: { id: "sender-1", aadObjectId: objectId },
     recipient: { id: `28:${appId}` },
     conversation: { id: "conversation-1", conversationType: "personal", tenantId },
     channelData: { tenant: { id: tenantId } },
@@ -91,6 +92,7 @@ async function request(
   authToken: string | undefined,
   activity = body(),
   client?: NonNullable<TeamsAppOptions["client"]>,
+  logger?: TeamsAppOptions["logger"],
 ) {
   const dedupe = new ActivityDedupeStore(config.dedupeDatabase, {
     maxRecords: config.dedupeMaxRecords,
@@ -103,6 +105,7 @@ async function request(
       tokenIssuer: issuer,
     },
     client,
+    logger,
   });
   await app.initialize();
   try {
@@ -177,7 +180,7 @@ describe("authenticated Teams ingress", () => {
       activityId: id,
       botAppId: appId,
       conversationId: "conversation-1",
-      senderId: "sender-1",
+      senderId: objectId,
       tenantId,
     })).toMatchObject({ receipt: "reply-1", state: "delivered" });
     expect(persisted.count()).toBe(1);
@@ -205,7 +208,7 @@ describe("authenticated Teams ingress", () => {
       activityId: id,
       botAppId: appId,
       conversationId: "conversation-1",
-      senderId: "sender-1",
+      senderId: objectId,
       tenantId,
     })).toMatchObject({ attemptCount: 2, receipt: "reply-1", state: "delivered" });
     persisted.close();
@@ -227,11 +230,60 @@ describe("authenticated Teams ingress", () => {
 
   it.each([
     ["missing activity type", body({ type: undefined })],
+    ["missing service URL", body({ serviceUrl: undefined })],
+    ["missing conversation tenant", body({ conversation: { id: "conversation-1", conversationType: "personal" } })],
+    ["missing channel tenant", body({ channelData: {} })],
     ["disallowed tenant", body({ conversation: { id: "conversation-1", conversationType: "personal", tenantId: "33333333-3333-4333-8333-333333333333" }, channelData: { tenant: { id: "33333333-3333-4333-8333-333333333333" } } })],
     ["group scope", body({ conversation: { id: "conversation-1", conversationType: "groupChat", tenantId } })],
     ["wrong recipient app", body({ recipient: { id: "28:44444444-4444-4444-8444-444444444444" } })],
     ["missing sender identity", body({ from: { id: "sender-1" } })],
+    ["malformed sender object ID", body({ from: { id: "sender-1", aadObjectId: "not-a-guid" } })],
+    ["unprefixed recipient app", body({ recipient: { id: appId } })],
   ])("fails closed for %s", async (_name, activity) => {
     expect((await request(token(), activity)).status).toBeGreaterThanOrEqual(400);
+  });
+
+  it("does not accept authorization from forwarding headers", async () => {
+    const dedupe = new ActivityDedupeStore(config.dedupeDatabase, {
+      maxRecords: config.dedupeMaxRecords,
+      retentionDays: config.dedupeRetentionDays,
+    });
+    const app = createTeamsApp(config, dedupe, {
+      cloud: {
+        ...PUBLIC,
+        openIdMetadataUrl: `${baseUrl}/openidconfiguration`,
+        tokenIssuer: issuer,
+      },
+    });
+    await app.initialize();
+    try {
+      expect(await app.server.handleRequest({
+        body: body(),
+        headers: { "x-forwarded-authorization": `Bearer ${token()}` },
+      })).toMatchObject({ status: 401 });
+    } finally {
+      dedupe.close();
+    }
+  });
+
+  it("redacts activity bodies and credentials from SDK log arguments", async () => {
+    const entries: unknown[][] = [];
+    const logger: NonNullable<TeamsAppOptions["logger"]> = {
+      child: () => logger,
+      debug: (...args: unknown[]) => entries.push(args),
+      error: (...args: unknown[]) => entries.push(args),
+      info: (...args: unknown[]) => entries.push(args),
+      log: (_level, ...args: unknown[]) => entries.push(args),
+      trace: (...args: unknown[]) => entries.push(args),
+      warn: (...args: unknown[]) => entries.push(args),
+    };
+    const marker = "sensitive-message-marker";
+    const credential = token();
+
+    await request(credential, body({ text: marker }), undefined, logger);
+
+    const logged = JSON.stringify(entries);
+    expect(logged).not.toContain(marker);
+    expect(logged).not.toContain(credential);
   });
 });
