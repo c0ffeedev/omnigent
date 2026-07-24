@@ -3005,3 +3005,240 @@ async def test_stream_presence_spans_subagent_conversations(
         await asyncio.gather(alice_task, return_exceptions=True)
         await root_collector.stop()
         await child_collector.stop()
+
+
+async def test_driver_lease_routes_authorize_fence_and_snapshot(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lease APIs enforce editor/manager roles and fence message submission."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    class _Runner:
+        async def post(self, path: str, **_: Any) -> httpx.Response:
+            return httpx.Response(202, request=httpx.Request("POST", f"http://runner{path}"))
+
+    async def _runner(*_: Any, **__: Any) -> _Runner:
+        return _Runner()
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
+
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="alice@example.com",
+        target_user="bob@example.com",
+        level=LEVEL_EDIT,
+    )
+    assert grant.status_code == 200
+    alice_headers = {"X-Forwarded-Email": "alice@example.com"}
+    bob_headers = {"X-Forwarded-Email": "bob@example.com"}
+
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers=alice_headers,
+    )
+    assert acquired.status_code == 200, acquired.text
+    assert acquired.json()["generation"] == 1
+    assert acquired.json()["holder_user_id"] == "alice@example.com"
+
+    conflict = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers=bob_headers,
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["details"]["driver_lease"] == acquired.json()
+    forbidden_takeover = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30, "force": True},
+        headers=bob_headers,
+    )
+    assert forbidden_takeover.status_code == 403
+
+    message = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "lease fenced"}],
+        },
+    }
+    missing_generation = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=message,
+        headers=alice_headers,
+    )
+    assert missing_generation.status_code == 409
+    wrong_holder = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={**message, "driver_generation": 1},
+        headers=bob_headers,
+    )
+    assert wrong_holder.status_code == 409
+
+    accepted = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={**message, "driver_generation": 1},
+        headers=alice_headers,
+    )
+    assert accepted.status_code == 202, accepted.text
+    items = SqlAlchemyConversationStore(db_uri).list_items(session_id).data
+    assert items[-1].created_by == "alice@example.com"
+    assert items[-1].driver_generation == 1
+
+    manage_grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="alice@example.com",
+        target_user="bob@example.com",
+        level=LEVEL_MANAGE,
+    )
+    assert manage_grant.status_code == 200
+    takeover = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30, "force": True},
+        headers=bob_headers,
+    )
+    assert takeover.status_code == 200, takeover.text
+    assert takeover.json()["generation"] == 2
+    assert takeover.json()["holder_user_id"] == "bob@example.com"
+
+    stale = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={**message, "driver_generation": 1},
+        headers=alice_headers,
+    )
+    assert stale.status_code == 409
+    snapshot = await auth_client.get(
+        f"/v1/sessions/{session_id}",
+        headers=alice_headers,
+    )
+    assert snapshot.status_code == 200
+    assert snapshot.json()["driver_lease"]["generation"] == 2
+    assert snapshot.json()["driver_lease"]["holder_user_id"] == "bob@example.com"
+
+    handoff = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/handoff",
+        json={
+            "generation": 2,
+            "holder_user_id": "alice@example.com",
+            "ttl_seconds": 30,
+        },
+        headers=alice_headers,
+    )
+    assert handoff.status_code == 200, handoff.text
+    assert handoff.json()["generation"] == 3
+    released = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/release",
+        json={"generation": 3},
+        headers=alice_headers,
+    )
+    assert released.status_code == 200, released.text
+
+    history = SqlAlchemyConversationStore(db_uri).list_items(session_id).data
+    lease_events = [
+        item
+        for item in history
+        if item.type == "resource_event"
+        and getattr(item.data, "resource_type", None) == "driver_lease"
+    ]
+    assert [getattr(item.data, "event_type", None) for item in lease_events] == [
+        "session.driver_lease.acquired",
+        "session.driver_lease.taken_over",
+        "session.driver_lease.handed_off",
+        "session.driver_lease.released",
+    ]
+    assert [item.driver_generation for item in lease_events] == [1, 2, 3, 3]
+
+
+async def test_expired_driver_lease_takeover_is_audited_in_session_history(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lease acquired after expiry records a durable takeover history item."""
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="alice@example.com",
+        target_user="bob@example.com",
+        level=LEVEL_EDIT,
+    )
+    assert grant.status_code == 200
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 100)
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 5},
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert acquired.status_code == 200, acquired.text
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 105)
+    takeover = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+    assert takeover.status_code == 200, takeover.text
+    assert takeover.json()["generation"] == 2
+
+    history = SqlAlchemyConversationStore(db_uri).list_items(session_id).data
+    lease_events = [
+        getattr(item.data, "event_type", None)
+        for item in history
+        if item.type == "resource_event"
+        and getattr(item.data, "resource_type", None) == "driver_lease"
+    ]
+    assert lease_events == [
+        "session.driver_lease.acquired",
+        "session.driver_lease.taken_over",
+    ]
+
+
+async def test_presence_heartbeat_is_advisory_and_root_isolated(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Heartbeats appear in snapshots but cannot acquire driver authority."""
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    first_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    second_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    headers = {"X-Forwarded-Email": "alice@example.com"}
+
+    heartbeat = await auth_client.post(
+        f"/v1/sessions/{first_id}/presence/heartbeat",
+        json={"ttl_seconds": 60},
+        headers=headers,
+    )
+    assert heartbeat.status_code == 200
+    assert heartbeat.json()["active_user_ids"] == ["alice@example.com"]
+
+    first_snapshot = await auth_client.get(f"/v1/sessions/{first_id}", headers=headers)
+    second_snapshot = await auth_client.get(f"/v1/sessions/{second_id}", headers=headers)
+    assert first_snapshot.json()["presence"]["active_user_ids"] == ["alice@example.com"]
+    assert second_snapshot.json()["presence"]["active_user_ids"] == []
+    assert first_snapshot.json()["driver_lease"] is None
+
+
+async def test_presence_heartbeat_omits_local_single_user_sentinel(
+    local_auth_client: httpx.AsyncClient,
+) -> None:
+    """Advisory presence never renders the reserved local identity as a user."""
+    agent = await create_test_agent(local_auth_client, user=None)
+    session_id = (await _create_session_as(local_auth_client, agent["id"], None))["id"]
+
+    heartbeat = await local_auth_client.post(
+        f"/v1/sessions/{session_id}/presence/heartbeat",
+        json={"ttl_seconds": 60},
+    )
+
+    assert heartbeat.status_code == 200
+    assert heartbeat.json()["active_user_ids"] == []

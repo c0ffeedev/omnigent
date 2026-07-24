@@ -1743,10 +1743,10 @@ def create_app(
             _logger.warning(
                 "Policy evaluate rejected 400 on %s: %s", request.url.path, exc.message
             )
-        return JSONResponse(
-            status_code=exc.http_status,
-            content={"error": {"code": exc.code, "message": exc.message}},
-        )
+        error: dict[str, object] = {"code": exc.code, "message": exc.message}
+        if exc.details is not None:
+            error["details"] = exc.details
+        return JSONResponse(status_code=exc.http_status, content={"error": error})
 
     @app.exception_handler(StatementError)
     async def _handle_statement_error(

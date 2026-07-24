@@ -1008,6 +1008,9 @@ class SqlConversationItem(ConversationBase):
     data: Mapped[str] = mapped_column(Text)
     search_text: Mapped[str] = mapped_column(Text)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Fencing generation of the driver lease that authorized this human
+    # input. NULL for pre-lease rows and agent/tool/system output.
+    driver_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         # Backs the per-conversation position-ordered scan (the dominant read).
@@ -1402,6 +1405,37 @@ class SqlHost(OmnigentBase):
         # rotation) stays consistent.
         UniqueConstraint(
             "workspace_id", "user_id", "name", name="uq_hosts_workspace_user_id_name"
+        ),
+    )
+
+
+class SqlSessionDriverLease(OmnigentBase):
+    """Server-authoritative, generation-fenced session driver lease."""
+
+    __tablename__ = "session_driver_leases"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    holder_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    acquired_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    renewed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    released_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("generation > 0", name="ck_session_driver_leases_generation_positive"),
+        CheckConstraint(
+            "(holder_user_id IS NULL AND expires_at IS NULL AND released_at IS NOT NULL) "
+            "OR (holder_user_id IS NOT NULL AND acquired_at IS NOT NULL "
+            "AND renewed_at IS NOT NULL AND expires_at IS NOT NULL AND released_at IS NULL)",
+            name="ck_session_driver_leases_lifecycle",
         ),
     )
 

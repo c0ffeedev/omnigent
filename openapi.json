@@ -1038,6 +1038,17 @@
             "description": "The typed data payload (MessageData, etc.).",
             "title": "Data"
           },
+          "driver_generation": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Driver Generation"
+          },
           "id": {
             "description": "Store-assigned item ID, e.g. `\"msg_abc123\"`.",
             "title": "Id",
@@ -1254,6 +1265,155 @@
           "response"
         ],
         "title": "CreatedEvent",
+        "type": "object"
+      },
+      "DriverLeaseAcquireRequest": {
+        "description": "Acquire or, for managers, force-take a session driver lease.",
+        "properties": {
+          "force": {
+            "default": false,
+            "title": "Force",
+            "type": "boolean"
+          },
+          "ttl_seconds": {
+            "default": 30,
+            "maximum": 300.0,
+            "minimum": 5.0,
+            "title": "Ttl Seconds",
+            "type": "integer"
+          }
+        },
+        "title": "DriverLeaseAcquireRequest",
+        "type": "object"
+      },
+      "DriverLeaseGenerationRequest": {
+        "description": "Generation-fenced renew/release request.",
+        "properties": {
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "ttl_seconds": {
+            "default": 30,
+            "maximum": 300.0,
+            "minimum": 5.0,
+            "title": "Ttl Seconds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "generation"
+        ],
+        "title": "DriverLeaseGenerationRequest",
+        "type": "object"
+      },
+      "DriverLeaseHandoffRequest": {
+        "description": "Generation-fenced handoff to a specified collaborator.",
+        "properties": {
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "holder_user_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Holder User Id",
+            "type": "string"
+          },
+          "ttl_seconds": {
+            "default": 30,
+            "maximum": 300.0,
+            "minimum": 5.0,
+            "title": "Ttl Seconds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "generation",
+          "holder_user_id"
+        ],
+        "title": "DriverLeaseHandoffRequest",
+        "type": "object"
+      },
+      "DriverLeaseResponse": {
+        "description": "Current persisted driver lease and fencing generation.",
+        "properties": {
+          "acquired_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Acquired At"
+          },
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "holder_user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Holder User Id"
+          },
+          "released_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Released At"
+          },
+          "renewed_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Renewed At"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "generation",
+          "active"
+        ],
+        "title": "DriverLeaseResponse",
         "type": "object"
       },
       "ElicitationRequestEvent": {
@@ -2527,6 +2687,44 @@
           "on"
         ],
         "title": "PolicySummary",
+        "type": "object"
+      },
+      "PresenceEntry": {
+        "description": "One currently active collaborator.",
+        "properties": {
+          "expires_at": {
+            "title": "Expires At",
+            "type": "integer"
+          },
+          "last_seen": {
+            "title": "Last Seen",
+            "type": "integer"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "last_seen",
+          "expires_at"
+        ],
+        "title": "PresenceEntry",
+        "type": "object"
+      },
+      "PresenceHeartbeatRequest": {
+        "description": "Refresh the caller's ephemeral collaborator-presence TTL.",
+        "properties": {
+          "ttl_seconds": {
+            "default": 60,
+            "maximum": 300.0,
+            "minimum": 10.0,
+            "title": "Ttl Seconds",
+            "type": "integer"
+          }
+        },
+        "title": "PresenceHeartbeatRequest",
         "type": "object"
       },
       "PresenceViewer": {
@@ -4420,6 +4618,34 @@
         "title": "SessionPresenceEvent",
         "type": "object"
       },
+      "SessionPresenceResponse": {
+        "description": "Current ephemeral collaborator-presence snapshot.",
+        "properties": {
+          "active_user_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Active User Ids",
+            "type": "array"
+          },
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/PresenceEntry"
+            },
+            "title": "Entries",
+            "type": "array"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "SessionPresenceResponse",
+        "type": "object"
+      },
       "SessionReasoningEffortEvent": {
         "description": "Active reasoning-effort update from a terminal-backed integration.\n\nEmitted after an `external_reasoning_effort_change` POST from a native\nterminal forwarder when the user changes the thinking level inside the\nterminal UI. Lets the web effort picker reflect a TUI-side switch without\na reload.",
         "properties": {
@@ -4738,6 +4964,16 @@
             "title": "Created At",
             "type": "integer"
           },
+          "driver_lease": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DriverLeaseResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "external_session_id": {
             "anyOf": [
               {
@@ -4940,6 +5176,16 @@
             ],
             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled (single-user mode without a permission store).",
             "title": "Permission Level"
+          },
+          "presence": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionPresenceResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "project_id": {
             "anyOf": [
@@ -9388,6 +9634,264 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/driver": {
+      "get": {
+        "operationId": "get_driver_lease_v1_sessions__session_id__driver_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/DriverLeaseResponse"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Get Driver Lease V1 Sessions  Session Id  Driver Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Driver Lease",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/driver/acquire": {
+      "post": {
+        "operationId": "acquire_driver_lease_v1_sessions__session_id__driver_acquire_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DriverLeaseAcquireRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriverLeaseResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Acquire Driver Lease",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/driver/handoff": {
+      "post": {
+        "operationId": "handoff_driver_lease_v1_sessions__session_id__driver_handoff_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DriverLeaseHandoffRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriverLeaseResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Handoff Driver Lease",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/driver/release": {
+      "post": {
+        "operationId": "release_driver_lease_v1_sessions__session_id__driver_release_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DriverLeaseGenerationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriverLeaseResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Release Driver Lease",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/driver/renew": {
+      "post": {
+        "operationId": "renew_driver_lease_v1_sessions__session_id__driver_renew_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DriverLeaseGenerationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriverLeaseResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Renew Driver Lease",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/items": {
       "get": {
         "description": "List items in a session with cursor-based pagination.\n\nDelegates to the conversation items store \u2014 session_id is\nthe conversation_id. Same pagination contract as\n`GET /v1/conversations/{id}/items`.\n\n**Returns:** A `PaginatedList` of conversation items.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
@@ -10062,6 +10566,58 @@
         "summary": "Update Policy",
         "tags": [
           "session_policies"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/presence/heartbeat": {
+      "post": {
+        "operationId": "heartbeat_session_presence_v1_sessions__session_id__presence_heartbeat_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PresenceHeartbeatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionPresenceResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Heartbeat Session Presence",
+        "tags": [
+          "sessions"
         ]
       }
     },
