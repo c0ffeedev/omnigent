@@ -35,6 +35,7 @@ from omnigent.db.enum_codecs import (
     decode_managed_credential_lease_state,
     encode_host_status,
     encode_managed_credential_lease_state,
+    encode_session_live_status,
 )
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
@@ -90,6 +91,20 @@ class Host:
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+
+
+@dataclass(frozen=True)
+class ManagedHostBinding:
+    """Durable sessions attached to one managed host.
+
+    ``has_active_turn`` is true only when a bound session reports a running or
+    waiting turn and its runner heartbeat is fresh. The freshness gate keeps a
+    crashed runner's stale status from pinning compute forever.
+    """
+
+    host: Host
+    session_ids: tuple[str, ...]
+    has_active_turn: bool
 
 
 @dataclass(frozen=True)
@@ -1272,6 +1287,60 @@ class HostStore:
             )
             return [_row_to_host(row) for row in rows]
 
+    def list_managed_host_bindings(self, provider: str) -> list[ManagedHostBinding]:
+        """List managed hosts for *provider* that still have bound sessions.
+
+        Bindings and live-turn state live in the operational DB, while
+        conversation activity may live in a separate Agent Platform DB. Idle
+        lifecycle code combines this result with
+        ``ConversationStore.get_conversations`` rather than assuming those
+        databases can be joined.
+        """
+        ref = now_epoch()
+        active_codes = {
+            encode_session_live_status("running"),
+            encode_session_live_status("waiting"),
+        }
+        with self._session() as session:
+            rows = session.execute(
+                select(SqlHost, SqlConversationMetadata)
+                .join(
+                    SqlConversationMetadata,
+                    and_(
+                        SqlConversationMetadata.workspace_id == SqlHost.workspace_id,
+                        SqlConversationMetadata.host_id == SqlHost.host_id,
+                    ),
+                )
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.sandbox_provider == provider,
+                    # A cleared launch token is the durable dormant marker: the
+                    # prior generation was already suspended and must not be
+                    # sent through provider termination every sweep.
+                    SqlHost.token_hash.is_not(None),
+                )
+            ).all()
+
+        grouped: dict[str, tuple[Host, list[str], bool]] = {}
+        for host_row, meta in rows:
+            host = _row_to_host(host_row)
+            _, session_ids, has_active_turn = grouped.get(host.host_id, (host, [], False))
+            session_ids.append(meta.id)
+            has_active_turn = has_active_turn or (
+                meta.live_status in active_codes
+                and meta.runner_last_seen is not None
+                and meta.runner_last_seen >= ref - HOST_LIVENESS_TTL_S
+            )
+            grouped[host.host_id] = (host, session_ids, has_active_turn)
+        return [
+            ManagedHostBinding(
+                host=host,
+                session_ids=tuple(session_ids),
+                has_active_turn=has_active_turn,
+            )
+            for host, session_ids, has_active_turn in grouped.values()
+        ]
+
     def get_host(self, host_id: str) -> Host | None:
         """
         Fetch a single host by ID.
@@ -1535,6 +1604,36 @@ class HostStore:
                     SqlHost.host_id == host_id,
                 )
             )
+            return True
+
+    def mark_managed_host_suspended(
+        self,
+        host_id: str,
+        *,
+        expected_sandbox_id: str,
+    ) -> bool:
+        """Mark one terminated sandbox generation offline without deleting it.
+
+        The compare-and-swap prevents an idle-reap completion from revoking a
+        replacement generation that a concurrent message already launched.
+        Keeping the row (including ``sandbox_id``) preserves session bindings
+        and gives the next turn durable identity for transparent relaunch.
+        """
+        with self._write_session() as session:
+            row = session.execute(
+                select(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None or row.sandbox_id != expected_sandbox_id:
+                return False
+            row.status = encode_host_status("offline")
+            row.token_hash = None
+            row.token_expires_at = None
+            row.updated_at = now_epoch()
             return True
 
     def revoke_launch_token(

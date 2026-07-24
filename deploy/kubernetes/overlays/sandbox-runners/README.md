@@ -136,6 +136,7 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 | `env` | Optional list of SERVER env-var names to inject as literal Pod env (prefer `secret_name` for credentials). |
 | `node_selector` | Optional extra node labels, merged with a default `kubernetes.io/arch: amd64` — set that key to `arm64` to schedule runners on arm64 nodes. |
 | `resources` | Optional `requests` / `limits` (`cpu` / `memory`) override. |
+| `idle_timeout_s` | Optional positive seconds of session inactivity before the runner Pod is deleted. The session, stable `host_id`, and workspace path remain; the next turn launches a fresh Pod and re-clones the create-time repository. Uncommitted files from the deleted Pod are ephemeral. Omit to disable. |
 | `in_cluster` | Optional cluster-config source: `true` (in-cluster SA only), `false` (kubeconfig only), omit (try in-cluster, then kubeconfig). |
 | `kubeconfig` | Optional kubeconfig path for the out-of-cluster fallback (env: `OMNIGENT_KUBERNETES_KUBECONFIG`). |
 
