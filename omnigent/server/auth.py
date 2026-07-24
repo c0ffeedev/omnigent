@@ -64,6 +64,35 @@ _DELEGATED_ALLOWED_PREFIXES = (
     "/oauth/revoke",
 )
 
+# Delegated scope names are part of the device-authorization contract. The
+# legacy ``sessions`` scope keeps its existing prefix behavior; ``interactive``
+# is deliberately narrower and matches method + route structure exactly.
+SESSIONS_DELEGATED_SCOPE = "sessions"
+INTERACTIVE_DELEGATED_SCOPE = "interactive"
+
+_INTERACTIVE_DELEGATED_ROUTES = frozenset(
+    {
+        ("GET", "/health"),
+        ("GET", "/v1/me"),
+        ("GET", "/v1/agents"),
+        ("GET", "/v1/hosts"),
+        ("GET", "/v1/hosts/{host_id}/filesystem"),
+        ("POST", "/v1/sessions"),
+        ("GET", "/v1/sessions/{session_id}"),
+        ("POST", "/v1/sessions/{session_id}/events"),
+        ("GET", "/v1/sessions/{session_id}/stream"),
+        ("GET", "/v1/sessions/{session_id}/items"),
+        (
+            "POST",
+            "/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        ),
+        ("POST", "/v1/hosts/{host_id}/runners"),
+        ("GET", "/v1/runners/{runner_id}/status"),
+        ("POST", "/oauth/token"),
+        ("POST", "/oauth/revoke"),
+    }
+)
+
 
 def delegated_path_allowed(path: str) -> bool:
     """Return True if a delegated access token may access *path*.
@@ -77,6 +106,38 @@ def delegated_path_allowed(path: str) -> bool:
         if path == prefix or path.startswith(prefix + "/"):
             return True
     return False
+
+
+def _route_template_matches(template: str, path: str) -> bool:
+    """Match one path segment per ``{parameter}`` in *template*."""
+    template_parts = template.split("/")
+    path_parts = path.split("/")
+    if len(template_parts) != len(path_parts):
+        return False
+    return all(
+        (bool(path_part) and template_part.startswith("{") and template_part.endswith("}"))
+        or template_part == path_part
+        for template_part, path_part in zip(template_parts, path_parts, strict=True)
+    )
+
+
+def delegated_request_allowed(scope: object, method: str, path: str) -> bool:
+    """Return whether a delegated scope permits this method and path.
+
+    Unknown or malformed scopes fail closed. The pre-existing ``sessions``
+    scope intentionally retains its path-prefix semantics for compatibility.
+    The ``interactive`` scope uses exact route templates so suffixes, nested
+    resources, and method changes do not inherit authority.
+    """
+    if scope == SESSIONS_DELEGATED_SCOPE:
+        return delegated_path_allowed(path)
+    if scope != INTERACTIVE_DELEGATED_SCOPE:
+        return False
+    normalized_method = method.upper()
+    return any(
+        normalized_method == allowed_method and _route_template_matches(template, path)
+        for allowed_method, template in _INTERACTIVE_DELEGATED_ROUTES
+    )
 
 
 # Explicit single-user marker. Set by the managed local-server spawn
@@ -578,7 +639,8 @@ class UnifiedAuthProvider(AuthProvider):
         # served from the plain user-id cache (which would skip both).
         grant_id = payload.get("grant_id")
         if grant_id is not None:
-            if not delegated_path_allowed(request.url.path):
+            method = str(request.scope.get("method") or "")
+            if not delegated_request_allowed(payload.get("scope"), method, request.url.path):
                 return None
             if self._grant_revoked is not None and self._grant_revoked(grant_id):
                 return None

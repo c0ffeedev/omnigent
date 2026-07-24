@@ -19,9 +19,15 @@ import secrets
 from collections.abc import Iterator
 from pathlib import Path
 
+import jwt
 import pytest
 from fastapi.testclient import TestClient
 
+from omnigent.server.auth import (
+    INTERACTIVE_DELEGATED_SCOPE,
+    SESSIONS_DELEGATED_SCOPE,
+    delegated_request_allowed,
+)
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
 
 _KEY = b"k" * 32
@@ -75,6 +81,92 @@ def test_poll_pending_then_slow_down(store: DeviceGrantStore) -> None:
     assert (
         store.poll_for_token(dch, now_epoch_seconds=1002, min_interval_seconds=5)[0] == "slow_down"
     )
+
+
+def test_poll_expired_grant(store: DeviceGrantStore) -> None:
+    """An expired device authorization cannot be redeemed."""
+    _new_grant(store)
+    outcome, grant = store.poll_for_token(
+        hash_secret("dc", _KEY), now_epoch_seconds=1601, min_interval_seconds=5
+    )
+    assert outcome == "expired"
+    assert grant is not None and grant.expires_at == 1600
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/health"),
+        ("GET", "/v1/me"),
+        ("GET", "/v1/agents"),
+        ("GET", "/v1/hosts"),
+        ("GET", "/v1/hosts/host-1/filesystem"),
+        ("POST", "/v1/sessions"),
+        ("GET", "/v1/sessions/session-1"),
+        ("POST", "/v1/sessions/session-1/events"),
+        ("GET", "/v1/sessions/session-1/stream"),
+        ("GET", "/v1/sessions/session-1/items"),
+        ("POST", "/v1/sessions/session-1/elicitations/elicit-1/resolve"),
+        ("POST", "/v1/hosts/host-1/runners"),
+        ("GET", "/v1/runners/runner-1/status"),
+        ("POST", "/oauth/token"),
+        ("POST", "/oauth/revoke"),
+    ],
+)
+def test_interactive_scope_allows_exact_adr_matrix(method: str, path: str) -> None:
+    assert delegated_request_allowed(INTERACTIVE_DELEGATED_SCOPE, method, path)
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "/health"),
+        ("POST", "/v1/agents"),
+        ("GET", "/v1/agents/agent-1"),
+        ("GET", "/v1/hosts/host-1"),
+        ("POST", "/v1/hosts/host-1/filesystem"),
+        ("GET", "/v1/hosts/host-1/filesystem/file.txt"),
+        ("GET", "/v1/sessions"),
+        ("DELETE", "/v1/sessions/session-1"),
+        ("GET", "/v1/sessions/session-1/events"),
+        ("POST", "/v1/sessions/session-1/stream"),
+        ("GET", "/v1/sessions/session-1/items/item-1"),
+        ("POST", "/v1/sessions/session-1/elicitations/elicit-1"),
+        ("GET", "/v1/hosts/host-1/runners"),
+        ("POST", "/v1/runners/runner-1/status"),
+        ("POST", "/v1/runners/runner-1/token"),
+        ("POST", "/v1/hosts/host-1/directories"),
+        ("PUT", "/v1/sessions/session-1/permissions"),
+        ("PUT", "/v1/sharing"),
+        ("GET", "/auth/users"),
+        ("POST", "/oauth/device/authorize"),
+        ("GET", "/oauth/token"),
+        ("POST", "/oauth/revoke/suffix"),
+        ("GET", "/v1/hosts//filesystem"),
+        ("GET", "/v1/hosts/host-1/filesystem/"),
+    ],
+)
+def test_interactive_scope_denies_adjacent_routes(method: str, path: str) -> None:
+    assert not delegated_request_allowed(INTERACTIVE_DELEGATED_SCOPE, method, path)
+
+
+def test_unknown_delegated_scope_fails_closed() -> None:
+    assert not delegated_request_allowed("unknown", "GET", "/health")
+
+
+@pytest.mark.parametrize(
+    ("path", "allowed"),
+    [
+        ("/v1/agents", True),
+        ("/v1/agents/agent-1", True),
+        ("/v1/sessions/session-1/anything", True),
+        ("/auth/users", False),
+        ("/v1", False),
+        ("/v1agents", False),
+    ],
+)
+def test_sessions_scope_keeps_existing_prefix_boundary(path: str, allowed: bool) -> None:
+    assert delegated_request_allowed(SESSIONS_DELEGATED_SCOPE, "DELETE", path) is allowed
 
 
 _LIFETIME = 30 * 24 * 3600
@@ -287,7 +379,10 @@ def _login_admin(client: TestClient) -> None:
 def test_full_device_flow(app: TestClient) -> None:
     """authorize → consent (as admin) → approve → poll → get delegated token."""
     # 1. Client (no auth) starts the flow.
-    r = app.post("/oauth/device/authorize", json={"client_id": "slack"})
+    r = app.post(
+        "/oauth/device/authorize",
+        json={"client_id": "teams", "scope": INTERACTIVE_DELEGATED_SCOPE},
+    )
     assert r.status_code == 200, r.text
     data = r.json()
     device_code = data["device_code"]
@@ -304,8 +399,11 @@ def test_full_device_flow(app: TestClient) -> None:
     )
     assert r.status_code == 400 and r.json()["error"] == "authorization_pending"
 
-    # 3. User signs in and approves. (Origin header satisfies the CSRF gate.)
+    # 3. User signs in, sees the requested scope, and approves.
     _login_admin(app)
+    r = app.get(f"/oauth/device?user_code={user_code}")
+    assert r.status_code == 200
+    assert INTERACTIVE_DELEGATED_SCOPE in r.text
     r = app.post(
         "/oauth/device/approve",
         data={"user_code": user_code},
@@ -340,16 +438,46 @@ def test_full_device_flow(app: TestClient) -> None:
     assert tok["token_type"] == "Bearer"
     access_token = tok["access_token"]
     refresh_token = tok["refresh_token"]
+    claims = jwt.decode(access_token, options={"verify_signature": False})
+    assert claims["scope"] == INTERACTIVE_DELEGATED_SCOPE
+    assert claims["act"] == {
+        "client_id": "teams",
+        "scope": INTERACTIVE_DELEGATED_SCOPE,
+    }
 
-    # 5. The delegated token reaches session APIs but NOT admin endpoints.
+    # 5. The delegated token reaches interactive APIs but not sensitive routes.
     #    Clear the browser session cookie first so the bearer token is the
     #    only credential — otherwise the admin login cookie would answer.
+    sharing_before = app.get("/v1/sharing").json()
     app.cookies.clear()
     auth = {"Authorization": f"Bearer {access_token}"}
     r = app.get("/v1/agents", headers=auth)
     assert r.status_code == 200, r.text
+    r = app.get("/v1/hosts/host-1/filesystem/private", headers=auth)
+    assert r.status_code in (401, 403), r.text  # structural suffix is outside the scope
     r = app.get("/auth/users", headers=auth)
     assert r.status_code in (401, 403), r.text  # scope blocks admin surface
+    r = app.put(
+        "/v1/sessions/session-1/permissions",
+        json={"user_id": "other-user", "level": 1},
+        headers=auth,
+    )
+    assert r.status_code in (401, 403), r.text  # no grant mutation
+    r = app.put("/v1/sharing", json={"sharing_mode": "off"}, headers=auth)
+    assert r.status_code in (401, 403), r.text  # no sharing administration
+    r = app.post(
+        "/v1/hosts/host-1/directories",
+        json={"path": "/tmp/interactive-scope-must-not-create"},
+        headers=auth,
+    )
+    assert r.status_code in (401, 403), r.text  # no host filesystem writes
+    r = app.post("/v1/runners/runner-1/token", headers=auth)
+    assert r.status_code in (401, 403), r.text  # no owner-token minting
+
+    # Prove the denied sharing write did not mutate server state.
+    _login_admin(app)
+    assert app.get("/v1/sharing").json() == sharing_before
+    app.cookies.clear()
 
     # 6. Refresh rotates the token.
     r = app.post(
@@ -369,6 +497,18 @@ def test_full_device_flow(app: TestClient) -> None:
         "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": new_refresh}
     )
     assert r.status_code == 400
+    # The access token from the revoked grant is rejected immediately.
+    r = app.get("/v1/agents", headers=auth)
+    assert r.status_code in (401, 403)
+
+
+def test_authorize_rejects_unsupported_scope(app: TestClient) -> None:
+    r = app.post(
+        "/oauth/device/authorize",
+        json={"client_id": "teams", "scope": "admin"},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_scope"
 
 
 def test_consent_page_requires_login(app: TestClient) -> None:
