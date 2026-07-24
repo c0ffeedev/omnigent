@@ -8,6 +8,7 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseCreated → "response_created").
 
+import type { DriverLease } from "./coordinationApi";
 import type { ErrorInfo, ModelUsage, RememberScope, Response, SandboxLaunchStage } from "./types";
 
 /** Provider-native tool item types. */
@@ -817,6 +818,13 @@ export interface SessionPresenceEvent {
   viewers: SessionViewer[];
 }
 
+/** `session.driver_lease` — full authoritative lease state after a transition. */
+export interface SessionDriverLeaseEvent {
+  type: "session_driver_lease";
+  conversationId: string;
+  driverLease: DriverLease;
+}
+
 /**
  * `session.superseded` — this conversation was superseded and the client
  * should follow to `targetConversationId`.
@@ -908,4 +916,5 @@ export type StreamEvent =
   | SessionSkillsEvent
   | SessionModelOptionsEvent
   | SessionPresenceEvent
+  | SessionDriverLeaseEvent
   | BrowserActionRequestEvent;

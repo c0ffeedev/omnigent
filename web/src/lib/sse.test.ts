@@ -157,3 +157,54 @@ describe("parseEvent — session.mcp_startup", () => {
     ).toBeNull();
   });
 });
+
+describe("parseEvent — session.driver_lease", () => {
+  it("parses the authoritative lease snapshot", () => {
+    expect(
+      parseEvent("session.driver_lease", {
+        conversation_id: "sess-1",
+        driver_lease: {
+          session_id: "sess-1",
+          holder_user_id: "alice@example.com",
+          generation: 3,
+          acquired_at: 10,
+          renewed_at: 11,
+          expires_at: 41,
+          released_at: null,
+          active: true,
+        },
+      }),
+    ).toEqual({
+      type: "session_driver_lease",
+      conversationId: "sess-1",
+      driverLease: {
+        sessionId: "sess-1",
+        holderUserId: "alice@example.com",
+        generation: 3,
+        acquiredAt: 10,
+        renewedAt: 11,
+        expiresAt: 41,
+        releasedAt: null,
+        active: true,
+      },
+    });
+  });
+
+  it("rejects a mismatched session", () => {
+    expect(
+      parseEvent("session.driver_lease", {
+        conversation_id: "sess-1",
+        driver_lease: {
+          session_id: "sess-2",
+          holder_user_id: null,
+          generation: 1,
+          acquired_at: null,
+          renewed_at: null,
+          expires_at: null,
+          released_at: null,
+          active: false,
+        },
+      }),
+    ).toBeNull();
+  });
+});

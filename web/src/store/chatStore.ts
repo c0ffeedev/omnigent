@@ -105,6 +105,7 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
 import { isCodexNativeModel } from "@/lib/codexNativeModels";
 import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
+import { applyDriverLeaseToCoordinationCache } from "@/lib/coordinationState";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
 
@@ -4199,6 +4200,11 @@ export function handleSessionEvent(event: StreamEvent): void {
       useChatStore.setState((s) =>
         s.conversationId === event.conversationId ? { viewers: event.viewers } : {},
       );
+      return;
+    case "session_driver_lease":
+      if (queryClient) {
+        applyDriverLeaseToCoordinationCache(queryClient, event.conversationId, event.driverLease);
+      }
       return;
     case "session_agent_changed":
       // The session's bound agent was switched in place (switch-agent
