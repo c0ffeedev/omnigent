@@ -5,7 +5,7 @@ Several low-cardinality closed-set columns (``conversations.kind``,
 ``account_tokens.kind``, ``policies.type``, ``policies.scope``,
 ``hosts.status``, ``agents.kind``, ``scheduled_tasks.state``,
 ``scheduled_tasks.execution_target``,
-``scheduled_task_runs.status``) are stored as
+``scheduled_task_runs.status``, ``project_resources.kind``) are stored as
 integer codes rather
 than their string names — smaller rows and a tighter ``CHECK`` than a
 free ``VARCHAR``. The string names remain the
@@ -133,6 +133,13 @@ SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
     "succeeded": 3,
     "failed": 4,
     "skipped": 5,
+}
+
+PROJECT_RESOURCE_KIND: dict[str, int] = {
+    "repository": 1,
+    "task": 2,
+    "decision": 3,
+    "open_question": 4,
 }
 
 
@@ -364,3 +371,13 @@ def encode_scheduled_task_run_status(name: str) -> int:
 def decode_scheduled_task_run_status(code: int) -> str:
     """Decode a ``scheduled_task_runs.status`` int code to its name."""
     return _decode(SCHEDULED_TASK_RUN_STATUS, code, field="scheduled_task_runs.status")
+
+
+def encode_project_resource_kind(name: str) -> int:
+    """Encode a ``project_resources.kind`` name to its int code."""
+    return _encode(PROJECT_RESOURCE_KIND, name, field="project_resources.kind")
+
+
+def decode_project_resource_kind(code: int) -> str:
+    """Decode a ``project_resources.kind`` int code to its name."""
+    return _decode(PROJECT_RESOURCE_KIND, code, field="project_resources.kind")

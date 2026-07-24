@@ -41,6 +41,11 @@ _CODECS = [
         ec.encode_scheduled_task_run_status,
         ec.decode_scheduled_task_run_status,
     ),
+    (
+        ec.PROJECT_RESOURCE_KIND,
+        ec.encode_project_resource_kind,
+        ec.decode_project_resource_kind,
+    ),
 ]
 
 
@@ -127,4 +132,10 @@ def test_shipped_codes_are_stable() -> None:
         "succeeded": 3,
         "failed": 4,
         "skipped": 5,
+    }
+    assert ec.PROJECT_RESOURCE_KIND == {
+        "repository": 1,
+        "task": 2,
+        "decision": 3,
+        "open_question": 4,
     }

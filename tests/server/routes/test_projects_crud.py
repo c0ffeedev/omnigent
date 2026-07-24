@@ -151,6 +151,100 @@ async def test_delete_project(project_client: httpx.AsyncClient) -> None:
     assert second_delete.status_code == 404
 
 
+async def test_project_resources_group_work_concepts(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """Projects group typed links without introducing a parallel workset API."""
+    project = (await project_client.post("/v1/projects", json={"name": "Workset"})).json()
+    expected = [
+        {"kind": "repository", "title": "omnigent", "reference": "https://example/omnigent"},
+        {"kind": "task", "title": "Ship projects", "reference": "task-123"},
+        {"kind": "decision", "title": "Reuse Projects", "reference": "session-456"},
+        {"kind": "open_question", "title": "How should sharing work?", "reference": None},
+    ]
+
+    for payload in expected:
+        response = await project_client.post(
+            f"/v1/projects/{project['id']}/resources", json=payload
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["object"] == "project.resource"
+        assert body["project_id"] == project["id"]
+        assert {key: body[key] for key in payload} == payload
+
+    response = await project_client.get(f"/v1/projects/{project['id']}/resources")
+    assert response.status_code == 200
+    assert response.json()["object"] == "list"
+    actual = {}
+    for item in response.json()["data"]:
+        actual[item["kind"]] = (item["title"], item["reference"])
+    expected_by_kind = {}
+    for item in expected:
+        expected_by_kind[item["kind"]] = (item["title"], item["reference"])
+    assert actual == expected_by_kind
+
+
+async def test_project_resources_filter_and_delete(project_client: httpx.AsyncClient) -> None:
+    """Resource associations can be filtered and removed independently."""
+    project = (await project_client.post("/v1/projects", json={"name": "Workset"})).json()
+    repository = (
+        await project_client.post(
+            f"/v1/projects/{project['id']}/resources",
+            json={"kind": "repository", "title": "omnigent"},
+        )
+    ).json()
+    await project_client.post(
+        f"/v1/projects/{project['id']}/resources",
+        json={"kind": "decision", "title": "Reuse Projects"},
+    )
+
+    filtered = await project_client.get(
+        f"/v1/projects/{project['id']}/resources", params={"kind": "decision"}
+    )
+    assert filtered.status_code == 200
+    assert [item["kind"] for item in filtered.json()["data"]] == ["decision"]
+
+    deleted = await project_client.delete(
+        f"/v1/projects/{project['id']}/resources/{repository['id']}"
+    )
+    assert deleted.status_code == 200
+    assert deleted.json() == {
+        "id": repository["id"],
+        "object": "project.resource.deleted",
+        "deleted": True,
+    }
+    missing = await project_client.delete(
+        f"/v1/projects/{project['id']}/resources/{repository['id']}"
+    )
+    assert missing.status_code == 404
+
+
+async def test_project_resource_validation_and_missing_project(
+    project_client: httpx.AsyncClient,
+) -> None:
+    """Resource kinds are closed and resources cannot target unknown projects."""
+    project = (await project_client.post("/v1/projects", json={"name": "Workset"})).json()
+    invalid_kind = await project_client.post(
+        f"/v1/projects/{project['id']}/resources",
+        json={"kind": "session", "title": "Already modeled upstream"},
+    )
+    assert invalid_kind.status_code == 422
+    empty_title = await project_client.post(
+        f"/v1/projects/{project['id']}/resources",
+        json={"kind": "task", "title": "   "},
+    )
+    assert empty_title.status_code == 422
+
+    missing_id = "0" * 32
+    missing = await project_client.post(
+        f"/v1/projects/{missing_id}/resources",
+        json={"kind": "task", "title": "No project"},
+    )
+    assert missing.status_code == 404
+    assert (await project_client.get(f"/v1/projects/{missing_id}/resources")).status_code == 404
+
+
 # ── Multi-user: projects are owner-private ─────────────────────────────
 
 
@@ -225,6 +319,39 @@ async def test_cannot_get_another_users_project(
     assert (
         await multi_user_client.get(f"/v1/projects/{created['id']}", headers=_as_user(BOB))
     ).status_code == 200
+
+
+async def test_cannot_access_another_users_project_resources(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    """Project-resource reads and writes inherit the project's owner scope."""
+    project = (
+        await multi_user_client.post(
+            "/v1/projects", json={"name": "Alice only"}, headers=_as_user(ALICE)
+        )
+    ).json()
+    resource = (
+        await multi_user_client.post(
+            f"/v1/projects/{project['id']}/resources",
+            json={"kind": "repository", "title": "omnigent"},
+            headers=_as_user(ALICE),
+        )
+    ).json()
+
+    path = f"/v1/projects/{project['id']}/resources"
+    assert (await multi_user_client.get(path, headers=_as_user(BOB))).status_code == 404
+    assert (
+        await multi_user_client.post(
+            path,
+            json={"kind": "task", "title": "Intrude"},
+            headers=_as_user(BOB),
+        )
+    ).status_code == 404
+    assert (
+        await multi_user_client.delete(f"{path}/{resource['id']}", headers=_as_user(BOB))
+    ).status_code == 404
+    owner_list = await multi_user_client.get(path, headers=_as_user(ALICE))
+    assert [item["id"] for item in owner_list.json()["data"]] == [resource["id"]]
 
 
 async def test_cannot_rename_another_users_project(

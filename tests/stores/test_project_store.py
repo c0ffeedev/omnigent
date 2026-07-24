@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 
@@ -31,6 +32,11 @@ def store(db_uri: str) -> SqlAlchemyProjectStore:
     :returns: A ready-to-use :class:`SqlAlchemyProjectStore` instance.
     """
     return SqlAlchemyProjectStore(db_uri)
+
+
+def test_resource_extension_does_not_add_required_abstract_methods() -> None:
+    """Legacy project-store adapters remain instantiable after the extension."""
+    assert ProjectStore.__abstractmethods__ == {"create", "get", "list", "update", "delete"}
 
 
 # ── create / get ──────────────────────────────────────────────────────────
@@ -255,3 +261,142 @@ def test_delete_scoped_to_owner(store: SqlAlchemyProjectStore) -> None:
     deleted = store.delete(_uid("p1"), owner_user_id="bob@example.com")
     assert deleted is False
     assert store.get(_uid("p1"), owner_user_id="alice@example.com") is not None
+
+
+# ── workset resources ──────────────────────────────────────────────────────
+
+
+def test_add_and_list_project_resources(store: SqlAlchemyProjectStore) -> None:
+    """A project groups repository, task, decision, and open-question links."""
+    store.create(_uid("p1"), "Workset", "alice@example.com")
+
+    expected = [
+        ("repository", "omnigent", "https://github.com/example/omnigent"),
+        ("task", "Ship projects", "task-123"),
+        ("decision", "Reuse Projects", "session-456"),
+        ("open_question", "How should sharing work?", None),
+    ]
+    for index, (kind, title, reference) in enumerate(expected):
+        resource = store.add_resource(
+            _uid(f"resource-{index}"),
+            _uid("p1"),
+            owner_user_id="alice@example.com",
+            kind=kind,
+            title=title,
+            reference=reference,
+        )
+        assert resource is not None
+        assert resource.project_id == _uid("p1")
+        assert resource.kind == kind
+        assert resource.title == title
+        assert resource.reference == reference
+
+    listed = store.list_resources(_uid("p1"), owner_user_id="alice@example.com")
+    assert listed is not None
+    assert {r.kind: (r.title, r.reference) for r in listed} == {
+        kind: (title, reference) for kind, title, reference in expected
+    }
+
+
+def test_list_project_resources_filters_by_kind(store: SqlAlchemyProjectStore) -> None:
+    """Resource listing can select one work-concept kind."""
+    store.create(_uid("p1"), "Workset", "alice@example.com")
+    store.add_resource(
+        _uid("repo"),
+        _uid("p1"),
+        owner_user_id="alice@example.com",
+        kind="repository",
+        title="omnigent",
+        reference=None,
+    )
+    store.add_resource(
+        _uid("decision"),
+        _uid("p1"),
+        owner_user_id="alice@example.com",
+        kind="decision",
+        title="Reuse Projects",
+        reference=None,
+    )
+
+    listed = store.list_resources(_uid("p1"), owner_user_id="alice@example.com", kind="decision")
+    assert listed is not None
+    assert [(r.kind, r.title) for r in listed] == [("decision", "Reuse Projects")]
+
+
+def test_project_resources_are_owner_scoped(store: SqlAlchemyProjectStore) -> None:
+    """Another user cannot discover or mutate a project's resources."""
+    store.create(_uid("p1"), "Alice workset", "alice@example.com")
+    created = store.add_resource(
+        _uid("repo"),
+        _uid("p1"),
+        owner_user_id="alice@example.com",
+        kind="repository",
+        title="omnigent",
+        reference=None,
+    )
+    assert created is not None
+
+    assert store.list_resources(_uid("p1"), owner_user_id="bob@example.com") is None
+    assert (
+        store.add_resource(
+            _uid("bob-resource"),
+            _uid("p1"),
+            owner_user_id="bob@example.com",
+            kind="task",
+            title="Intrude",
+            reference=None,
+        )
+        is None
+    )
+    assert (
+        store.remove_resource(_uid("p1"), _uid("repo"), owner_user_id="bob@example.com") is False
+    )
+    listed = store.list_resources(_uid("p1"), owner_user_id="alice@example.com")
+    assert listed is not None
+    assert [r.id for r in listed] == [_uid("repo")]
+
+
+def test_remove_project_resource(store: SqlAlchemyProjectStore) -> None:
+    """Removing an association leaves the project intact."""
+    store.create(_uid("p1"), "Workset", "alice@example.com")
+    store.add_resource(
+        _uid("repo"),
+        _uid("p1"),
+        owner_user_id="alice@example.com",
+        kind="repository",
+        title="omnigent",
+        reference=None,
+    )
+
+    assert (
+        store.remove_resource(_uid("p1"), _uid("repo"), owner_user_id="alice@example.com") is True
+    )
+    assert (
+        store.remove_resource(_uid("p1"), _uid("repo"), owner_user_id="alice@example.com") is False
+    )
+    assert store.list_resources(_uid("p1"), owner_user_id="alice@example.com") == []
+
+
+def test_delete_project_removes_resource_associations(store: SqlAlchemyProjectStore) -> None:
+    """Application-managed project deletion does not leave orphan resources."""
+    store.create(_uid("p1"), "Workset", "alice@example.com")
+    store.add_resource(
+        _uid("repo"),
+        _uid("p1"),
+        owner_user_id="alice@example.com",
+        kind="repository",
+        title="omnigent",
+        reference=None,
+    )
+
+    assert store.delete(_uid("p1"), owner_user_id="alice@example.com") is True
+    store.create(_uid("p1"), "Recreated", "alice@example.com")
+    recreated = store.add_resource(
+        _uid("repo"),
+        _uid("p1"),
+        owner_user_id="alice@example.com",
+        kind="repository",
+        title="omnigent",
+        reference=None,
+    )
+    assert recreated is not None

@@ -16,7 +16,7 @@ from typing import Annotated, Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
 
-from omnigent.entities import ConversationItem
+from omnigent.entities import ConversationItem, ProjectResourceKind
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -4236,4 +4236,38 @@ class UpdateProjectRequest(BaseModel):
             raise ValueError("name must not be empty")
         if len(trimmed) > 100:
             raise ValueError("name must be at most 100 characters")
+        return trimmed
+
+
+class CreateProjectResourceRequest(BaseModel):
+    """Request body for adding a typed reference to a project."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: ProjectResourceKind
+    title: str
+    reference: str | None = None
+
+    @field_validator("title")
+    @classmethod
+    def _validate_title(cls, value: str) -> str:
+        """Trim and bound the resource display title."""
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("title must not be empty")
+        if len(trimmed) > 200:
+            raise ValueError("title must be at most 200 characters")
+        return trimmed
+
+    @field_validator("reference")
+    @classmethod
+    def _validate_reference(cls, value: str | None) -> str | None:
+        """Trim an optional opaque source reference."""
+        if value is None:
+            return None
+        trimmed = value.strip()
+        if not trimmed:
+            return None
+        if len(trimmed) > 2048:
+            raise ValueError("reference must be at most 2048 characters")
         return trimmed

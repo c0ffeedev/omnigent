@@ -1,10 +1,10 @@
 """REST API routes for projects (``/v1/projects``).
 
-Projects are first-class, owner-private containers that group sessions (see
-``designs/PROJECTS_PRD.md``). These endpoints let the web UI create empty
-projects, list them, rename them, and delete them. Session membership
-(filing a session into a project) is managed on the sessions API via the
-conversation store's ``project_id``.
+Projects are first-class, owner-private containers that group sessions and
+typed resource references (see ``designs/PROJECTS_PRD.md`` and
+``designs/PROJECT_WORKSET_RESOURCES.md``). These endpoints manage project CRUD
+and repository/task/decision/open-question references. Session membership is
+managed on the sessions API via the conversation store's ``project_id``.
 
 Because projects are owner-private and carry no ACL of their own, every handler
 scopes to the requesting user: a caller only ever sees and mutates their own
@@ -20,12 +20,13 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from omnigent.entities import Project
+from omnigent.entities import Project, ProjectResource, ProjectResourceKind
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.schemas import (
     CreateProjectRequest,
+    CreateProjectResourceRequest,
     UpdateProjectRequest,
 )
 from omnigent.stores.project_store import ProjectStore
@@ -43,6 +44,19 @@ def _to_response(project: Project) -> dict[str, Any]:
         "name": project.name,
         "created_at": project.created_at,
         "updated_at": project.updated_at,
+    }
+
+
+def _resource_to_response(resource: ProjectResource) -> dict[str, Any]:
+    """Convert a project-resource entity to its API representation."""
+    return {
+        "id": resource.id,
+        "object": "project.resource",
+        "project_id": resource.project_id,
+        "kind": resource.kind,
+        "title": resource.title,
+        "reference": resource.reference,
+        "created_at": resource.created_at,
     }
 
 
@@ -154,5 +168,66 @@ def create_projects_router(
         if not deleted:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         return {"id": project_id, "object": "project.deleted", "deleted": True}
+
+    @router.post("/projects/{project_id}/resources")
+    async def add_project_resource(
+        request: Request,
+        project_id: str,
+        body: CreateProjectResourceRequest,
+    ) -> dict[str, Any]:
+        """Add a repository, task, decision, or open-question reference."""
+        user_id = require_user(request, auth_provider)
+        resource = await asyncio.to_thread(
+            project_store.add_resource,
+            uuid.uuid4().hex,
+            project_id,
+            owner_user_id=user_id,
+            kind=body.kind,
+            title=body.title,
+            reference=body.reference,
+        )
+        if resource is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        return _resource_to_response(resource)
+
+    @router.get("/projects/{project_id}/resources")
+    async def list_project_resources(
+        request: Request,
+        project_id: str,
+        kind: ProjectResourceKind | None = None,
+    ) -> dict[str, Any]:
+        """List typed references grouped into an owned project."""
+        user_id = require_user(request, auth_provider)
+        resources = await asyncio.to_thread(
+            project_store.list_resources,
+            project_id,
+            owner_user_id=user_id,
+            kind=kind,
+        )
+        if resources is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        return {"object": "list", "data": [_resource_to_response(r) for r in resources]}
+
+    @router.delete("/projects/{project_id}/resources/{resource_id}")
+    async def remove_project_resource(
+        request: Request,
+        project_id: str,
+        resource_id: str,
+    ) -> dict[str, Any]:
+        """Remove a typed reference from an owned project."""
+        user_id = require_user(request, auth_provider)
+        removed = await asyncio.to_thread(
+            project_store.remove_resource,
+            project_id,
+            resource_id,
+            owner_user_id=user_id,
+        )
+        if not removed:
+            raise OmnigentError("Project resource not found", code=ErrorCode.NOT_FOUND)
+        return {
+            "id": resource_id,
+            "object": "project.resource.deleted",
+            "deleted": True,
+        }
 
     return router

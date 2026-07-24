@@ -838,6 +838,44 @@ class SqlProject(OmnigentBase):
     )
 
 
+class SqlProjectResource(OmnigentBase):
+    """SQL row for a typed resource associated with a project.
+
+    The relationship to :class:`SqlProject` is application-managed (Rule
+    R032), so deleting a project must remove these rows in the project store.
+    Sessions are not duplicated here: their existing ``project_id`` metadata
+    remains the canonical project-membership relationship.
+    """
+
+    __tablename__ = "project_resources"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    # Stable enum code: repository=1, task=2, decision=3, open_question=4.
+    kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    reference: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("kind IN (1, 2, 3, 4)", name="ck_project_resources_kind"),
+        Index(
+            "ix_project_resources_project_id",
+            "workspace_id",
+            "project_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+
 class SqlConversation(ConversationBase):
     """
     SQLAlchemy model for the ``conversations`` table.
