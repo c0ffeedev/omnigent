@@ -1,18 +1,21 @@
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { ActivityDedupeStore } from "../../src/dedupe.js";
 
-const [databasePath, gatePath, owner] = process.argv.slice(2);
-if (!databasePath || !gatePath || !owner) throw new Error("database path, gate path, and owner are required");
-
-while (!existsSync(gatePath)) await delay(5);
+const [databasePath, gatePath, readyPath, owner] = process.argv.slice(2);
+if (!databasePath || !gatePath || !readyPath || !owner) {
+  throw new Error("database path, gate path, ready path, and owner are required");
+}
 
 const store = new ActivityDedupeStore(databasePath, {
   leaseMilliseconds: 5_000,
   maxRecords: 100,
   retentionDays: 7,
 });
+writeFileSync(readyPath, "ready", { flag: "wx" });
+while (!existsSync(gatePath)) await delay(5);
+
 const key = {
   botAppId: "11111111-1111-4111-8111-111111111111",
   tenantId: "22222222-2222-4222-8222-222222222222",

@@ -226,6 +226,7 @@ describe("authenticated Teams ingress", () => {
   });
 
   it.each([
+    ["missing activity type", body({ type: undefined })],
     ["disallowed tenant", body({ conversation: { id: "conversation-1", conversationType: "personal", tenantId: "33333333-3333-4333-8333-333333333333" }, channelData: { tenant: { id: "33333333-3333-4333-8333-333333333333" } } })],
     ["group scope", body({ conversation: { id: "conversation-1", conversationType: "groupChat", tenantId } })],
     ["wrong recipient app", body({ recipient: { id: "28:44444444-4444-4444-8444-444444444444" } })],

@@ -80,9 +80,9 @@ export class ActivityDedupeStore {
     }
     mkdirSync(dirname(path), { recursive: true });
     this.database = new Database(path);
+    this.database.pragma("busy_timeout = 5000");
     this.database.pragma("journal_mode = WAL");
     this.database.pragma("synchronous = FULL");
-    this.database.pragma("busy_timeout = 5000");
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS activity_operations (
         bot_app_id TEXT NOT NULL,
@@ -194,7 +194,7 @@ export class ActivityDedupeStore {
 
   private migrateClaimOnlySchema(): void {
     const migrations = new Map([
-      ["state", "ALTER TABLE activity_operations ADD COLUMN state TEXT NOT NULL DEFAULT 'delivered'"],
+      ["state", "ALTER TABLE activity_operations ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'"],
       ["lease_owner", "ALTER TABLE activity_operations ADD COLUMN lease_owner TEXT"],
       ["lease_expires_at", "ALTER TABLE activity_operations ADD COLUMN lease_expires_at INTEGER NOT NULL DEFAULT 0"],
       ["attempt_count", "ALTER TABLE activity_operations ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 1"],

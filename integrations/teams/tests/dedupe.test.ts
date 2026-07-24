@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -43,13 +44,20 @@ function openStore(path: string, maxRecords = 100): ActivityDedupeStore {
   return new ActivityDedupeStore(path, { leaseMilliseconds: 50, maxRecords, retentionDays: 7 });
 }
 
-function runWorker(databasePath: string, gatePath: string, owner: string): Promise<WorkerResult> {
+function runWorker(
+  databasePath: string,
+  gatePath: string,
+  readyPath: string,
+  owner: string,
+): Promise<WorkerResult> {
   const workerPath = fileURLToPath(new URL("./fixtures/dedupe-worker.ts", import.meta.url));
 
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ["--import", "tsx", workerPath, databasePath, gatePath, owner], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", workerPath, databasePath, gatePath, readyPath, owner],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
     let stdout = "";
     let stderr = "";
 
@@ -68,8 +76,16 @@ function runWorker(databasePath: string, gatePath: string, owner: string): Promi
   });
 }
 
+async function waitUntilReady(paths: string[]): Promise<void> {
+  for (let attempts = 0; attempts < 500; attempts += 1) {
+    if (paths.every((path) => existsSync(path))) return;
+    await delay(10);
+  }
+  throw new Error("dedupe workers did not reach the ready barrier");
+}
+
 describe("ActivityDedupeStore", () => {
-  it("migrates claim-only rows as delivered without replaying them", () => {
+  it("migrates ambiguous claim-only rows as pending so delivery is retried", () => {
     const path = databasePath();
     const legacy = new Database(path);
     legacy.exec(`
@@ -99,9 +115,9 @@ describe("ActivityDedupeStore", () => {
     const migrated = openStore(path);
     expect(migrated.claim(key, operation, "worker-1", 1_001)).toMatchObject({
       operation,
-      status: "delivered",
+      status: "acquired",
     });
-    expect(migrated.get(key)).toMatchObject({ deliveredAt: 1_000, state: "delivered" });
+    expect(migrated.get(key)).toMatchObject({ attemptCount: 2, state: "pending" });
     migrated.close();
   });
 
@@ -189,13 +205,19 @@ describe("ActivityDedupeStore", () => {
 
   it("allows only one operating-system process to acquire the same activity", async () => {
     const path = databasePath();
-    const gatePath = join(temporaryDirectories.at(-1)!, "start");
-    const workers = Array.from({ length: 4 }, (_, index) => runWorker(path, gatePath, `worker-${index}`));
+    const directory = temporaryDirectories.at(-1)!;
+    const gatePath = join(directory, "start");
+    const readyPaths = Array.from({ length: 4 }, (_, index) => join(directory, `ready-${index}`));
+    const workers = readyPaths.map((readyPath, index) => (
+      runWorker(path, gatePath, readyPath, `worker-${index}`)
+    ));
 
+    await waitUntilReady(readyPaths);
     writeFileSync(gatePath, "go", { flag: "wx" });
     const results = await Promise.all(workers);
 
     expect(results.filter(({ status }) => status === "acquired")).toHaveLength(1);
+    expect(results.filter(({ status }) => status === "busy").length).toBeGreaterThanOrEqual(1);
     const restarted = openStore(path);
     expect(restarted.count()).toBe(1);
     expect(restarted.get({ ...key, activityId: "shared-activity" })).toMatchObject({ state: "delivered" });

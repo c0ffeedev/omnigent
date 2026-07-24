@@ -54,6 +54,7 @@ export function validateActivity(candidate: unknown, constraints: ActivityConstr
   const activity = object(candidate);
   if (!activity) return reject(400, "Malformed activity");
 
+  const activityType = string(activity.type);
   const activityId = string(activity.id);
   const channelId = string(activity.channelId);
   const conversation = object(activity.conversation);
@@ -69,6 +70,7 @@ export function validateActivity(candidate: unknown, constraints: ActivityConstr
   const conversationTenantId = string(conversation?.tenantId)?.toLowerCase();
   const channelTenantId = string(channelTenant?.id)?.toLowerCase();
 
+  if (!activityType) return reject(400, "Activity type is required");
   if (!activityId || !conversationId || !senderId || !objectId || !recipientId) {
     return reject(400, "Activity identity fields are required");
   }
