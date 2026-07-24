@@ -2666,19 +2666,67 @@ async def _release_stored_credential_leases(
     return all_released
 
 
-async def _abandon_credential_lease_claims(
+async def _abandon_suspension_credential_claims_best_effort(
+    host_store: HostStore,
+    host: Host,
+    claim_owner: str,
+) -> None:
+    """Restore every lease claimed by a suspension that did not terminate."""
+    if host.sandbox_id is None:
+        return
+    try:
+        await asyncio.to_thread(
+            host_store.abandon_credential_lease_claims,
+            host.host_id,
+            claim_owner=claim_owner,
+            expected_sandbox_id=host.sandbox_id,
+            expected_provider=host.sandbox_provider,
+        )
+    except Exception:  # noqa: BLE001 -- never mask the initiating failure
+        _logger.warning(
+            "Failed to abandon managed credential claims for host %s sandbox %s",
+            host.host_id,
+            host.sandbox_id,
+            exc_info=True,
+        )
+
+
+async def _release_host_suspension_claim_best_effort(
+    host_store: HostStore,
+    host: Host,
+    claim_owner: str,
+) -> None:
+    """Release a host suspension claim without masking its initiating failure."""
+    if host.sandbox_id is None:
+        return
+    try:
+        await asyncio.to_thread(
+            host_store.release_managed_host_suspension_claim,
+            host.host_id,
+            expected_sandbox_id=host.sandbox_id,
+            claim_owner=claim_owner,
+        )
+    except Exception:  # noqa: BLE001 -- never mask the initiating failure
+        _logger.warning(
+            "Failed to release managed host suspension claim for host %s sandbox %s",
+            host.host_id,
+            host.sandbox_id,
+            exc_info=True,
+        )
+
+
+async def _release_suspension_credentials_best_effort(
+    config: ManagedSandboxConfig,
     host_store: HostStore,
     records: list[CredentialLeaseRecord],
 ) -> None:
-    """Return cleanup claims to active when the sandbox was not terminated."""
-    for record in records:
-        if record.claim_owner is None:
-            continue
-        await asyncio.to_thread(
-            host_store.abandon_credential_lease_claim,
-            record.host_id,
-            record.generation,
-            claim_owner=record.claim_owner,
+    """Tombstone a terminated generation's leases without masking the caller."""
+    try:
+        await _release_stored_credential_leases(config, host_store, records)
+    except Exception:  # noqa: BLE001 -- retiring rows remain retryable
+        _logger.warning(
+            "Failed to release credentials for terminated idle sandbox",
+            exc_info=True,
         )
 
 
@@ -3351,45 +3399,53 @@ async def suspend_managed_host(
     )
     if not owns_host_claim:
         return False
-    claimed = await asyncio.to_thread(
-        host_store.claim_active_credential_leases,
-        host.host_id,
-        claim_owner=claim_owner,
-        claim_expires_at=claim_expires_at,
-        expected_sandbox_id=host.sandbox_id,
-        expected_provider=host.sandbox_provider,
-    )
-    terminated = await _terminate_sandbox_best_effort(launcher, host)
+    try:
+        claimed = await asyncio.to_thread(
+            host_store.claim_active_credential_leases,
+            host.host_id,
+            claim_owner=claim_owner,
+            claim_expires_at=claim_expires_at,
+            expected_sandbox_id=host.sandbox_id,
+            expected_provider=host.sandbox_provider,
+        )
+    except BaseException:
+        # The store call may have committed before its await failed. Restore by
+        # durable owner identity rather than relying on an unassigned result.
+        await _abandon_suspension_credential_claims_best_effort(host_store, host, claim_owner)
+        await _release_host_suspension_claim_best_effort(host_store, host, claim_owner)
+        raise
+    try:
+        terminated = await _terminate_sandbox_best_effort(launcher, host)
+    except asyncio.CancelledError:
+        # A cancelled executor await may leave the provider call running. Keep
+        # leases retiring so recovery can repeat idempotent termination later.
+        await _release_host_suspension_claim_best_effort(host_store, host, claim_owner)
+        raise
     if not terminated:
-        await _abandon_credential_lease_claims(host_store, claimed)
-        await asyncio.to_thread(
-            host_store.release_managed_host_suspension_claim,
+        await _abandon_suspension_credential_claims_best_effort(host_store, host, claim_owner)
+        await _release_host_suspension_claim_best_effort(host_store, host, claim_owner)
+        return False
+    try:
+        suspended = await asyncio.to_thread(
+            host_store.mark_managed_host_suspended,
             host.host_id,
             expected_sandbox_id=host.sandbox_id,
             claim_owner=claim_owner,
         )
-        return False
-    suspended = await asyncio.to_thread(
-        host_store.mark_managed_host_suspended,
-        host.host_id,
-        expected_sandbox_id=host.sandbox_id,
-        claim_owner=claim_owner,
-    )
+    except BaseException:
+        await _release_suspension_credentials_best_effort(config, host_store, claimed)
+        await _release_host_suspension_claim_best_effort(host_store, host, claim_owner)
+        raise
     if not suspended:
         _logger.info(
             "Managed idle suspension lost generation CAS for host %s sandbox %s",
             host.host_id,
             host.sandbox_id,
         )
-        await _release_stored_credential_leases(config, host_store, claimed)
-        await asyncio.to_thread(
-            host_store.release_managed_host_suspension_claim,
-            host.host_id,
-            expected_sandbox_id=host.sandbox_id,
-            claim_owner=claim_owner,
-        )
+        await _release_suspension_credentials_best_effort(config, host_store, claimed)
+        await _release_host_suspension_claim_best_effort(host_store, host, claim_owner)
         return False
-    await _release_stored_credential_leases(config, host_store, claimed)
+    await _release_suspension_credentials_best_effort(config, host_store, claimed)
     _logger.info(
         "Suspended idle managed host %s (sandbox %s, provider %s)",
         host.host_id,
