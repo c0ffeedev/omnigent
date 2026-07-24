@@ -30,6 +30,7 @@ interface StoredRow extends RecordedOperation {
   attempt_count: number;
   created_at: number;
   delivered_at: number | null;
+  expires_at: number;
   lease_expires_at: number;
   lease_owner: string | null;
   receipt: string | null;
@@ -41,6 +42,7 @@ export interface RecordedDelivery extends RecordedOperation {
   attemptCount: number;
   createdAt: number;
   deliveredAt?: number;
+  expiresAt: number;
   leaseExpiresAt: number;
   receipt?: string;
   state: "pending" | "delivered";
@@ -48,7 +50,24 @@ export interface RecordedDelivery extends RecordedOperation {
 }
 
 const DEFAULT_LEASE_MILLISECONDS = 30_000;
+const DATABASE_BUSY_TIMEOUT_MILLISECONDS = 5_000;
 const RECEIPT_MAX_LENGTH = 512;
+
+function configureWal(database: Database.Database): void {
+  const deadline = Date.now() + DATABASE_BUSY_TIMEOUT_MILLISECONDS;
+  while (true) {
+    try {
+      database.pragma("journal_mode = WAL");
+      return;
+    } catch (error) {
+      const code = typeof error === "object" && error !== null && "code" in error
+        ? error.code
+        : undefined;
+      if (code !== "SQLITE_BUSY" || Date.now() >= deadline) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
+}
 
 export class ActivityDedupeCapacityError extends Error {
   constructor(maxRecords: number) {
@@ -60,6 +79,7 @@ export class ActivityDedupeCapacityError extends Error {
 export class ActivityDedupeStore {
   private readonly database: Database.Database;
   private readonly leaseMilliseconds: number;
+  private readonly retentionMilliseconds: number;
   private readonly claimTransaction: (
     key: ActivityDedupeKey,
     operation: RecordedOperation,
@@ -78,10 +98,11 @@ export class ActivityDedupeStore {
     if (!Number.isSafeInteger(options.retentionDays) || options.retentionDays < 1) {
       throw new Error("retentionDays must be a positive integer");
     }
+    this.retentionMilliseconds = options.retentionDays * 24 * 60 * 60 * 1000;
     mkdirSync(dirname(path), { recursive: true });
     this.database = new Database(path);
-    this.database.pragma("busy_timeout = 5000");
-    this.database.pragma("journal_mode = WAL");
+    this.database.pragma(`busy_timeout = ${DATABASE_BUSY_TIMEOUT_MILLISECONDS}`);
+    configureWal(this.database);
     this.database.pragma("synchronous = FULL");
     this.database.exec(`
       CREATE TABLE IF NOT EXISTS activity_operations (
@@ -99,6 +120,7 @@ export class ActivityDedupeStore {
         receipt TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
         delivered_at INTEGER,
         PRIMARY KEY (bot_app_id, tenant_id, conversation_id, sender_id, activity_id)
       );
@@ -107,8 +129,9 @@ export class ActivityDedupeStore {
     this.migrateClaimOnlySchema();
     this.database.exec(`
       DROP INDEX IF EXISTS activity_operations_created_at;
-      CREATE INDEX IF NOT EXISTS activity_operations_updated_at
-        ON activity_operations(updated_at);
+      DROP INDEX IF EXISTS activity_operations_updated_at;
+      CREATE INDEX IF NOT EXISTS activity_operations_expires_at
+        ON activity_operations(expires_at);
       CREATE INDEX IF NOT EXISTS activity_operations_lease
         ON activity_operations(state, lease_expires_at);
     `);
@@ -117,19 +140,21 @@ export class ActivityDedupeStore {
       INSERT OR IGNORE INTO activity_operations (
         bot_app_id, tenant_id, conversation_id, sender_id, activity_id,
         kind, payload, state, lease_owner, lease_expires_at,
-        attempt_count, created_at, updated_at
+        attempt_count, created_at, updated_at, expires_at
       ) VALUES (
         @botAppId, @tenantId, @conversationId, @senderId, @activityId,
         @kind, @payload, 'pending', @owner, @leaseExpiresAt,
-        1, @createdAt, @createdAt
+        1, @createdAt, @createdAt, @expiresAt
       )
     `);
     const deleteExpired = this.database.prepare(
-      "DELETE FROM activity_operations WHERE updated_at < ?",
+      `DELETE FROM activity_operations
+       WHERE expires_at <= @now
+         AND (state = 'delivered' OR lease_expires_at <= @now)`,
     );
     const select = this.database.prepare(`
       SELECT kind, payload, state, lease_owner, lease_expires_at,
-        attempt_count, receipt, created_at, updated_at, delivered_at
+        attempt_count, receipt, created_at, updated_at, expires_at, delivered_at
       FROM activity_operations
       WHERE bot_app_id = @botAppId
         AND tenant_id = @tenantId
@@ -143,7 +168,8 @@ export class ActivityDedupeStore {
       SET lease_owner = @owner,
         lease_expires_at = @leaseExpiresAt,
         attempt_count = attempt_count + 1,
-        updated_at = @now
+        updated_at = @now,
+        expires_at = @expiresAt
       WHERE bot_app_id = @botAppId
         AND tenant_id = @tenantId
         AND conversation_id = @conversationId
@@ -154,8 +180,7 @@ export class ActivityDedupeStore {
     `);
 
     const claim = this.database.transaction((key, operation, owner, now): ClaimResult => {
-      const cutoff = now - this.options.retentionDays * 24 * 60 * 60 * 1000;
-      deleteExpired.run(cutoff);
+      deleteExpired.run({ now });
       let row = select.get(key) as StoredRow | undefined;
 
       if (!row) {
@@ -167,6 +192,7 @@ export class ActivityDedupeStore {
           ...key,
           ...operation,
           createdAt: now,
+          expiresAt: now + this.retentionMilliseconds,
           leaseExpiresAt: now + this.leaseMilliseconds,
           owner,
         });
@@ -181,6 +207,7 @@ export class ActivityDedupeStore {
 
       const acquired = acquireExpired.run({
         ...key,
+        expiresAt: now + this.retentionMilliseconds,
         leaseExpiresAt: now + this.leaseMilliseconds,
         now,
         owner,
@@ -200,6 +227,7 @@ export class ActivityDedupeStore {
       ["attempt_count", "ALTER TABLE activity_operations ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 1"],
       ["receipt", "ALTER TABLE activity_operations ADD COLUMN receipt TEXT"],
       ["updated_at", "ALTER TABLE activity_operations ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0"],
+      ["expires_at", "ALTER TABLE activity_operations ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0"],
       ["delivered_at", "ALTER TABLE activity_operations ADD COLUMN delivered_at INTEGER"],
     ]);
 
@@ -213,6 +241,12 @@ export class ActivityDedupeStore {
       this.database.exec(`
         UPDATE activity_operations
         SET updated_at = CASE WHEN updated_at = 0 THEN created_at ELSE updated_at END,
+          expires_at = CASE
+            WHEN expires_at = 0 THEN
+              (CASE WHEN updated_at = 0 THEN created_at ELSE updated_at END)
+                + ${this.retentionMilliseconds}
+            ELSE expires_at
+          END,
           delivered_at = CASE
             WHEN state = 'delivered' AND delivered_at IS NULL THEN created_at
             ELSE delivered_at
@@ -246,6 +280,7 @@ export class ActivityDedupeStore {
         lease_expires_at = 0,
         receipt = @receipt,
         updated_at = @now,
+        expires_at = @expiresAt,
         delivered_at = @now
       WHERE bot_app_id = @botAppId
         AND tenant_id = @tenantId
@@ -254,14 +289,23 @@ export class ActivityDedupeStore {
         AND activity_id = @activityId
         AND state = 'pending'
         AND lease_owner = @owner
-    `).run({ ...key, now, owner, receipt: normalizedReceipt });
+    `).run({
+      ...key,
+      expiresAt: now + this.retentionMilliseconds,
+      now,
+      owner,
+      receipt: normalizedReceipt,
+    });
     if (result.changes !== 1) throw new Error("Teams delivery lease is no longer owned by this worker");
   }
 
   release(key: ActivityDedupeKey, owner: string, now = Date.now()): boolean {
     const result = this.database.prepare(`
       UPDATE activity_operations
-      SET lease_owner = NULL, lease_expires_at = 0, updated_at = @now
+      SET lease_owner = NULL,
+        lease_expires_at = 0,
+        updated_at = @now,
+        expires_at = @expiresAt
       WHERE bot_app_id = @botAppId
         AND tenant_id = @tenantId
         AND conversation_id = @conversationId
@@ -269,7 +313,7 @@ export class ActivityDedupeStore {
         AND activity_id = @activityId
         AND state = 'pending'
         AND lease_owner = @owner
-    `).run({ ...key, now, owner });
+    `).run({ ...key, expiresAt: now + this.retentionMilliseconds, now, owner });
     return result.changes === 1;
   }
 
@@ -280,7 +324,9 @@ export class ActivityDedupeStore {
   renew(key: ActivityDedupeKey, owner: string, now = Date.now()): boolean {
     const result = this.database.prepare(`
       UPDATE activity_operations
-      SET lease_expires_at = @leaseExpiresAt, updated_at = @now
+      SET lease_expires_at = @leaseExpiresAt,
+        updated_at = @now,
+        expires_at = @expiresAt
       WHERE bot_app_id = @botAppId
         AND tenant_id = @tenantId
         AND conversation_id = @conversationId
@@ -288,14 +334,20 @@ export class ActivityDedupeStore {
         AND activity_id = @activityId
         AND state = 'pending'
         AND lease_owner = @owner
-    `).run({ ...key, leaseExpiresAt: now + this.leaseMilliseconds, now, owner });
+    `).run({
+      ...key,
+      expiresAt: now + this.retentionMilliseconds,
+      leaseExpiresAt: now + this.leaseMilliseconds,
+      now,
+      owner,
+    });
     return result.changes === 1;
   }
 
   get(key: ActivityDedupeKey): RecordedDelivery | undefined {
     const row = this.database.prepare(`
       SELECT kind, payload, state, lease_owner, lease_expires_at,
-        attempt_count, receipt, created_at, updated_at, delivered_at
+        attempt_count, receipt, created_at, updated_at, expires_at, delivered_at
       FROM activity_operations
       WHERE bot_app_id = @botAppId
         AND tenant_id = @tenantId
@@ -308,6 +360,7 @@ export class ActivityDedupeStore {
       attemptCount: row.attempt_count,
       createdAt: row.created_at,
       deliveredAt: row.delivered_at ?? undefined,
+      expiresAt: row.expires_at,
       kind: row.kind,
       leaseExpiresAt: row.lease_expires_at,
       payload: row.payload,
@@ -320,6 +373,15 @@ export class ActivityDedupeStore {
   count(): number {
     const row = this.database.prepare("SELECT COUNT(*) AS count FROM activity_operations").get() as { count: number };
     return row.count;
+  }
+
+  cleanupExpired(now = Date.now()): number {
+    const result = this.database.prepare(
+      `DELETE FROM activity_operations
+       WHERE expires_at <= @now
+         AND (state = 'delivered' OR lease_expires_at <= @now)`,
+    ).run({ now });
+    return result.changes;
   }
 
   close(): void {

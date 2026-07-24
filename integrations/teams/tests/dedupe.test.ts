@@ -121,6 +121,50 @@ describe("ActivityDedupeStore", () => {
     migrated.close();
   });
 
+  it("derives expiry from the last durable update when migrating existing rows", () => {
+    const path = databasePath();
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE activity_operations (
+        bot_app_id TEXT NOT NULL,
+        tenant_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        sender_id TEXT NOT NULL,
+        activity_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        state TEXT NOT NULL,
+        lease_owner TEXT,
+        lease_expires_at INTEGER NOT NULL,
+        attempt_count INTEGER NOT NULL,
+        receipt TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        PRIMARY KEY (bot_app_id, tenant_id, conversation_id, sender_id, activity_id)
+      );
+    `);
+    legacy.prepare(`
+      INSERT INTO activity_operations (
+        bot_app_id, tenant_id, conversation_id, sender_id, activity_id,
+        kind, payload, state, lease_owner, lease_expires_at, attempt_count,
+        receipt, created_at, updated_at, delivered_at
+      ) VALUES (
+        @botAppId, @tenantId, @conversationId, @senderId, @activityId,
+        @kind, @payload, 'delivered', NULL, 0, 1,
+        'reply-1', 1000, 2000, 2000
+      )
+    `).run({ ...key, ...operation });
+    legacy.close();
+
+    const migrated = openStore(path);
+    expect(migrated.get(key)).toMatchObject({
+      expiresAt: 2_000 + 7 * 24 * 60 * 60 * 1000,
+      state: "delivered",
+    });
+    migrated.close();
+  });
+
   it("persists a completed operation across connections and restart", () => {
     const path = databasePath();
     const first = openStore(path);
@@ -144,6 +188,25 @@ describe("ActivityDedupeStore", () => {
     expect(restarted.get(key)).toMatchObject({ receipt: "reply-1", state: "delivered" });
     expect(restarted.count()).toBe(1);
     restarted.close();
+  });
+
+  it("isolates activity identities across every security-boundary key field", () => {
+    const store = openStore(databasePath());
+    const keys = [
+      key,
+      { ...key, botAppId: "33333333-3333-4333-8333-333333333333" },
+      { ...key, tenantId: "44444444-4444-4444-8444-444444444444" },
+      { ...key, conversationId: "conversation-2" },
+      { ...key, senderId: "sender-2" },
+      { ...key, activityId: "activity-2" },
+    ];
+
+    for (const [index, isolatedKey] of keys.entries()) {
+      expect(store.claim(isolatedKey, operation, `worker-${index}`, 1_000).status)
+        .toBe("acquired");
+    }
+    expect(store.count()).toBe(keys.length);
+    store.close();
   });
 
   it("reclaims an abandoned lease after restart without adding a second operation", () => {
@@ -174,6 +237,37 @@ describe("ActivityDedupeStore", () => {
     expect(store.claim(key, operation, "worker-2", 1_091).status).toBe("acquired");
     expect(store.complete.bind(store, key, "worker-1", undefined, 1_092)).toThrow(/no longer owned/);
     store.complete(key, "worker-2", "reply-1", 1_093);
+    store.close();
+  });
+
+  it("records expiry metadata and exposes bounded retention cleanup", () => {
+    const store = new ActivityDedupeStore(databasePath(), {
+      leaseMilliseconds: 50,
+      maxRecords: 2,
+      retentionDays: 1,
+    });
+    expect(store.claim(key, operation, "worker-1", 1_000).status).toBe("acquired");
+    store.complete(key, "worker-1", "reply-1", 1_001);
+
+    expect(store.get(key)).toMatchObject({ expiresAt: 1_001 + 24 * 60 * 60 * 1000 });
+    expect(store.cleanupExpired(1_001 + 24 * 60 * 60 * 1000 - 1)).toBe(0);
+    expect(store.cleanupExpired(1_001 + 24 * 60 * 60 * 1000)).toBe(1);
+    expect(store.get(key)).toBeUndefined();
+    store.close();
+  });
+
+  it("does not clean up a claim while its longer lease is still active", () => {
+    const oneDay = 24 * 60 * 60 * 1000;
+    const store = new ActivityDedupeStore(databasePath(), {
+      leaseMilliseconds: 2 * oneDay,
+      maxRecords: 2,
+      retentionDays: 1,
+    });
+    expect(store.claim(key, operation, "worker-1", 1_000).status).toBe("acquired");
+
+    expect(store.cleanupExpired(1_000 + oneDay)).toBe(0);
+    expect(store.claim(key, operation, "worker-2", 1_000 + oneDay).status).toBe("busy");
+    expect(store.count()).toBe(1);
     store.close();
   });
 
