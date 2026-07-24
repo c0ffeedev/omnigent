@@ -20,6 +20,9 @@ from omnigent.server.routes.sessions import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
+_ADVISOR_AGENT_ID = "c20f0d14f2a14ff09679ece635c8d071"
+_TEST_AGENT_ID = "7b8800b901e849b69a3034f8f29168ed"
+
 
 async def _drain_runner_skills(session_id: str) -> None:
     """Pump the loop until the snapshot's background skills fetch lands.
@@ -214,7 +217,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
             created_at=1,
             updated_at=1,
             root_conversation_id="conv_parent",
-            agent_id="ag_advisor",
+            agent_id=_ADVISOR_AGENT_ID,
         ),
         "conv_child": Conversation(
             id="conv_child",
@@ -222,7 +225,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
             updated_at=1,
             root_conversation_id="conv_parent",
             parent_conversation_id="conv_parent",
-            agent_id="ag_advisor",
+            agent_id=_ADVISOR_AGENT_ID,
             kind="sub_agent",
             sub_agent_name="executor",
         ),
@@ -232,7 +235,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
     class _AgentStore:
         @staticmethod
         def get(agent_id: str) -> Any:
-            assert agent_id == "ag_advisor"
+            assert agent_id == _ADVISOR_AGENT_ID
             return type(
                 "StoredAgent",
                 (),
@@ -242,7 +245,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
     class _AgentCache:
         @staticmethod
         def load(agent_id: str, bundle_location: str) -> Any:
-            assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
+            assert (agent_id, bundle_location) == (_ADVISOR_AGENT_ID, "bundle")
             return type("LoadedAgent", (), {"spec": parent_spec})()
 
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
@@ -723,7 +726,7 @@ async def test_session_snapshot_includes_model_options_from_runner(
         created_at=1,
         updated_at=1,
         root_conversation_id=session_id,
-        agent_id="ag_test",
+        agent_id=_TEST_AGENT_ID,
         labels={
             _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: getattr(_mod, wrapper_attr),
         },
@@ -805,7 +808,7 @@ async def test_session_snapshot_serves_pi_model_options_from_extension_push(
         created_at=1,
         updated_at=1,
         root_conversation_id="conv_pi_options",
-        agent_id="ag_test",
+        agent_id=_TEST_AGENT_ID,
         labels={
             _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._PI_NATIVE_WRAPPER_LABEL_VALUE,
         },
