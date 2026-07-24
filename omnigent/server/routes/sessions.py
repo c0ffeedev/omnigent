@@ -2705,6 +2705,26 @@ def _requires_driver_fence(body: SessionEventInput) -> bool:
     }
 
 
+async def _await_driver_lifecycle_task(task: asyncio.Task[Any]) -> Any:
+    """Await durable cleanup before propagating request cancellation."""
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            cancelled = True
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                current_task.uncancel()
+            if task.done():
+                result = task.result()
+                break
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
 async def _driver_dispatch_lifecycle(request: Request) -> AsyncIterator[None]:
     """Fail an unfinished durable driver dispatch when a request unwinds."""
     try:
@@ -2725,14 +2745,7 @@ async def _driver_dispatch_lifecycle(request: Request) -> AsyncIterator[None]:
                         succeeded=False,
                     )
                 )
-                try:
-                    await asyncio.shield(completion)
-                except asyncio.CancelledError:
-                    current_task = asyncio.current_task()
-                    if current_task is not None:
-                        current_task.uncancel()
-                    await completion
-                    raise
+                await _await_driver_lifecycle_task(completion)
             except Exception:
                 _logger.exception(
                     "Failed to mark driver dispatch %s failed for session %s",
@@ -9135,6 +9148,7 @@ async def _dispatch_skill_slash_command_to_runner(
     agent: Agent,
     has_mcp_servers: bool,
     created_by: str | None,
+    side_effect_guard: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """
     Persist a skill slash command and forward hidden skill context.
@@ -9175,6 +9189,8 @@ async def _dispatch_skill_slash_command_to_runner(
     import uuid
 
     skill_name, arguments = _parse_skill_slash_command(body)
+    if side_effect_guard is not None:
+        await side_effect_guard("before_skill_resolution")
     meta_text = await _resolve_skill_meta_text_via_runner(
         session_id,
         skill_name,
@@ -9205,6 +9221,8 @@ async def _dispatch_skill_slash_command_to_runner(
         ),
         created_by=created_by,
     )
+    if side_effect_guard is not None:
+        await side_effect_guard("before_item_persistence")
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
@@ -9248,6 +9266,8 @@ async def _dispatch_skill_slash_command_to_runner(
         runner_body["harness_override"] = conv.harness_override
 
     try:
+        if side_effect_guard is not None:
+            await side_effect_guard("before_runner_dispatch")
         await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
@@ -9503,6 +9523,7 @@ async def _forward_event_to_runner(
     artifact_store: ArtifactStore | None = None,
     has_mcp_servers: bool = False,
     created_by: str | None = None,
+    side_effect_guard: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -9537,6 +9558,8 @@ async def _forward_event_to_runner(
 
     turn_id = f"turn_{uuid.uuid4().hex}"
     item = _build_new_item(body, turn_id, created_by=created_by)
+    if side_effect_guard is not None:
+        await side_effect_guard("before_item_persistence")
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
@@ -9753,6 +9776,8 @@ async def _forward_event_to_runner(
     # and starts the turn as a background task. No streaming
     # response to drain — events flow through GET /stream.
     try:
+        if side_effect_guard is not None:
+            await side_effect_guard("before_runner_dispatch")
         await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
@@ -9831,6 +9856,7 @@ async def _dispatch_session_event_to_runner(
     created_by: str | None = None,
     runner_router: RunnerRouter | None = None,
     native_terminal_ready: bool = False,
+    side_effect_guard: Callable[[str], Awaitable[None]] | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -9942,6 +9968,8 @@ async def _dispatch_session_event_to_runner(
         # back on any failure/cancellation so a message the TUI never
         # received doesn't replay as a ghost.
         content = body.data.get("content")
+        if side_effect_guard is not None:
+            await side_effect_guard("before_pending_input_enqueue")
         pending_id: str | None = (
             pending_inputs.record(
                 session_id,
@@ -10017,6 +10045,8 @@ async def _dispatch_session_event_to_runner(
         # ────────────────────────────────────────────────────────────
         forwarded = False
         try:
+            if side_effect_guard is not None:
+                await side_effect_guard("before_runner_dispatch")
             await _forward_native_terminal_message(
                 runner_client,
                 session_id,
@@ -10060,6 +10090,7 @@ async def _dispatch_session_event_to_runner(
         artifact_store=artifact_store,
         has_mcp_servers=has_mcp_servers,
         created_by=created_by,
+        side_effect_guard=side_effect_guard,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
@@ -20682,6 +20713,27 @@ def create_sessions_router(
         driver_heartbeat_task: asyncio.Task[None] | None = None
         driver_lease_active = False
 
+        async def _guard_driver_side_effect(point: str) -> None:
+            """Renew the durable fence immediately before a driver side effect."""
+            if driver_dispatch_id is None:
+                return
+            # Tests may install a deterministic barrier. Production never sets
+            # this app-state attribute, so hooks cannot affect normal requests.
+            test_hook = getattr(request.app.state, "driver_fence_test_hook", None)
+            if test_hook is not None:
+                await test_hook(point, driver_dispatch_id)
+            try:
+                # Lease transitions reject an active dispatch. Conversely, a
+                # takeover that reclaimed an expired claim makes this CAS fail,
+                # so a paused stale request cannot resume into the side effect.
+                await asyncio.to_thread(
+                    conversation_store.renew_driver_event,
+                    session_id,
+                    driver_dispatch_id,
+                )
+            except DriverLeaseConflictError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+
         def _start_driver_heartbeat() -> None:
             nonlocal driver_heartbeat_task
             assert driver_dispatch_id is not None
@@ -20740,6 +20792,7 @@ def create_sessions_router(
             if driver_dispatch_id is None:
                 raise RuntimeError("active driver lease disappeared before acceptance")
             _start_driver_heartbeat()
+            await _guard_driver_side_effect("after_acceptance")
 
         async def _finish_driver_response(response: Any) -> Any:
             """Finish durable dispatch state before FastAPI emits a success."""
@@ -20758,12 +20811,8 @@ def create_sessions_router(
                 )
             )
             try:
-                await asyncio.shield(completion)
+                await _await_driver_lifecycle_task(completion)
             except asyncio.CancelledError:
-                current_task = asyncio.current_task()
-                if current_task is not None:
-                    current_task.uncancel()
-                await completion
                 request.state.driver_dispatch = None
                 raise
             request.state.driver_dispatch = None
@@ -20858,6 +20907,7 @@ def create_sessions_router(
                 reason = _input_verdict.get("reason", "Denied by policy")
                 _publish_status(session_id, "running")
                 _publish_policy_deny(session_id, reason)
+                await _guard_driver_side_effect("before_policy_deny_persistence")
                 await _persist_policy_deny_sentinel(
                     session_id,
                     conv,
@@ -20890,6 +20940,7 @@ def create_sessions_router(
                 reason = _input_verdict.get("reason", "Denied by policy")
                 _publish_status(session_id, "running")
                 _publish_policy_deny(session_id, reason)
+                await _guard_driver_side_effect("before_policy_deny_persistence")
                 await _persist_policy_deny_sentinel(
                     session_id,
                     conv,
@@ -20949,6 +21000,7 @@ def create_sessions_router(
 
         if body.type == _INTERRUPT_TYPE:
             await _accept_driver_fence()
+            await _guard_driver_side_effect("before_interrupt_dispatch")
             _publish_interrupted(session_id)
             # Fence the cancelled turn (see _interrupt_fenced_sessions).
             _interrupt_fenced_sessions.add(session_id)
@@ -20996,6 +21048,7 @@ def create_sessions_router(
             # it, letting the web UI show the stop didn't land instead
             # of closing the dialog as if it succeeded.
             try:
+                await _guard_driver_side_effect("before_stop_dispatch")
                 stop_delivered = await _stop_session_via_runner(session_id, runner_router)
             except Exception:
                 # Stop didn't land: the turn keeps running, so lift the
@@ -21023,6 +21076,7 @@ def create_sessions_router(
                 # sessions drop the tunnel on Stop; other harnesses leave the
                 # runner connected, so there is nothing to suppress for them.
                 _intentional_stop_sessions.add(session_id)
+                await _guard_driver_side_effect("before_host_runner_teardown")
                 teardown_delivered = await _stop_session_host_runner(
                     session_id,
                     stop_conv.host_id,
@@ -21062,6 +21116,7 @@ def create_sessions_router(
             return await _finish_driver_response({"queued": False})
         if body.type == _APPROVAL_TYPE:
             await _accept_driver_fence()
+            await _guard_driver_side_effect("before_approval_dispatch")
             # Deliver the verdict through the shared resolver: it
             # sets any server-side harness Future (owner-checked),
             # clears the sidebar badge, and forwards
@@ -21071,6 +21126,7 @@ def create_sessions_router(
             await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
+            await _guard_driver_side_effect("before_approval_policy_writes")
             await _apply_pending_policy_ask_writes(
                 session_id, conv, conversation_store, agent_store, body.data
             )
@@ -21114,6 +21170,7 @@ def create_sessions_router(
             return {"queued": False, "elicitation_id": elicit_id}
         if body.type == _COMPACT_TYPE:
             await _accept_driver_fence()
+            await _guard_driver_side_effect("before_compaction_dispatch")
             # Unified control dispatch (designs/CLAUDE_NATIVE.md
             # "Control events dispatch on the runner"): forward /compact
             # to the bound runner first, regardless of harness. The
@@ -21139,6 +21196,7 @@ def create_sessions_router(
                     f"Compaction failed: runner returned {runner_result.status_code}",
                     code=ErrorCode.INTERNAL_ERROR,
                 )
+            await _guard_driver_side_effect("before_compaction_persistence")
             await _run_compact_locked(
                 session_id,
                 conv,
@@ -21453,6 +21511,7 @@ def create_sessions_router(
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
             try:
+                await _guard_driver_side_effect("before_tool_result_dispatch")
                 await runner_client.post(
                     f"/v1/sessions/{session_id}/events",
                     json={
@@ -21766,6 +21825,7 @@ def create_sessions_router(
                 agent=_agent,
                 has_mcp_servers=_has_mcp_servers,
                 created_by=_attribution_user(user_id),
+                side_effect_guard=_guard_driver_side_effect,
             )
             if pending_background_title is not None:
                 pending_background_title.schedule()
@@ -21783,6 +21843,7 @@ def create_sessions_router(
             created_by=_attribution_user(user_id),
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
+            side_effect_guard=_guard_driver_side_effect,
         )
         if pending_background_title is not None:
             pending_background_title.schedule()
