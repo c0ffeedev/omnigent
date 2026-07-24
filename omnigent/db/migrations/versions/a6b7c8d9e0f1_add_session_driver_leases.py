@@ -72,6 +72,7 @@ def upgrade() -> None:
         sa.Column("state", sa.String(length=16), nullable=False),
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("completed_at", sa.Integer(), nullable=True),
+        sa.Column("claim_expires_at", sa.Integer(), nullable=True),
         sa.CheckConstraint(
             "generation > 0", name="ck_session_driver_dispatches_generation_positive"
         ),
@@ -80,16 +81,21 @@ def upgrade() -> None:
             name="ck_session_driver_dispatches_state",
         ),
         sa.CheckConstraint(
-            "(state = 'running' AND completed_at IS NULL) OR "
-            "(state IN ('completed', 'failed') AND completed_at IS NOT NULL)",
+            "claim_expires_at IS NULL OR claim_expires_at > created_at",
+            name="ck_session_driver_dispatches_claim_window",
+        ),
+        sa.CheckConstraint(
+            "(state = 'running' AND completed_at IS NULL AND claim_expires_at IS NOT NULL) OR "
+            "(state IN ('completed', 'failed') AND completed_at IS NOT NULL "
+            "AND claim_expires_at IS NULL)",
             name="ck_session_driver_dispatches_lifecycle",
         ),
         sa.PrimaryKeyConstraint("workspace_id", "id"),
     )
     op.create_index(
-        "ix_session_driver_dispatches_session_state",
+        "ix_session_driver_dispatches_recovery",
         "session_driver_dispatches",
-        ["workspace_id", "session_id", "state"],
+        ["workspace_id", "session_id", "state", "claim_expires_at"],
     )
     with op.batch_alter_table("conversation_items") as batch_op:
         batch_op.add_column(sa.Column("driver_generation", sa.Integer(), nullable=True))
@@ -100,7 +106,7 @@ def downgrade() -> None:
     with op.batch_alter_table("conversation_items") as batch_op:
         batch_op.drop_column("driver_generation")
     op.drop_index(
-        "ix_session_driver_dispatches_session_state",
+        "ix_session_driver_dispatches_recovery",
         table_name="session_driver_dispatches",
     )
     op.drop_table("session_driver_dispatches")

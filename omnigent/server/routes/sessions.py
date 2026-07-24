@@ -312,6 +312,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
+    DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
     PROJECT_LABEL_KEY,
     ConversationNotFoundError,
     DriverLeaseConflictError,
@@ -332,6 +333,7 @@ from omnigent.telemetry.surface import classify_surface as _classify_surface
 from omnigent.tools.client_specified import parse_client_side_tool_specs
 
 _logger = logging.getLogger(__name__)
+_DRIVER_DISPATCH_HEARTBEAT_INTERVAL_SECONDS = DRIVER_DISPATCH_CLAIM_TTL_SECONDS / 3
 
 # ── Module-level constants (rule 34) ──────────────────────────────
 
@@ -2710,8 +2712,11 @@ async def _driver_dispatch_lifecycle(request: Request) -> AsyncIterator[None]:
     finally:
         dispatch = getattr(request.state, "driver_dispatch", None)
         if dispatch is not None:
-            conversation_store, session_id, dispatch_id = dispatch
+            conversation_store, session_id, dispatch_id, heartbeat_task = dispatch
             try:
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await heartbeat_task
                 completion = asyncio.create_task(
                     asyncio.to_thread(
                         conversation_store.complete_driver_event,
@@ -2736,6 +2741,28 @@ async def _driver_dispatch_lifecycle(request: Request) -> AsyncIterator[None]:
                 )
             finally:
                 request.state.driver_dispatch = None
+
+
+async def _heartbeat_driver_dispatch(
+    conversation_store: ConversationStore,
+    session_id: str,
+    dispatch_id: str,
+    owner_task: asyncio.Task[Any],
+) -> None:
+    """Renew a live request's bounded claim and stop it if fencing is lost."""
+    try:
+        while True:
+            await asyncio.sleep(_DRIVER_DISPATCH_HEARTBEAT_INTERVAL_SECONDS)
+            await asyncio.to_thread(
+                conversation_store.renew_driver_event,
+                session_id,
+                dispatch_id,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        owner_task.cancel()
+        raise
 
 
 def _build_session_response(
@@ -20652,7 +20679,28 @@ def create_sessions_router(
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
         driver_dispatch_id: str | None = None
+        driver_heartbeat_task: asyncio.Task[None] | None = None
         driver_lease_active = False
+
+        def _start_driver_heartbeat() -> None:
+            nonlocal driver_heartbeat_task
+            assert driver_dispatch_id is not None
+            owner_task = asyncio.current_task()
+            assert owner_task is not None
+            driver_heartbeat_task = asyncio.create_task(
+                _heartbeat_driver_dispatch(
+                    conversation_store,
+                    session_id,
+                    driver_dispatch_id,
+                    owner_task,
+                )
+            )
+            request.state.driver_dispatch = (
+                conversation_store,
+                session_id,
+                driver_dispatch_id,
+                driver_heartbeat_task,
+            )
 
         async def _accept_driver_fence() -> None:
             nonlocal driver_dispatch_id
@@ -20681,11 +20729,7 @@ def create_sessions_router(
                         current_task.uncancel()
                     driver_dispatch_id = await acceptance
                     if driver_dispatch_id is not None:
-                        request.state.driver_dispatch = (
-                            conversation_store,
-                            session_id,
-                            driver_dispatch_id,
-                        )
+                        _start_driver_heartbeat()
                     raise
             except NotImplementedError as exc:
                 raise RuntimeError(
@@ -20695,16 +20739,16 @@ def create_sessions_router(
                 raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
             if driver_dispatch_id is None:
                 raise RuntimeError("active driver lease disappeared before acceptance")
-            request.state.driver_dispatch = (
-                conversation_store,
-                session_id,
-                driver_dispatch_id,
-            )
+            _start_driver_heartbeat()
 
         async def _finish_driver_response(response: Any) -> Any:
             """Finish durable dispatch state before FastAPI emits a success."""
             if driver_dispatch_id is None:
                 return response
+            assert driver_heartbeat_task is not None
+            driver_heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await driver_heartbeat_task
             completion = asyncio.create_task(
                 asyncio.to_thread(
                     conversation_store.complete_driver_event,

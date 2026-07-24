@@ -17,6 +17,7 @@ from sqlalchemy import (
     Select,
     and_,
     asc,
+    case,
     delete,
     desc,
     func,
@@ -91,6 +92,7 @@ from omnigent.session_import.models import (
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
+    DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -2058,6 +2060,37 @@ class SqlAlchemyConversationStore(ConversationStore):
         if self._active_driver_dispatch(session, session_id) is not None:
             raise DriverLeaseConflictError("driver dispatch is in progress")
 
+    def _recover_or_reject_driver_dispatch(
+        self,
+        session: Session,
+        session_id: str,
+        now: int,
+    ) -> bool:
+        """Tombstone an expired claim, or reject while its owner is live."""
+        dispatch = self._active_driver_dispatch(session, session_id)
+        if dispatch is None:
+            return False
+        if dispatch.claim_expires_at is None or dispatch.claim_expires_at > now:
+            raise DriverLeaseConflictError("driver dispatch is in progress")
+        result = session.execute(
+            update(SqlSessionDriverDispatch)
+            .where(
+                SqlSessionDriverDispatch.workspace_id == current_workspace_id(),
+                SqlSessionDriverDispatch.id == dispatch.id,
+                SqlSessionDriverDispatch.session_id == session_id,
+                SqlSessionDriverDispatch.state == "running",
+                SqlSessionDriverDispatch.claim_expires_at <= now,
+            )
+            .values(
+                state="failed",
+                completed_at=now,
+                claim_expires_at=None,
+            )
+        )
+        if result.rowcount != 1:
+            raise DriverLeaseConflictError("driver dispatch is in progress")
+        return True
+
     def _record_driver_event(
         self,
         session: Session,
@@ -2221,8 +2254,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         actor_user_id: str,
         generation: int | None,
         event_type: str,
+        *,
+        claim_ttl_seconds: int = DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
     ) -> str | None:
         """Validate, audit, and durably claim an event in one transaction."""
+        if claim_ttl_seconds <= 0:
+            raise ValueError("claim_ttl_seconds must be positive")
         now = now_epoch()
         with self._driver_session(session_id) as session:
             row = self._locked_driver_lease(session, session_id)
@@ -2264,9 +2301,45 @@ class SqlAlchemyConversationStore(ConversationStore):
                     state="running",
                     created_at=now,
                     completed_at=None,
+                    claim_expires_at=now + claim_ttl_seconds,
                 )
             )
             return dispatch_id
+
+    def renew_driver_event(
+        self,
+        session_id: str,
+        dispatch_id: str,
+        *,
+        claim_ttl_seconds: int = DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
+    ) -> None:
+        """Extend an unexpired dispatch claim using its random fencing id."""
+        if claim_ttl_seconds <= 0:
+            raise ValueError("claim_ttl_seconds must be positive")
+        now = now_epoch()
+        renewed_expires_at = now + claim_ttl_seconds
+        with self._driver_session(session_id) as session:
+            result = session.execute(
+                update(SqlSessionDriverDispatch)
+                .where(
+                    SqlSessionDriverDispatch.workspace_id == current_workspace_id(),
+                    SqlSessionDriverDispatch.id == dispatch_id,
+                    SqlSessionDriverDispatch.session_id == session_id,
+                    SqlSessionDriverDispatch.state == "running",
+                    SqlSessionDriverDispatch.claim_expires_at > now,
+                )
+                .values(
+                    claim_expires_at=case(
+                        (
+                            SqlSessionDriverDispatch.claim_expires_at < renewed_expires_at,
+                            renewed_expires_at,
+                        ),
+                        else_=SqlSessionDriverDispatch.claim_expires_at,
+                    )
+                )
+            )
+            if result.rowcount != 1:
+                raise DriverLeaseConflictError("driver dispatch is no longer active")
 
     def complete_driver_event(
         self,
@@ -2276,6 +2349,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         succeeded: bool,
     ) -> None:
         """Finish a durable dispatch claim before the request completes."""
+        now = now_epoch()
         with self._driver_session(session_id) as session:
             result = session.execute(
                 update(SqlSessionDriverDispatch)
@@ -2284,10 +2358,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlSessionDriverDispatch.id == dispatch_id,
                     SqlSessionDriverDispatch.session_id == session_id,
                     SqlSessionDriverDispatch.state == "running",
+                    SqlSessionDriverDispatch.claim_expires_at > now,
                 )
                 .values(
                     state="completed" if succeeded else "failed",
-                    completed_at=now_epoch(),
+                    completed_at=now,
+                    claim_expires_at=None,
                 )
             )
             if result.rowcount != 1:
@@ -2347,7 +2423,20 @@ class SqlAlchemyConversationStore(ConversationStore):
             previous_holder = row.holder_user_id
             same_holder = active and row.holder_user_id == actor_user_id
             if not same_holder:
-                self._reject_active_driver_dispatch(session, session_id)
+                dispatch_recovered = self._recover_or_reject_driver_dispatch(
+                    session,
+                    session_id,
+                    now,
+                )
+            else:
+                dispatch = self._active_driver_dispatch(session, session_id)
+                dispatch_recovered = (
+                    dispatch is not None
+                    and dispatch.claim_expires_at is not None
+                    and dispatch.claim_expires_at <= now
+                    and self._recover_or_reject_driver_dispatch(session, session_id, now)
+                )
+            same_holder = same_holder and not dispatch_recovered
             generation = old_generation if same_holder else old_generation + 1
             result = session.execute(
                 update(SqlSessionDriverLease)

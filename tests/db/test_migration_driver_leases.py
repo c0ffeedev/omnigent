@@ -116,5 +116,48 @@ def test_driver_lease_migration_enforces_lifecycle(tmp_path: Path) -> None:
             with pytest.raises(IntegrityError):
                 with engine.begin() as connection:
                     connection.execute(leases.insert().values(**row))
+
+        dispatches = sa.Table(
+            "session_driver_dispatches",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        valid_dispatch = {
+            "workspace_id": 0,
+            "id": bytes.fromhex("412233445566478890abcdef12345678"),
+            "session_id": bytes.fromhex("112233445566478890abcdef12345678"),
+            "actor_user_id": "alice@example.com",
+            "generation": 1,
+            "input_type": "message",
+            "state": "running",
+            "created_at": 100,
+            "completed_at": None,
+            "claim_expires_at": 130,
+        }
+        with engine.begin() as connection:
+            connection.execute(dispatches.insert().values(**valid_dispatch))
+
+        invalid_dispatches = (
+            {
+                **valid_dispatch,
+                "id": bytes.fromhex("512233445566478890abcdef12345678"),
+                "claim_expires_at": None,
+            },
+            {
+                **valid_dispatch,
+                "id": bytes.fromhex("612233445566478890abcdef12345678"),
+                "state": "completed",
+                "completed_at": 101,
+            },
+            {
+                **valid_dispatch,
+                "id": bytes.fromhex("712233445566478890abcdef12345678"),
+                "claim_expires_at": 100,
+            },
+        )
+        for row in invalid_dispatches:
+            with pytest.raises(IntegrityError):
+                with engine.begin() as connection:
+                    connection.execute(dispatches.insert().values(**row))
     finally:
         engine.dispose()

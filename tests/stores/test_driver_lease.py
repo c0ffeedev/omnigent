@@ -11,7 +11,11 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 
-from omnigent.db.db_models import SqlSessionDriverEvent, workspace_scope
+from omnigent.db.db_models import (
+    SqlSessionDriverDispatch,
+    SqlSessionDriverEvent,
+    workspace_scope,
+)
 from omnigent.stores.conversation_store import DriverLeaseConflictError
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -233,6 +237,91 @@ def test_driver_completion_commit_connection_loss_remains_fenced_until_retry(
         conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
     conversation_store.complete_driver_event(session_id, dispatch_id, succeeded=True)
     assert conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True).generation == 2
+
+
+def test_expired_dispatch_is_recovered_after_restart_and_fences_old_owner(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replica can tombstone a crashed dispatch and advance the lease generation."""
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    session_id = conversation_store.create_conversation().id
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 100)
+    conversation_store.acquire_driver_lease(session_id, ALICE, 30)
+    dispatch_id = conversation_store.begin_driver_event(
+        session_id,
+        ALICE,
+        1,
+        "message",
+        claim_ttl_seconds=10,
+    )
+    assert dispatch_id is not None
+
+    restarted_store = SqlAlchemyConversationStore(db_uri)
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 110)
+    recovered = restarted_store.acquire_driver_lease(session_id, BOB, 30, force=True)
+
+    assert recovered.generation == 2
+    with pytest.raises(DriverLeaseConflictError, match="no longer active"):
+        conversation_store.renew_driver_event(
+            session_id,
+            dispatch_id,
+            claim_ttl_seconds=10,
+        )
+    with pytest.raises(DriverLeaseConflictError, match="no longer active"):
+        conversation_store.complete_driver_event(session_id, dispatch_id, succeeded=True)
+    with restarted_store._conv_session() as session:
+        dispatch = session.get(SqlSessionDriverDispatch, (0, dispatch_id))
+        assert dispatch is not None
+        assert dispatch.state == "failed"
+        assert dispatch.completed_at == 110
+        assert dispatch.claim_expires_at is None
+
+
+def test_dispatch_heartbeat_renews_before_boundary_and_expires_at_boundary(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Heartbeat renewal is strict: live before expiry, recoverable at expiry."""
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    session_id = conversation_store.create_conversation().id
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 100)
+    conversation_store.acquire_driver_lease(session_id, ALICE, 30)
+    dispatch_id = conversation_store.begin_driver_event(
+        session_id,
+        ALICE,
+        1,
+        "message",
+        claim_ttl_seconds=10,
+    )
+    assert dispatch_id is not None
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 109)
+    conversation_store.renew_driver_event(
+        session_id,
+        dispatch_id,
+        claim_ttl_seconds=10,
+    )
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 105)
+    conversation_store.renew_driver_event(
+        session_id,
+        dispatch_id,
+        claim_ttl_seconds=10,
+    )
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 110)
+    with pytest.raises(DriverLeaseConflictError, match="dispatch is in progress"):
+        conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 116)
+    with pytest.raises(DriverLeaseConflictError, match="dispatch is in progress"):
+        conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 119)
+    recovered = conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
+    assert recovered.generation == 2
 
 
 def test_driver_mutations_hold_at_most_one_pool_connection_per_thread(

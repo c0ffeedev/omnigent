@@ -3604,12 +3604,15 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The route holds its durable fence through persistence and runner POST."""
+    """The route renews its bounded fence while the runner POST is in flight."""
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
 
     runner_entered = asyncio.Event()
     runner_release = asyncio.Event()
+    heartbeat_renewed = threading.Event()
     forwarded: list[tuple[str, dict[str, Any]]] = []
+    clock = [100]
 
     class _Runner:
         async def post(self, path: str, **kwargs: Any) -> httpx.Response:
@@ -3621,6 +3624,20 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
     async def _runner(*_: Any, **__: Any) -> _Runner:
         return _Runner()
 
+    original_renew = SqlAlchemyConversationStore.renew_driver_event
+
+    def _renew_with_signal(
+        store: SqlAlchemyConversationStore,
+        event_session_id: str,
+        dispatch_id: str,
+        **kwargs: Any,
+    ) -> None:
+        original_renew(store, event_session_id, dispatch_id, **kwargs)
+        heartbeat_renewed.set()
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: clock[0])
+    monkeypatch.setattr(sessions_module, "_DRIVER_DISPATCH_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "renew_driver_event", _renew_with_signal)
     monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
     agent = await create_test_agent(auth_client, user="alice@example.com")
     session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
@@ -3656,6 +3673,10 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
     takeover_task: asyncio.Task[httpx.Response] | None = None
     try:
         await asyncio.wait_for(runner_entered.wait(), timeout=5)
+        heartbeat_renewed.clear()
+        clock[0] = 399
+        assert await asyncio.to_thread(heartbeat_renewed.wait, 1)
+        clock[0] = 400
         takeover_task = asyncio.create_task(
             auth_client.post(
                 f"/v1/sessions/{session_id}/driver/acquire",

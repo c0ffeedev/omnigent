@@ -14,6 +14,8 @@ from omnigent.entities import (
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 
+DRIVER_DISPATCH_CLAIM_TTL_SECONDS = 300
+
 # Label set on a fork of a session that had a working directory. Its
 # value is the source session id. Presence marks the (unbound) clone as
 # needing a host + working directory before it can run, so the
@@ -321,8 +323,20 @@ class ConversationStore(ABC):
         actor_user_id: str,
         generation: int | None,
         event_type: str,
+        *,
+        claim_ttl_seconds: int = DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
     ) -> str | None:
         """Atomically validate, accept, and claim a human driver event."""
+        raise NotImplementedError
+
+    def renew_driver_event(
+        self,
+        session_id: str,
+        dispatch_id: str,
+        *,
+        claim_ttl_seconds: int = DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
+    ) -> None:
+        """Renew an unexpired durable dispatch claim."""
         raise NotImplementedError
 
     def complete_driver_event(

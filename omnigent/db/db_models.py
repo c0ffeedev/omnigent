@@ -1541,6 +1541,7 @@ class SqlSessionDriverDispatch(ConversationBase):
     state: Mapped[str] = mapped_column(String(16), nullable=False)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     completed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    claim_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         CheckConstraint("generation > 0", name="ck_session_driver_dispatches_generation_positive"),
@@ -1549,15 +1550,21 @@ class SqlSessionDriverDispatch(ConversationBase):
             name="ck_session_driver_dispatches_state",
         ),
         CheckConstraint(
-            "(state = 'running' AND completed_at IS NULL) OR "
-            "(state IN ('completed', 'failed') AND completed_at IS NOT NULL)",
+            "claim_expires_at IS NULL OR claim_expires_at > created_at",
+            name="ck_session_driver_dispatches_claim_window",
+        ),
+        CheckConstraint(
+            "(state = 'running' AND completed_at IS NULL AND claim_expires_at IS NOT NULL) OR "
+            "(state IN ('completed', 'failed') AND completed_at IS NOT NULL "
+            "AND claim_expires_at IS NULL)",
             name="ck_session_driver_dispatches_lifecycle",
         ),
         Index(
-            "ix_session_driver_dispatches_session_state",
+            "ix_session_driver_dispatches_recovery",
             "workspace_id",
             "session_id",
             "state",
+            "claim_expires_at",
         ),
     )
 
