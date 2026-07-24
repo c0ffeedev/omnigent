@@ -58,7 +58,11 @@ import jwt
 from fastapi import APIRouter, HTTPException, Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.auth import (
+    INTERACTIVE_DELEGATED_SCOPE,
+    SESSIONS_DELEGATED_SCOPE,
+    UnifiedAuthProvider,
+)
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
 from omnigent.server.routes._origin import require_trusted_origin
 
@@ -78,7 +82,8 @@ _CLIENT_SECRET_HEADER = "X-Omnigent-Client-Secret"
 # Scope granted to delegated (device-grant) access tokens. Restricts them
 # to the session-facing APIs a delegated client needs; the auth layer
 # refuses admin / user-management paths for a token carrying this scope.
-DELEGATED_SCOPE = "sessions"
+DELEGATED_SCOPE = SESSIONS_DELEGATED_SCOPE
+_SUPPORTED_DELEGATED_SCOPES = frozenset({SESSIONS_DELEGATED_SCOPE, INTERACTIVE_DELEGATED_SCOPE})
 
 # RFC 8628 timings.
 _DEVICE_CODE_TTL_SECONDS = 600  # 10 min — bounds the unapproved window.
@@ -111,6 +116,15 @@ def _client_id(body: dict) -> str | None:
     return (body.get("client_id") or "").strip() or None
 
 
+def _requested_scope(body: dict) -> str | None:
+    """Return the requested delegated scope, defaulting legacy clients."""
+    raw_scope = body.get("scope", DELEGATED_SCOPE)
+    if not isinstance(raw_scope, str):
+        return None
+    scope = raw_scope.strip()
+    return scope if scope in _SUPPORTED_DELEGATED_SCOPES else None
+
+
 def _mint_refresh_token() -> str:
     """Return a fresh high-entropy refresh token (raw; stored hashed)."""
     return secrets.token_urlsafe(32)
@@ -140,9 +154,8 @@ def mint_delegated_token(
       checked against the revocation denylist so revoking the grant
       immediately kills the token.
     - ``jti`` — unique token id, for audit/log correlation.
-    - ``act`` — provenance (RFC 8693 style), ``{"client_id": "<app>"}``,
-      naming the application that obtained the grant so every delegated
-      action is attributable to it.
+    - ``act`` — provenance (RFC 8693 style), naming the application and
+      delegated scope so every delegated action is attributable to both.
 
     :param user_id: The Omnigent identity the token acts as (``sub``).
     :param cookie_secret: HMAC key for HS256 signing.
@@ -164,7 +177,7 @@ def mint_delegated_token(
         "scope": scope,
         "grant_id": grant_id,
         "jti": jti,
-        "act": {"client_id": client_id},
+        "act": {"client_id": client_id, "scope": scope},
     }
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
@@ -308,7 +321,7 @@ def create_device_auth_router(
     # authorize so the table stays bounded without a separate scheduler.
     _last_purge = {"at": 0.0}
 
-    def _issue_access_token(grant_id: str, user_id: str, client_id: str) -> str:
+    def _issue_access_token(grant_id: str, user_id: str, client_id: str, scope: str) -> str:
         return mint_delegated_token(
             user_id,
             cookie_secret,
@@ -317,6 +330,7 @@ def create_device_auth_router(
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
+            scope=scope,
         )
 
     # ── Device authorization (public) ─────────────────────────────
@@ -358,6 +372,9 @@ def create_device_auth_router(
         if not isinstance(body, dict):
             body = {}
         client_id = _client_id(body)
+        requested_scope = _requested_scope(body)
+        if requested_scope is None:
+            return _oauth_error("invalid_scope")
 
         device_code = secrets.token_urlsafe(32)
         grant_id = secrets.token_urlsafe(16)
@@ -368,6 +385,7 @@ def create_device_auth_router(
             device_code_hash=hash_secret(device_code, cookie_secret),
             user_code=user_code,
             client_id=client_id,
+            scope=requested_scope,
             created_at=now,
             expires_at=now + _DEVICE_CODE_TTL_SECONDS,
         )
@@ -424,6 +442,7 @@ def create_device_auth_router(
                 user_code=user_code,
                 user_id=user_id,
                 client_id=grant.client_id,
+                scope=grant.scope,
             ),
             status_code=200,
         )
@@ -543,6 +562,7 @@ def create_device_auth_router(
             redeemed.id,
             redeemed.user_id,
             redeemed.client_id or "",
+            redeemed.scope,
         )
         _logger.info("oauth/token: issued delegated token for grant %s", redeemed.id)
         return JSONResponse(
@@ -599,6 +619,7 @@ def create_device_auth_router(
             rotated.id,
             rotated.user_id,
             rotated.client_id or "",
+            rotated.scope,
         )
         return JSONResponse(
             status_code=200,
@@ -661,6 +682,7 @@ def _consent_html(
     user_code: str = "",
     user_id: str = "",
     client_id: str | None = None,
+    scope: str = DELEGATED_SCOPE,
     prompt_for_code: bool = False,
     error: str = "",
     approved_as: str = "",
@@ -699,6 +721,7 @@ def _consent_html(
             "<h1>Authorize access</h1>"
             f"<p>{app_name} is requesting permission to act as "
             f"<b>{esc(user_id)}</b> on this Omnigent server.</p>"
+            f'<p class="muted">Requested scope: <b>{esc(scope)}</b></p>'
             f'<p class="muted">Code: {esc(user_code)}</p>'
             '<p class="warn">⚠️ Only approve if <b>you</b> just started this '
             "login and this code matches the one the application showed you. If "

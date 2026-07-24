@@ -59,6 +59,7 @@ def _to_device_grant(row: SqlDeviceGrant) -> DeviceGrant:
         user_code=row.user_code,
         status=decode_device_grant_status(row.status),
         client_id=row.client_id,
+        scope=row.scope,
         user_id=row.user_id,
         created_at=row.created_at,
         expires_at=row.expires_at,
@@ -94,6 +95,7 @@ class DeviceGrantStore:
         client_id: str | None,
         created_at: int,
         expires_at: int,
+        scope: str = "sessions",
     ) -> DeviceGrant:
         """Persist a new ``pending`` grant.
 
@@ -107,6 +109,7 @@ class DeviceGrantStore:
         :param client_id: RFC 8628 client identifier — a public string
             naming the requesting application (e.g. ``"slack"``); display +
             audit only.
+        :param scope: Delegated authorization scope requested by the client.
         :param created_at: Unix epoch seconds.
         :param expires_at: Unix epoch seconds the device_code expires.
         :returns: The created :class:`DeviceGrant`.
@@ -118,6 +121,7 @@ class DeviceGrantStore:
                 user_code=user_code,
                 status=encode_device_grant_status("pending"),
                 client_id=client_id,
+                scope=scope,
                 user_id=None,
                 refresh_token_hash=None,
                 prev_refresh_token_hash=None,
