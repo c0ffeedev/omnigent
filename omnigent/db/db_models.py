@@ -624,6 +624,7 @@ class SqlDeviceGrant(OmnigentBase):
     # row↔entity boundary.
     status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     client_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    scope: Mapped[str] = mapped_column(String(64), nullable=False, server_default="sessions")
     user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     refresh_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Digest of the just-superseded refresh token, kept only so a replay

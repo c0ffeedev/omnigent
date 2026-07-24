@@ -29,6 +29,7 @@ class DeviceGrant:
     :param client_id: RFC 8628 client identifier — a public string naming
         the requesting application (e.g. ``"slack"``); display + audit
         only, not an authorization key.
+    :param scope: Delegated authorization scope approved by the user.
     :param user_id: Omnigent identity that approved it; ``None`` while
         pending.
     :param created_at: Unix epoch seconds when created.
@@ -44,6 +45,7 @@ class DeviceGrant:
     user_code: str
     status: str
     client_id: str | None
+    scope: str
     user_id: str | None
     created_at: int
     expires_at: int
