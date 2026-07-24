@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -112,6 +113,10 @@ class _ViewerEntry:
 # subscriber registry in ``omnigent.runtime.session_stream``.
 _viewers: dict[str, dict[str, _ViewerEntry]] = {}
 
+# Explicit REST heartbeats are ephemeral transport state. Driver authority
+# lives only in the persisted lease store.
+_heartbeats: dict[str, dict[str, tuple[int, int]]] = {}
+
 # (root_conversation_id, user_id) -> pending leave-broadcast timer.
 _pending_leaves: dict[tuple[str, str], asyncio.TimerHandle] = {}
 
@@ -150,16 +155,60 @@ def snapshot(root_id: str, conversation_id: str) -> dict[str, Any]:
         "viewers": [{"user_id": …, "joined_at": …, "idle": …}]}``,
         with viewers ordered by join time for stable rendering.
     """
+    now = int(time.time())
     with _lock:
+        heartbeat_rows = _heartbeats.get(root_id, {})
+        for user_id in [
+            user_id for user_id, (_, expires_at) in heartbeat_rows.items() if expires_at <= now
+        ]:
+            heartbeat_rows.pop(user_id, None)
         entries = list(_viewers.get(root_id, {}).items())
+        heartbeat_users = set(heartbeat_rows)
     viewers = [
         {"user_id": user_id, "joined_at": entry.joined_at, "idle": entry.idle}
         for user_id, entry in sorted(entries, key=lambda item: item[1].joined_at)
     ]
+    visible_users = {viewer["user_id"] for viewer in viewers}
+    viewers.extend(
+        {"user_id": user_id, "joined_at": _now_iso(), "idle": False}
+        for user_id in sorted(heartbeat_users - visible_users)
+    )
     return {
         "type": "session.presence",
         "conversation_id": conversation_id,
         "viewers": viewers,
+    }
+
+
+def heartbeat(
+    root_id: str,
+    conversation_id: str,
+    user_id: str,
+    ttl_seconds: int,
+) -> dict[str, Any]:
+    """Refresh explicit ephemeral presence and return a detailed snapshot."""
+    now = int(time.time())
+    with _lock:
+        _heartbeats.setdefault(root_id, {})[user_id] = (now, now + ttl_seconds)
+    _broadcast(root_id)
+    return presence_state(root_id, conversation_id)
+
+
+def presence_state(root_id: str, conversation_id: str) -> dict[str, Any]:
+    """Return active collaborator IDs plus heartbeat freshness metadata."""
+    event = snapshot(root_id, conversation_id)
+    now = int(time.time())
+    with _lock:
+        heartbeat_rows = dict(_heartbeats.get(root_id, {}))
+    entries = []
+    for viewer in event["viewers"]:
+        user_id = viewer["user_id"]
+        last_seen, expires_at = heartbeat_rows.get(user_id, (now, now + int(_LEAVE_GRACE_S)))
+        entries.append({"user_id": user_id, "last_seen": last_seen, "expires_at": expires_at})
+    return {
+        "session_id": conversation_id,
+        "active_user_ids": [entry["user_id"] for entry in entries],
+        "entries": entries,
     }
 
 
@@ -333,5 +382,6 @@ def reset_for_tests() -> None:
         timers = list(_pending_leaves.values())
         _pending_leaves.clear()
         _viewers.clear()
+        _heartbeats.clear()
     for timer in timers:
         timer.cancel()

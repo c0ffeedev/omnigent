@@ -1134,6 +1134,9 @@ class SessionEventInput(BaseModel):
         "description": "...", "parameters": {...}}}]``. Ignored
         when the event steers into an active task: that task's
         tools are fixed at start time.
+    :param driver_generation: Optional lease fencing token. Required for
+        human-authored turn/control events after a session first acquires a
+        driver lease; omitted by legacy clients on lease-free sessions.
     """
 
     type: str
@@ -1143,6 +1146,11 @@ class SessionEventInput(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
+    driver_generation: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class SessionGitOptions(BaseModel):
@@ -1550,6 +1558,63 @@ class ModelUsage(BaseModel):
     total_cost_usd: float | None = None
 
 
+class DriverLeaseResponse(BaseModel):
+    """Current persisted driver lease and fencing generation."""
+
+    session_id: str
+    holder_user_id: str | None = None
+    generation: int
+    acquired_at: int | None = None
+    renewed_at: int | None = None
+    expires_at: int | None = None
+    released_at: int | None = None
+    active: bool
+
+
+class DriverLeaseAcquireRequest(BaseModel):
+    """Acquire or, for managers, force-take a session driver lease."""
+
+    ttl_seconds: int = Field(default=30, ge=5, le=300)
+    force: bool = False
+
+
+class DriverLeaseGenerationRequest(BaseModel):
+    """Generation-fenced renew/release request."""
+
+    generation: int = Field(ge=1)
+    ttl_seconds: int = Field(default=30, ge=5, le=300)
+
+
+class DriverLeaseHandoffRequest(BaseModel):
+    """Generation-fenced handoff to a specified collaborator."""
+
+    generation: int = Field(ge=1)
+    holder_user_id: str = Field(min_length=1, max_length=128)
+    ttl_seconds: int = Field(default=30, ge=5, le=300)
+
+
+class PresenceHeartbeatRequest(BaseModel):
+    """Refresh the caller's ephemeral collaborator-presence TTL."""
+
+    ttl_seconds: int = Field(default=60, ge=10, le=300)
+
+
+class PresenceEntry(BaseModel):
+    """One currently active collaborator."""
+
+    user_id: str
+    last_seen: int
+    expires_at: int
+
+
+class SessionPresenceResponse(BaseModel):
+    """Current ephemeral collaborator-presence snapshot."""
+
+    session_id: str
+    active_user_ids: list[str] = Field(default_factory=list)
+    entries: list[PresenceEntry] = Field(default_factory=list)
+
+
 class SessionResponse(BaseModel):
     """
     API representation of a session.
@@ -1802,6 +1867,8 @@ class SessionResponse(BaseModel):
     reasoning_effort: str | None = None
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None
+    driver_lease: DriverLeaseResponse | None = None
+    presence: SessionPresenceResponse | None = None
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     root_conversation_id: str | None = None
@@ -3351,6 +3418,14 @@ class SessionPresenceEvent(_SSEEventBase):
     viewers: list[PresenceViewer]
 
 
+class SessionDriverLeaseEvent(_SSEEventBase):
+    """The authoritative driver lease changed; clients replace local state."""
+
+    type: Literal["session.driver_lease"]
+    conversation_id: str
+    driver_lease: DriverLeaseResponse | None
+
+
 class ElicitationRequestParams(BaseModel):
     """
     Inner ``params`` block of a :class:`ElicitationRequestEvent`.
@@ -4018,6 +4093,7 @@ ServerStreamEvent = Annotated[
     | SessionCreatedEvent
     | SessionSupersededEvent
     | SessionPresenceEvent
+    | SessionDriverLeaseEvent
     # ── Transient (SSE-only) — session resource lifecycle ─────
     | SessionResourceCreatedEvent
     | SessionResourceDeletedEvent

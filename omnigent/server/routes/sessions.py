@@ -234,6 +234,10 @@ from omnigent.server.schemas import (
     CopyFilesRequest,
     CopyFilesResponse,
     CreatedSessionResponse,
+    DriverLeaseAcquireRequest,
+    DriverLeaseGenerationRequest,
+    DriverLeaseHandoffRequest,
+    DriverLeaseResponse,
     ElicitationRequestEvent,
     ElicitationRequestParams,
     ElicitationResult,
@@ -249,6 +253,7 @@ from omnigent.server.schemas import (
     PermissionObject,
     PolicyDeniedEvent,
     PolicySummary,
+    PresenceHeartbeatRequest,
     ReadStatePutRequest,
     ReasoningStartedEvent,
     ReasoningTextDeltaEvent,
@@ -273,6 +278,7 @@ from omnigent.server.schemas import (
     SessionMcpStartupEvent,
     SessionModelEvent,
     SessionModelOptionsEvent,
+    SessionPresenceResponse,
     SessionReasoningEffortEvent,
     SessionResourceListPage,
     SessionResourceObject,
@@ -306,9 +312,12 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
+    DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
     PROJECT_LABEL_KEY,
     ConversationNotFoundError,
+    DriverLeaseConflictError,
     NameAlreadyExistsError,
+    SessionDriverLease,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
@@ -324,6 +333,7 @@ from omnigent.telemetry.surface import classify_surface as _classify_surface
 from omnigent.tools.client_specified import parse_client_side_tool_specs
 
 _logger = logging.getLogger(__name__)
+_DRIVER_DISPATCH_HEARTBEAT_INTERVAL_SECONDS = DRIVER_DISPATCH_CLAIM_TTL_SECONDS / 3
 
 # ── Module-level constants (rule 34) ──────────────────────────────
 
@@ -2663,6 +2673,111 @@ def _pending_elicitation_snapshot_for_session(
     return events
 
 
+def _driver_lease_response(lease: SessionDriverLease | None) -> DriverLeaseResponse | None:
+    """Project a persisted lease without treating expiry as ownership."""
+    if lease is None:
+        return None
+    return DriverLeaseResponse(
+        session_id=lease.session_id,
+        holder_user_id=lease.holder_user_id,
+        generation=lease.generation,
+        acquired_at=lease.acquired_at,
+        renewed_at=lease.renewed_at,
+        expires_at=lease.expires_at,
+        released_at=lease.released_at,
+        active=lease.is_active(),
+    )
+
+
+def _requires_driver_fence(body: SessionEventInput) -> bool:
+    """Return whether an event can drive or control a human-authored turn."""
+    if body.type == "message":
+        return body.data.get("role") == "user"
+    if body.type == "function_call" and body.data.get("evaluate_policy"):
+        return False
+    return body.type in {
+        "function_call_output",
+        _APPROVAL_TYPE,
+        _COMPACT_TYPE,
+        _INTERRUPT_TYPE,
+        _SLASH_COMMAND_TYPE,
+        _STOP_SESSION_TYPE,
+    }
+
+
+async def _await_driver_lifecycle_task(task: asyncio.Task[Any]) -> Any:
+    """Await durable cleanup before propagating request cancellation."""
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            cancelled = True
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                current_task.uncancel()
+            if task.done():
+                result = task.result()
+                break
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+async def _driver_dispatch_lifecycle(request: Request) -> AsyncIterator[None]:
+    """Fail an unfinished durable driver dispatch when a request unwinds."""
+    try:
+        yield
+    finally:
+        dispatch = getattr(request.state, "driver_dispatch", None)
+        if dispatch is not None:
+            conversation_store, session_id, dispatch_id, heartbeat_task = dispatch
+            try:
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await heartbeat_task
+                completion = asyncio.create_task(
+                    asyncio.to_thread(
+                        conversation_store.complete_driver_event,
+                        session_id,
+                        dispatch_id,
+                        succeeded=False,
+                    )
+                )
+                await _await_driver_lifecycle_task(completion)
+            except Exception:
+                _logger.exception(
+                    "Failed to mark driver dispatch %s failed for session %s",
+                    dispatch_id,
+                    session_id,
+                )
+            finally:
+                request.state.driver_dispatch = None
+
+
+async def _heartbeat_driver_dispatch(
+    conversation_store: ConversationStore,
+    session_id: str,
+    dispatch_id: str,
+    owner_task: asyncio.Task[Any],
+) -> None:
+    """Renew a live request's bounded claim and stop it if fencing is lost."""
+    try:
+        while True:
+            await asyncio.sleep(_DRIVER_DISPATCH_HEARTBEAT_INTERVAL_SECONDS)
+            await asyncio.to_thread(
+                conversation_store.renew_driver_event,
+                session_id,
+                dispatch_id,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        owner_task.cancel()
+        raise
+
+
 def _build_session_response(
     conv: Conversation,
     items: list[ConversationItem],
@@ -2682,6 +2797,8 @@ def _build_session_response(
     subtree_usage: dict[str, Any] | None = None,
     model_options: list[dict[str, Any]] | None = None,
     visible_team_ids: set[str] | None = None,
+    driver_lease: SessionDriverLease | None = None,
+    presence_state: dict[str, Any] | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -2787,6 +2904,10 @@ def _build_session_response(
         reasoning_effort=conv.reasoning_effort,
         items=items,
         permission_level=permission_level,
+        driver_lease=_driver_lease_response(driver_lease),
+        presence=(
+            SessionPresenceResponse.model_validate(presence_state) if presence_state else None
+        ),
         sub_agent_name=conv.sub_agent_name,
         parent_session_id=conv.parent_conversation_id,
         root_conversation_id=conv.root_conversation_id,
@@ -5401,6 +5522,8 @@ async def _persist_external_conversation_item(
             # bubble then disappear once the committed item arrived.
             if drained.created_by is not None and item.created_by is None:
                 item = item.model_copy(update={"created_by": drained.created_by})
+            if drained.driver_generation is not None and item.driver_generation is None:
+                item = item.model_copy(update={"driver_generation": drained.driver_generation})
         elif item.created_by is None and created_by is not None:
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
@@ -5445,6 +5568,7 @@ async def _persist_skipped_kiro_pending_input(
         response_id=turn_id,
         data=MessageData(role="user", content=skipped.content),
         created_by=skipped.created_by,
+        driver_generation=skipped.driver_generation,
     )
     error = ErrorData(
         source="execution",
@@ -8873,6 +8997,7 @@ def _build_new_item(
         response_id=response_id,
         data=data,
         created_by=created_by,
+        driver_generation=body.driver_generation,
     )
 
 
@@ -9023,6 +9148,7 @@ async def _dispatch_skill_slash_command_to_runner(
     agent: Agent,
     has_mcp_servers: bool,
     created_by: str | None,
+    side_effect_guard: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """
     Persist a skill slash command and forward hidden skill context.
@@ -9063,6 +9189,8 @@ async def _dispatch_skill_slash_command_to_runner(
     import uuid
 
     skill_name, arguments = _parse_skill_slash_command(body)
+    if side_effect_guard is not None:
+        await side_effect_guard("before_skill_resolution")
     meta_text = await _resolve_skill_meta_text_via_runner(
         session_id,
         skill_name,
@@ -9093,6 +9221,8 @@ async def _dispatch_skill_slash_command_to_runner(
         ),
         created_by=created_by,
     )
+    if side_effect_guard is not None:
+        await side_effect_guard("before_item_persistence")
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
@@ -9136,6 +9266,8 @@ async def _dispatch_skill_slash_command_to_runner(
         runner_body["harness_override"] = conv.harness_override
 
     try:
+        if side_effect_guard is not None:
+            await side_effect_guard("before_runner_dispatch")
         await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
@@ -9257,6 +9389,7 @@ async def _persist_session_event(
     session_id: str,
     body: SessionEventInput,
     conversation_store: ConversationStore,
+    created_by: str | None = None,
 ) -> str:
     """
     Persist a user event without forwarding to a runner.
@@ -9274,7 +9407,7 @@ async def _persist_session_event(
     import uuid
 
     turn_id = f"turn_{uuid.uuid4().hex}"
-    item = _build_new_item(body, turn_id)
+    item = _build_new_item(body, turn_id, created_by=created_by)
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
@@ -9390,6 +9523,7 @@ async def _forward_event_to_runner(
     artifact_store: ArtifactStore | None = None,
     has_mcp_servers: bool = False,
     created_by: str | None = None,
+    side_effect_guard: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -9424,6 +9558,8 @@ async def _forward_event_to_runner(
 
     turn_id = f"turn_{uuid.uuid4().hex}"
     item = _build_new_item(body, turn_id, created_by=created_by)
+    if side_effect_guard is not None:
+        await side_effect_guard("before_item_persistence")
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
@@ -9504,6 +9640,8 @@ async def _forward_event_to_runner(
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
     }
+    if body.driver_generation is not None:
+        runner_body["driver_generation"] = body.driver_generation
     if created_by is not None:
         runner_body["actor"] = _build_actor(created_by)
     # Forward request-supplied client-side tool schemas so non-native
@@ -9638,6 +9776,8 @@ async def _forward_event_to_runner(
     # and starts the turn as a background task. No streaming
     # response to drain — events flow through GET /stream.
     try:
+        if side_effect_guard is not None:
+            await side_effect_guard("before_runner_dispatch")
         await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
@@ -9716,6 +9856,7 @@ async def _dispatch_session_event_to_runner(
     created_by: str | None = None,
     runner_router: RunnerRouter | None = None,
     native_terminal_ready: bool = False,
+    side_effect_guard: Callable[[str], Awaitable[None]] | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -9827,8 +9968,15 @@ async def _dispatch_session_event_to_runner(
         # back on any failure/cancellation so a message the TUI never
         # received doesn't replay as a ghost.
         content = body.data.get("content")
+        if side_effect_guard is not None:
+            await side_effect_guard("before_pending_input_enqueue")
         pending_id: str | None = (
-            pending_inputs.record(session_id, content, created_by=created_by)
+            pending_inputs.record(
+                session_id,
+                content,
+                created_by=created_by,
+                driver_generation=body.driver_generation,
+            )
             if isinstance(content, list) and content
             else None
         )
@@ -9897,6 +10045,8 @@ async def _dispatch_session_event_to_runner(
         # ────────────────────────────────────────────────────────────
         forwarded = False
         try:
+            if side_effect_guard is not None:
+                await side_effect_guard("before_runner_dispatch")
             await _forward_native_terminal_message(
                 runner_client,
                 session_id,
@@ -9940,6 +10090,7 @@ async def _dispatch_session_event_to_runner(
         artifact_store=artifact_store,
         has_mcp_servers=has_mcp_servers,
         created_by=created_by,
+        side_effect_guard=side_effect_guard,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
@@ -20219,6 +20370,182 @@ def create_sessions_router(
             "content_preview": params.get("content_preview", ""),
         }
 
+    def _publish_driver_lease(session_id: str, lease: SessionDriverLease) -> None:
+        payload = _driver_lease_response(lease)
+        session_stream.publish(
+            session_id,
+            {
+                "type": "session.driver_lease",
+                "conversation_id": session_id,
+                "driver_lease": payload.model_dump() if payload is not None else None,
+            },
+        )
+
+    async def _mutate_driver_lease(
+        operation: Callable[[], SessionDriverLease],
+        session_id: str,
+    ) -> DriverLeaseResponse:
+        try:
+            lease = await asyncio.to_thread(operation)
+        except DriverLeaseConflictError as exc:
+            current = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
+            current_response = _driver_lease_response(current)
+            raise OmnigentError(
+                str(exc),
+                code=ErrorCode.CONFLICT,
+                details={
+                    "driver_lease": (
+                        current_response.model_dump() if current_response is not None else None
+                    )
+                },
+            ) from exc
+        _publish_driver_lease(session_id, lease)
+        response = _driver_lease_response(lease)
+        assert response is not None
+        return response
+
+    @router.get(
+        "/sessions/{session_id}/driver",
+        response_model=DriverLeaseResponse | None,
+    )
+    async def get_driver_lease(
+        session_id: str,
+        request: Request,
+    ) -> DriverLeaseResponse | None:
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        lease = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
+        return _driver_lease_response(lease)
+
+    @router.post(
+        "/sessions/{session_id}/driver/acquire",
+        response_model=DriverLeaseResponse,
+    )
+    async def acquire_driver_lease(
+        session_id: str,
+        body: DriverLeaseAcquireRequest,
+        request: Request,
+    ) -> DriverLeaseResponse:
+        user_id = _get_user_id(request, auth_provider)
+        actor_user_id = user_id or RESERVED_USER_PUBLIC
+        minimum_level = LEVEL_MANAGE if body.force else LEVEL_EDIT
+        await _require_access_and_level(
+            user_id, session_id, minimum_level, permission_store, conversation_store
+        )
+        return await _mutate_driver_lease(
+            lambda: conversation_store.acquire_driver_lease(
+                session_id,
+                actor_user_id,
+                body.ttl_seconds,
+                force=body.force,
+            ),
+            session_id,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/driver/renew",
+        response_model=DriverLeaseResponse,
+    )
+    async def renew_driver_lease(
+        session_id: str,
+        body: DriverLeaseGenerationRequest,
+        request: Request,
+    ) -> DriverLeaseResponse:
+        user_id = _get_user_id(request, auth_provider)
+        actor_user_id = user_id or RESERVED_USER_PUBLIC
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        return await _mutate_driver_lease(
+            lambda: conversation_store.renew_driver_lease(
+                session_id, actor_user_id, body.generation, body.ttl_seconds
+            ),
+            session_id,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/driver/release",
+        response_model=DriverLeaseResponse,
+    )
+    async def release_driver_lease(
+        session_id: str,
+        body: DriverLeaseGenerationRequest,
+        request: Request,
+    ) -> DriverLeaseResponse:
+        user_id = _get_user_id(request, auth_provider)
+        actor_user_id = user_id or RESERVED_USER_PUBLIC
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        return await _mutate_driver_lease(
+            lambda: conversation_store.release_driver_lease(
+                session_id, actor_user_id, body.generation
+            ),
+            session_id,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/driver/handoff",
+        response_model=DriverLeaseResponse,
+    )
+    async def handoff_driver_lease(
+        session_id: str,
+        body: DriverLeaseHandoffRequest,
+        request: Request,
+    ) -> DriverLeaseResponse:
+        user_id = _get_user_id(request, auth_provider)
+        actor_user_id = user_id or RESERVED_USER_PUBLIC
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_MANAGE, permission_store, conversation_store
+        )
+        target_level = await _get_permission_level(
+            body.holder_user_id, session_id, permission_store
+        )
+        if permission_store is not None and (target_level is None or target_level < LEVEL_EDIT):
+            raise OmnigentError(
+                "driver handoff target requires edit access",
+                code=ErrorCode.FORBIDDEN,
+            )
+        return await _mutate_driver_lease(
+            lambda: conversation_store.handoff_driver_lease(
+                session_id,
+                actor_user_id,
+                body.holder_user_id,
+                body.generation,
+                body.ttl_seconds,
+            ),
+            session_id,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/presence/heartbeat",
+        response_model=SessionPresenceResponse,
+    )
+    async def heartbeat_session_presence(
+        session_id: str,
+        body: PresenceHeartbeatRequest,
+        request: Request,
+    ) -> SessionPresenceResponse:
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        root_id = conv.root_conversation_id or conv.id
+        actor_user_id = _attribution_user(user_id)
+        state = (
+            presence.heartbeat(root_id, conv.id, actor_user_id, body.ttl_seconds)
+            if actor_user_id is not None
+            else presence.presence_state(root_id, conv.id)
+        )
+        return SessionPresenceResponse.model_validate(state)
+
     @router.post(
         "/sessions/{session_id}/events",
         # Internal event ingestion — hidden from the public API reference.
@@ -20232,6 +20559,7 @@ def create_sessions_router(
         request: Request,
         session_id: str,
         body: SessionEventInput,
+        _driver_dispatch: Annotated[None, Depends(_driver_dispatch_lifecycle)],
     ) -> dict[str, bool | str]:
         """
         Submit a session event (input message, tool output,
@@ -20380,6 +20708,140 @@ def create_sessions_router(
                 parse_client_side_tool_specs(body.tools)
             except ValueError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
+        driver_dispatch_id: str | None = None
+        driver_heartbeat_task: asyncio.Task[None] | None = None
+        driver_lease_active = False
+
+        async def _guard_driver_side_effect(point: str) -> None:
+            """Renew the durable fence immediately before a driver side effect."""
+            if driver_dispatch_id is None:
+                return
+            # Tests may install a deterministic barrier. Production never sets
+            # this app-state attribute, so hooks cannot affect normal requests.
+            test_hook = getattr(request.app.state, "driver_fence_test_hook", None)
+            if test_hook is not None:
+                await test_hook(point, driver_dispatch_id)
+            try:
+                # Lease transitions reject an active dispatch. Conversely, a
+                # takeover that reclaimed an expired claim makes this CAS fail,
+                # so a paused stale request cannot resume into the side effect.
+                await asyncio.to_thread(
+                    conversation_store.renew_driver_event,
+                    session_id,
+                    driver_dispatch_id,
+                )
+            except DriverLeaseConflictError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+
+        def _start_driver_heartbeat() -> None:
+            nonlocal driver_heartbeat_task
+            assert driver_dispatch_id is not None
+            owner_task = asyncio.current_task()
+            assert owner_task is not None
+            driver_heartbeat_task = asyncio.create_task(
+                _heartbeat_driver_dispatch(
+                    conversation_store,
+                    session_id,
+                    driver_dispatch_id,
+                    owner_task,
+                )
+            )
+            request.state.driver_dispatch = (
+                conversation_store,
+                session_id,
+                driver_dispatch_id,
+                driver_heartbeat_task,
+            )
+
+        async def _accept_driver_fence() -> None:
+            nonlocal driver_dispatch_id
+            if not driver_lease_active:
+                return
+            if driver_dispatch_id is not None:
+                return
+            begin_driver_event = getattr(conversation_store, "begin_driver_event", None)
+            if begin_driver_event is None:
+                raise RuntimeError("conversation store cannot atomically begin driver dispatches")
+            try:
+                acceptance = asyncio.create_task(
+                    asyncio.to_thread(
+                        begin_driver_event,
+                        session_id,
+                        user_id or RESERVED_USER_PUBLIC,
+                        body.driver_generation,
+                        body.type,
+                    )
+                )
+                try:
+                    driver_dispatch_id = await asyncio.shield(acceptance)
+                except asyncio.CancelledError:
+                    current_task = asyncio.current_task()
+                    if current_task is not None:
+                        current_task.uncancel()
+                    driver_dispatch_id = await acceptance
+                    if driver_dispatch_id is not None:
+                        _start_driver_heartbeat()
+                    raise
+            except NotImplementedError as exc:
+                raise RuntimeError(
+                    "conversation store cannot atomically begin driver dispatches"
+                ) from exc
+            except DriverLeaseConflictError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+            if driver_dispatch_id is None:
+                raise RuntimeError("active driver lease disappeared before acceptance")
+            _start_driver_heartbeat()
+            await _guard_driver_side_effect("after_acceptance")
+
+        async def _finish_driver_response(response: Any) -> Any:
+            """Finish durable dispatch state before FastAPI emits a success."""
+            if driver_dispatch_id is None:
+                return response
+            assert driver_heartbeat_task is not None
+            driver_heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await driver_heartbeat_task
+            completion = asyncio.create_task(
+                asyncio.to_thread(
+                    conversation_store.complete_driver_event,
+                    session_id,
+                    driver_dispatch_id,
+                    succeeded=True,
+                )
+            )
+            try:
+                await _await_driver_lifecycle_task(completion)
+            except asyncio.CancelledError:
+                request.state.driver_dispatch = None
+                raise
+            request.state.driver_dispatch = None
+            return response
+
+        # Fail fast, then durably claim the generation through policy,
+        # persistence, enqueue, and runner dispatch. Lease mutations cannot
+        # commit while this dispatch remains active.
+        if _requires_driver_fence(body) and getattr(
+            conversation_store, "supports_driver_leases", False
+        ):
+            actor_user_id = user_id or RESERVED_USER_PUBLIC
+            validate_driver_lease = getattr(conversation_store, "validate_driver_lease", None)
+            if validate_driver_lease is None:
+                raise RuntimeError("driver-capable store cannot validate driver leases")
+            try:
+                validated_lease = await asyncio.to_thread(
+                    validate_driver_lease,
+                    session_id,
+                    actor_user_id,
+                    body.driver_generation,
+                )
+                driver_lease_active = validated_lease is not None
+            except NotImplementedError as exc:
+                raise RuntimeError("driver-capable store cannot validate driver leases") from exc
+            except DriverLeaseConflictError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+            await _accept_driver_fence()
+
         # ── Policy evaluation (path-agnostic) ────────────────
         # Evaluate policies BEFORE persistence/runner forwarding so
         # enforcement fires on both paths. On DENY, persist the
@@ -20445,6 +20907,7 @@ def create_sessions_router(
                 reason = _input_verdict.get("reason", "Denied by policy")
                 _publish_status(session_id, "running")
                 _publish_policy_deny(session_id, reason)
+                await _guard_driver_side_effect("before_policy_deny_persistence")
                 await _persist_policy_deny_sentinel(
                     session_id,
                     conv,
@@ -20460,7 +20923,9 @@ def create_sessions_router(
                 # /events so postEvent doesn't throw on an unexpected
                 # response body. queued=False signals the event was
                 # handled synchronously (denied, not queued for a turn).
-                return {"queued": False, "denied": True, "reason": reason}
+                return await _finish_driver_response(
+                    {"queued": False, "denied": True, "reason": reason}
+                )
         elif body.type == _SLASH_COMMAND_TYPE and conv.agent_id is not None:
             _input_verdict = await _evaluate_input_policy(
                 request,
@@ -20475,6 +20940,7 @@ def create_sessions_router(
                 reason = _input_verdict.get("reason", "Denied by policy")
                 _publish_status(session_id, "running")
                 _publish_policy_deny(session_id, reason)
+                await _guard_driver_side_effect("before_policy_deny_persistence")
                 await _persist_policy_deny_sentinel(
                     session_id,
                     conv,
@@ -20485,7 +20951,9 @@ def create_sessions_router(
                 # Terminal response.completed before idle (see message branch).
                 _publish_input_deny_terminal(session_id, conv, reason)
                 _publish_status(session_id, "idle")
-                return {"queued": False, "denied": True, "reason": reason}
+                return await _finish_driver_response(
+                    {"queued": False, "denied": True, "reason": reason}
+                )
         elif (
             body.type == "message"
             and body.data.get("role") == "assistant"
@@ -20510,7 +20978,7 @@ def create_sessions_router(
                 if _output_verdict["verdict"] == "deny":
                     pass  # fall through with modified body
                 else:
-                    return _output_verdict
+                    return await _finish_driver_response(_output_verdict)
         elif body.type == "function_call" and body.data.get("evaluate_policy"):
             _tool_verdict = await _evaluate_tool_call_policy(
                 session_id,
@@ -20531,6 +20999,8 @@ def create_sessions_router(
             return {"verdict": "allow"}
 
         if body.type == _INTERRUPT_TYPE:
+            await _accept_driver_fence()
+            await _guard_driver_side_effect("before_interrupt_dispatch")
             _publish_interrupted(session_id)
             # Fence the cancelled turn (see _interrupt_fenced_sessions).
             _interrupt_fenced_sessions.add(session_id)
@@ -20557,7 +21027,7 @@ def create_sessions_router(
                 # The turn keeps running and nothing else lifts the fence —
                 # remove it so the turn's remaining output isn't dropped.
                 _interrupt_fenced_sessions.discard(session_id)
-            return {"queued": False}
+            return await _finish_driver_response({"queued": False})
         if body.type == _STOP_SESSION_TYPE:
             # Terminating the whole session (not just the current turn)
             # is a lifecycle action; require owner access on top of the
@@ -20566,6 +21036,7 @@ def create_sessions_router(
             await _require_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
+            await _accept_driver_fence()
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
             # Harness-agnostic forward: the runner kills the external
@@ -20577,6 +21048,7 @@ def create_sessions_router(
             # it, letting the web UI show the stop didn't land instead
             # of closing the dialog as if it succeeded.
             try:
+                await _guard_driver_side_effect("before_stop_dispatch")
                 stop_delivered = await _stop_session_via_runner(session_id, runner_router)
             except Exception:
                 # Stop didn't land: the turn keeps running, so lift the
@@ -20604,6 +21076,7 @@ def create_sessions_router(
                 # sessions drop the tunnel on Stop; other harnesses leave the
                 # runner connected, so there is nothing to suppress for them.
                 _intentional_stop_sessions.add(session_id)
+                await _guard_driver_side_effect("before_host_runner_teardown")
                 teardown_delivered = await _stop_session_host_runner(
                     session_id,
                     stop_conv.host_id,
@@ -20640,8 +21113,10 @@ def create_sessions_router(
                 )
             except Exception:  # noqa: BLE001 — telemetry is best-effort
                 pass
-            return {"queued": False}
+            return await _finish_driver_response({"queued": False})
         if body.type == _APPROVAL_TYPE:
+            await _accept_driver_fence()
+            await _guard_driver_side_effect("before_approval_dispatch")
             # Deliver the verdict through the shared resolver: it
             # sets any server-side harness Future (owner-checked),
             # clears the sidebar badge, and forwards
@@ -20651,10 +21126,11 @@ def create_sessions_router(
             await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
+            await _guard_driver_side_effect("before_approval_policy_writes")
             await _apply_pending_policy_ask_writes(
                 session_id, conv, conversation_store, agent_store, body.data
             )
-            return {"queued": False}
+            return await _finish_driver_response({"queued": False})
         if body.type == _MCP_ELICITATION_TYPE:
             # The runner's inline MCP elicitation callback fires when
             # an external MCP server sends ``elicitation/create``
@@ -20693,6 +21169,8 @@ def create_sessions_router(
             )
             return {"queued": False, "elicitation_id": elicit_id}
         if body.type == _COMPACT_TYPE:
+            await _accept_driver_fence()
+            await _guard_driver_side_effect("before_compaction_dispatch")
             # Unified control dispatch (designs/CLAUDE_NATIVE.md
             # "Control events dispatch on the runner"): forward /compact
             # to the bound runner first, regardless of harness. The
@@ -20712,19 +21190,20 @@ def create_sessions_router(
                 {"type": _COMPACT_TYPE},
             )
             if runner_result is not None and runner_result.status_code == 200:
-                return {"queued": False}
+                return await _finish_driver_response({"queued": False})
             if runner_result is not None and runner_result.status_code != 204:
                 raise OmnigentError(
                     f"Compaction failed: runner returned {runner_result.status_code}",
                     code=ErrorCode.INTERNAL_ERROR,
                 )
+            await _guard_driver_side_effect("before_compaction_persistence")
             await _run_compact_locked(
                 session_id,
                 conv,
                 agent_store,
                 agent_cache,
             )
-            return {"queued": False}
+            return await _finish_driver_response({"queued": False})
         if body.type == "compaction":
             import uuid as _uuid
 
@@ -21010,6 +21489,7 @@ def create_sessions_router(
             )
             return {"queued": False, "child_session_id": child_id}
         if body.type == "function_call_output":
+            await _accept_driver_fence()
             # A client-side tool's result tunneling back to a parked turn.
             # The harness scaffold resolves the parked tool Future on a
             # ``tool_result`` event (ToolResultEvent {call_id, output}), so
@@ -21031,6 +21511,7 @@ def create_sessions_router(
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
             try:
+                await _guard_driver_side_effect("before_tool_result_dispatch")
                 await runner_client.post(
                     f"/v1/sessions/{session_id}/events",
                     json={
@@ -21050,7 +21531,7 @@ def create_sessions_router(
                     "Failed to deliver the tool result to the session runner.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 ) from exc
-            return {"queued": True, "item_id": body.data["call_id"]}
+            return await _finish_driver_response({"queued": True, "item_id": body.data["call_id"]})
         # Whether the runner was initially unavailable or was woken below. In
         # that case the session-init handshake may still be racing the first
         # message, even if we reused the original binding instead of launching
@@ -21183,7 +21664,7 @@ def create_sessions_router(
                             runner_router,
                             created_by=_attribution_user(user_id),
                         )
-                        return {"queued": True, "item_id": item_id}
+                        return await _finish_driver_response({"queued": True, "item_id": item_id})
                     relaunched_runner_id = launch_attempt.runner_id
                 else:
                     relaunched_runner_id = None
@@ -21267,7 +21748,7 @@ def create_sessions_router(
                     runner_router,
                     created_by=_attribution_user(user_id),
                 )
-                return {"queued": True, "item_id": item_id}
+                return await _finish_driver_response({"queued": True, "item_id": item_id})
             # Raise so the Omnigent server doesn't persist an item the
             # harness will never see. Other event paths (interrupt,
             # approval) are best-effort and silently skip when no
@@ -21344,10 +21825,11 @@ def create_sessions_router(
                 agent=_agent,
                 has_mcp_servers=_has_mcp_servers,
                 created_by=_attribution_user(user_id),
+                side_effect_guard=_guard_driver_side_effect,
             )
             if pending_background_title is not None:
                 pending_background_title.schedule()
-            return {"queued": True, "item_id": item_id}
+            return await _finish_driver_response({"queued": True, "item_id": item_id})
         dispatch = await _dispatch_session_event_to_runner(
             session_id,
             conv,
@@ -21361,6 +21843,7 @@ def create_sessions_router(
             created_by=_attribution_user(user_id),
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
+            side_effect_guard=_guard_driver_side_effect,
         )
         if pending_background_title is not None:
             pending_background_title.schedule()
@@ -21375,7 +21858,7 @@ def create_sessions_router(
         # stability) and relies on stableKey + FIFO instead.
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
-        return response
+        return await _finish_driver_response(response)
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 
@@ -22943,6 +23426,18 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+    get_driver_lease = getattr(conv_store, "get_driver_lease", None)
+    try:
+        raw_driver_lease = (
+            await asyncio.to_thread(get_driver_lease, session_id)
+            if get_driver_lease is not None
+            else None
+        )
+    except NotImplementedError:
+        raw_driver_lease = None
+    driver_lease = raw_driver_lease if isinstance(raw_driver_lease, SessionDriverLease) else None
+    root_id = conv.root_conversation_id or conv.id
+    current_presence = presence.presence_state(root_id, conv.id)
     return _build_session_response(
         conv,
         items,
@@ -22965,5 +23460,7 @@ async def _get_session_snapshot(
             conv,
         ),
         subtree_usage=subtree_usage,
+        driver_lease=driver_lease,
+        presence_state=current_presence,
         visible_team_ids=visible_team_ids,
     )

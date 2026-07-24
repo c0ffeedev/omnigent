@@ -1049,6 +1049,9 @@ class SqlConversationItem(ConversationBase):
     data: Mapped[str] = mapped_column(Text)
     search_text: Mapped[str] = mapped_column(Text)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Fencing generation of the driver lease that authorized this human
+    # input. NULL for pre-lease rows and agent/tool/system output.
+    driver_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         # Backs the per-conversation position-ordered scan (the dominant read).
@@ -1450,6 +1453,118 @@ class SqlHost(OmnigentBase):
         # rotation) stays consistent.
         UniqueConstraint(
             "workspace_id", "user_id", "name", name="uq_hosts_workspace_user_id_name"
+        ),
+    )
+
+
+class SqlSessionDriverLease(ConversationBase):
+    """Server-authoritative, generation-fenced session driver lease."""
+
+    __tablename__ = "session_driver_leases"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    holder_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    acquired_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    renewed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    released_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("generation > 0", name="ck_session_driver_leases_generation_positive"),
+        CheckConstraint(
+            "(holder_user_id IS NULL AND expires_at IS NULL AND released_at IS NOT NULL) "
+            "OR (holder_user_id IS NOT NULL AND acquired_at IS NOT NULL "
+            "AND renewed_at IS NOT NULL AND expires_at IS NOT NULL AND released_at IS NULL)",
+            name="ck_session_driver_leases_lifecycle",
+        ),
+    )
+
+
+class SqlSessionDriverEvent(ConversationBase):
+    """Durable audit/acceptance record for driver-fenced session events."""
+
+    __tablename__ = "session_driver_events"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    holder_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    previous_holder_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("generation > 0", name="ck_session_driver_events_generation_positive"),
+        Index(
+            "ix_session_driver_events_session_created",
+            "workspace_id",
+            "session_id",
+            "created_at",
+        ),
+    )
+
+
+class SqlSessionDriverDispatch(ConversationBase):
+    """Durable in-flight record serializing one accepted driver event."""
+
+    __tablename__ = "session_driver_dispatches"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    actor_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    claim_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("generation > 0", name="ck_session_driver_dispatches_generation_positive"),
+        CheckConstraint(
+            "state IN ('running', 'completed', 'failed')",
+            name="ck_session_driver_dispatches_state",
+        ),
+        CheckConstraint(
+            "claim_expires_at IS NULL OR claim_expires_at > created_at",
+            name="ck_session_driver_dispatches_claim_window",
+        ),
+        CheckConstraint(
+            "(state = 'running' AND completed_at IS NULL AND claim_expires_at IS NOT NULL) OR "
+            "(state IN ('completed', 'failed') AND completed_at IS NOT NULL "
+            "AND claim_expires_at IS NULL)",
+            name="ck_session_driver_dispatches_lifecycle",
+        ),
+        Index(
+            "ix_session_driver_dispatches_recovery",
+            "workspace_id",
+            "session_id",
+            "state",
+            "claim_expires_at",
         ),
     )
 

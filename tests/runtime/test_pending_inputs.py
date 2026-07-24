@@ -130,6 +130,21 @@ def test_resolve_oldest_returns_none_when_empty() -> None:
     assert pending_inputs.resolve_oldest("conv_a") is None
 
 
+def test_driver_generation_survives_native_pending_round_trip() -> None:
+    """Native transcript persistence retains the accepted fencing token."""
+    pending_inputs.record(
+        "conv_a",
+        [_text_block("fenced")],
+        created_by="alice@example.com",
+        driver_generation=4,
+    )
+
+    assert pending_inputs.snapshot_for("conv_a")[0]["driver_generation"] == 4
+    drained = pending_inputs.resolve_oldest("conv_a")
+    assert drained is not None
+    assert drained.driver_generation == 4
+
+
 def test_resolve_oldest_drains_regardless_of_reformatted_text() -> None:
     """
     Regression: a queued message drains even when the transcript

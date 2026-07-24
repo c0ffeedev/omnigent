@@ -39,11 +39,55 @@ from omnigent.server.schemas import (
     ReasoningTextDeltaEvent,
     ResponseObject,
     ServerStreamEvent,
+    SessionEventInput,
     SessionHeartbeatEvent,
     ToolOutputDeltaEvent,
 )
 
+
+def test_session_event_plain_dump_omits_unset_driver_generation() -> None:
+    """Adding lease support does not change the legacy runner wire payload."""
+    event = SessionEventInput(
+        type="message",
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": "legacy client"}],
+        },
+    )
+
+    assert event.model_dump() == {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "legacy client"}],
+        },
+        "model_override": None,
+        "tools": None,
+    }
+
+
 # ── Round-trip serialization ──────────────────────────────────
+
+
+def test_session_event_input_driver_generation_wire_shape() -> None:
+    """The fencing token is one exact integer field on the transport payload."""
+    event = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        driver_generation=7,
+    )
+    payload = event.model_dump(exclude_none=True)
+    assert payload["driver_generation"] == 7
+    assert [key for key in payload if "generation" in key] == ["driver_generation"]
+
+
+def test_session_event_input_omits_legacy_generation_when_unset() -> None:
+    """Lease-free clients retain their pre-fencing JSON payload."""
+    event = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+    )
+    assert "driver_generation" not in event.model_dump(exclude_none=True)
 
 
 def test_output_text_delta_roundtrip() -> None:
