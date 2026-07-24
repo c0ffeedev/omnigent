@@ -1521,6 +1521,47 @@ class SqlSessionDriverEvent(ConversationBase):
     )
 
 
+class SqlSessionDriverDispatch(ConversationBase):
+    """Durable in-flight record serializing one accepted driver event."""
+
+    __tablename__ = "session_driver_dispatches"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    actor_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("generation > 0", name="ck_session_driver_dispatches_generation_positive"),
+        CheckConstraint(
+            "state IN ('running', 'completed', 'failed')",
+            name="ck_session_driver_dispatches_state",
+        ),
+        CheckConstraint(
+            "(state = 'running' AND completed_at IS NULL) OR "
+            "(state IN ('completed', 'failed') AND completed_at IS NOT NULL)",
+            name="ck_session_driver_dispatches_lifecycle",
+        ),
+        Index(
+            "ix_session_driver_dispatches_session_state",
+            "workspace_id",
+            "session_id",
+            "state",
+        ),
+    )
+
+
 class SqlManagedCredentialLease(OmnigentBase):
     """Durable, non-secret cleanup metadata for managed-host credentials.
 

@@ -72,7 +72,6 @@ from omnigent.entities import (
     ErrorData,
     MessageData,
     NewConversationItem,
-    ResourceEventData,
     SlashCommandData,
     StoredFile,
     synthesize_conversation_title,
@@ -2702,6 +2701,41 @@ def _requires_driver_fence(body: SessionEventInput) -> bool:
         _SLASH_COMMAND_TYPE,
         _STOP_SESSION_TYPE,
     }
+
+
+async def _driver_dispatch_lifecycle(request: Request) -> AsyncIterator[None]:
+    """Fail an unfinished durable driver dispatch when a request unwinds."""
+    try:
+        yield
+    finally:
+        dispatch = getattr(request.state, "driver_dispatch", None)
+        if dispatch is not None:
+            conversation_store, session_id, dispatch_id = dispatch
+            try:
+                completion = asyncio.create_task(
+                    asyncio.to_thread(
+                        conversation_store.complete_driver_event,
+                        session_id,
+                        dispatch_id,
+                        succeeded=False,
+                    )
+                )
+                try:
+                    await asyncio.shield(completion)
+                except asyncio.CancelledError:
+                    current_task = asyncio.current_task()
+                    if current_task is not None:
+                        current_task.uncancel()
+                    await completion
+                    raise
+            except Exception:
+                _logger.exception(
+                    "Failed to mark driver dispatch %s failed for session %s",
+                    dispatch_id,
+                    session_id,
+                )
+            finally:
+                request.state.driver_dispatch = None
 
 
 def _build_session_response(
@@ -9842,24 +9876,6 @@ async def _dispatch_session_event_to_runner(
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
-    # Linearize ownership immediately before persistence/enqueue. The earlier
-    # route check is fail-fast only; a takeover may happen during policy or
-    # routing work.
-    accept_driver_event = getattr(conversation_store, "accept_driver_event", None)
-    if created_by is not None and _requires_driver_fence(body) and accept_driver_event is not None:
-        try:
-            await asyncio.to_thread(
-                accept_driver_event,
-                session_id,
-                created_by,
-                body.driver_generation,
-                body.type,
-            )
-        except NotImplementedError:
-            pass
-        except DriverLeaseConflictError as exc:
-            raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
-
     if body.type == "message" and _is_native_terminal_session(conv):
         # Validate before touching the runner. The ensure probe is only
         # for syntactically valid user messages; assistant/system-shaped
@@ -20310,8 +20326,6 @@ def create_sessions_router(
     async def _mutate_driver_lease(
         operation: Callable[[], SessionDriverLease],
         session_id: str,
-        actor_user_id: str,
-        transition: str | Callable[[SessionDriverLease], str],
     ) -> DriverLeaseResponse:
         try:
             lease = await asyncio.to_thread(operation)
@@ -20327,34 +20341,6 @@ def create_sessions_router(
                     )
                 },
             ) from exc
-        event_type = transition(lease) if callable(transition) else transition
-        await asyncio.to_thread(
-            conversation_store.append,
-            session_id,
-            [
-                NewConversationItem(
-                    type="resource_event",
-                    response_id=session_id,
-                    data=ResourceEventData(
-                        event_type=f"session.driver_lease.{event_type}",
-                        resource_id=session_id,
-                        resource_type="driver_lease",
-                        resource={
-                            "session_id": lease.session_id,
-                            "holder_user_id": lease.holder_user_id,
-                            "generation": lease.generation,
-                            "acquired_at": lease.acquired_at,
-                            "renewed_at": lease.renewed_at,
-                            "expires_at": lease.expires_at,
-                            "released_at": lease.released_at,
-                            "actor_user_id": actor_user_id,
-                        },
-                    ),
-                    created_by=actor_user_id,
-                    driver_generation=lease.generation,
-                )
-            ],
-        )
         _publish_driver_lease(session_id, lease)
         response = _driver_lease_response(lease)
         assert response is not None
@@ -20390,15 +20376,6 @@ def create_sessions_router(
         await _require_access_and_level(
             user_id, session_id, minimum_level, permission_store, conversation_store
         )
-        previous = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
-
-        def transition(lease: SessionDriverLease) -> str:
-            if previous is None or previous.holder_user_id is None:
-                return "acquired"
-            if lease.generation == previous.generation:
-                return "renewed"
-            return "taken_over"
-
         return await _mutate_driver_lease(
             lambda: conversation_store.acquire_driver_lease(
                 session_id,
@@ -20407,8 +20384,6 @@ def create_sessions_router(
                 force=body.force,
             ),
             session_id,
-            actor_user_id,
-            transition,
         )
 
     @router.post(
@@ -20430,8 +20405,6 @@ def create_sessions_router(
                 session_id, actor_user_id, body.generation, body.ttl_seconds
             ),
             session_id,
-            actor_user_id,
-            "renewed",
         )
 
     @router.post(
@@ -20453,8 +20426,6 @@ def create_sessions_router(
                 session_id, actor_user_id, body.generation
             ),
             session_id,
-            actor_user_id,
-            "released",
         )
 
     @router.post(
@@ -20488,8 +20459,6 @@ def create_sessions_router(
                 body.ttl_seconds,
             ),
             session_id,
-            actor_user_id,
-            "handed_off",
         )
 
     @router.post(
@@ -20532,6 +20501,7 @@ def create_sessions_router(
         request: Request,
         session_id: str,
         body: SessionEventInput,
+        _driver_dispatch: Annotated[None, Depends(_driver_dispatch_lifecycle)],
     ) -> dict[str, bool | str]:
         """
         Submit a session event (input message, tool output,
@@ -20681,45 +20651,103 @@ def create_sessions_router(
             except ValueError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
-        # Fence human-authored turn/control events before policy evaluation,
-        # persistence, or runner side effects. A session remains backward
-        # compatible until its first lease row is created; after that, even an
-        # expired/released lease requires reacquisition and a current generation.
-        if _requires_driver_fence(body):
-            actor_user_id = user_id or RESERVED_USER_PUBLIC
-            validate_driver_lease = getattr(conversation_store, "validate_driver_lease", None)
-            try:
-                if validate_driver_lease is not None:
-                    await asyncio.to_thread(
-                        validate_driver_lease,
-                        session_id,
-                        actor_user_id,
-                        body.driver_generation,
-                    )
-            except NotImplementedError:
-                # Alternate stores that predate leases retain legacy input
-                # behavior, matching the snapshot's optional lease projection.
-                pass
-            except DriverLeaseConflictError as exc:
-                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+        driver_dispatch_id: str | None = None
+        driver_lease_active = False
 
         async def _accept_driver_fence() -> None:
-            if not _requires_driver_fence(body):
+            nonlocal driver_dispatch_id
+            if not driver_lease_active:
                 return
-            accept_driver_event = getattr(conversation_store, "accept_driver_event", None)
+            if driver_dispatch_id is not None:
+                return
+            begin_driver_event = getattr(conversation_store, "begin_driver_event", None)
+            if begin_driver_event is None:
+                raise RuntimeError("conversation store cannot atomically begin driver dispatches")
             try:
-                if accept_driver_event is not None:
-                    await asyncio.to_thread(
-                        accept_driver_event,
+                acceptance = asyncio.create_task(
+                    asyncio.to_thread(
+                        begin_driver_event,
                         session_id,
                         user_id or RESERVED_USER_PUBLIC,
                         body.driver_generation,
                         body.type,
                     )
-            except NotImplementedError:
-                pass
+                )
+                try:
+                    driver_dispatch_id = await asyncio.shield(acceptance)
+                except asyncio.CancelledError:
+                    current_task = asyncio.current_task()
+                    if current_task is not None:
+                        current_task.uncancel()
+                    driver_dispatch_id = await acceptance
+                    if driver_dispatch_id is not None:
+                        request.state.driver_dispatch = (
+                            conversation_store,
+                            session_id,
+                            driver_dispatch_id,
+                        )
+                    raise
+            except NotImplementedError as exc:
+                raise RuntimeError(
+                    "conversation store cannot atomically begin driver dispatches"
+                ) from exc
             except DriverLeaseConflictError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+            if driver_dispatch_id is None:
+                raise RuntimeError("active driver lease disappeared before acceptance")
+            request.state.driver_dispatch = (
+                conversation_store,
+                session_id,
+                driver_dispatch_id,
+            )
+
+        async def _finish_driver_response(response: Any) -> Any:
+            """Finish durable dispatch state before FastAPI emits a success."""
+            if driver_dispatch_id is None:
+                return response
+            completion = asyncio.create_task(
+                asyncio.to_thread(
+                    conversation_store.complete_driver_event,
+                    session_id,
+                    driver_dispatch_id,
+                    succeeded=True,
+                )
+            )
+            try:
+                await asyncio.shield(completion)
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                if current_task is not None:
+                    current_task.uncancel()
+                await completion
+                request.state.driver_dispatch = None
+                raise
+            request.state.driver_dispatch = None
+            return response
+
+        # Fail fast, then durably claim the generation through policy,
+        # persistence, enqueue, and runner dispatch. Lease mutations cannot
+        # commit while this dispatch remains active.
+        if _requires_driver_fence(body) and getattr(
+            conversation_store, "supports_driver_leases", False
+        ):
+            actor_user_id = user_id or RESERVED_USER_PUBLIC
+            validate_driver_lease = getattr(conversation_store, "validate_driver_lease", None)
+            if validate_driver_lease is None:
+                raise RuntimeError("driver-capable store cannot validate driver leases")
+            try:
+                validated_lease = await asyncio.to_thread(
+                    validate_driver_lease,
+                    session_id,
+                    actor_user_id,
+                    body.driver_generation,
+                )
+                driver_lease_active = validated_lease is not None
+            except NotImplementedError as exc:
+                raise RuntimeError("driver-capable store cannot validate driver leases") from exc
+            except DriverLeaseConflictError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+            await _accept_driver_fence()
 
         # ── Policy evaluation (path-agnostic) ────────────────
         # Evaluate policies BEFORE persistence/runner forwarding so
@@ -20801,7 +20829,9 @@ def create_sessions_router(
                 # /events so postEvent doesn't throw on an unexpected
                 # response body. queued=False signals the event was
                 # handled synchronously (denied, not queued for a turn).
-                return {"queued": False, "denied": True, "reason": reason}
+                return await _finish_driver_response(
+                    {"queued": False, "denied": True, "reason": reason}
+                )
         elif body.type == _SLASH_COMMAND_TYPE and conv.agent_id is not None:
             _input_verdict = await _evaluate_input_policy(
                 request,
@@ -20826,7 +20856,9 @@ def create_sessions_router(
                 # Terminal response.completed before idle (see message branch).
                 _publish_input_deny_terminal(session_id, conv, reason)
                 _publish_status(session_id, "idle")
-                return {"queued": False, "denied": True, "reason": reason}
+                return await _finish_driver_response(
+                    {"queued": False, "denied": True, "reason": reason}
+                )
         elif (
             body.type == "message"
             and body.data.get("role") == "assistant"
@@ -20851,7 +20883,7 @@ def create_sessions_router(
                 if _output_verdict["verdict"] == "deny":
                     pass  # fall through with modified body
                 else:
-                    return _output_verdict
+                    return await _finish_driver_response(_output_verdict)
         elif body.type == "function_call" and body.data.get("evaluate_policy"):
             _tool_verdict = await _evaluate_tool_call_policy(
                 session_id,
@@ -20899,7 +20931,7 @@ def create_sessions_router(
                 # The turn keeps running and nothing else lifts the fence —
                 # remove it so the turn's remaining output isn't dropped.
                 _interrupt_fenced_sessions.discard(session_id)
-            return {"queued": False}
+            return await _finish_driver_response({"queued": False})
         if body.type == _STOP_SESSION_TYPE:
             # Terminating the whole session (not just the current turn)
             # is a lifecycle action; require owner access on top of the
@@ -20983,7 +21015,7 @@ def create_sessions_router(
                 )
             except Exception:  # noqa: BLE001 — telemetry is best-effort
                 pass
-            return {"queued": False}
+            return await _finish_driver_response({"queued": False})
         if body.type == _APPROVAL_TYPE:
             await _accept_driver_fence()
             # Deliver the verdict through the shared resolver: it
@@ -20998,7 +21030,7 @@ def create_sessions_router(
             await _apply_pending_policy_ask_writes(
                 session_id, conv, conversation_store, agent_store, body.data
             )
-            return {"queued": False}
+            return await _finish_driver_response({"queued": False})
         if body.type == _MCP_ELICITATION_TYPE:
             # The runner's inline MCP elicitation callback fires when
             # an external MCP server sends ``elicitation/create``
@@ -21057,7 +21089,7 @@ def create_sessions_router(
                 {"type": _COMPACT_TYPE},
             )
             if runner_result is not None and runner_result.status_code == 200:
-                return {"queued": False}
+                return await _finish_driver_response({"queued": False})
             if runner_result is not None and runner_result.status_code != 204:
                 raise OmnigentError(
                     f"Compaction failed: runner returned {runner_result.status_code}",
@@ -21069,7 +21101,7 @@ def create_sessions_router(
                 agent_store,
                 agent_cache,
             )
-            return {"queued": False}
+            return await _finish_driver_response({"queued": False})
         if body.type == "compaction":
             import uuid as _uuid
 
@@ -21396,7 +21428,7 @@ def create_sessions_router(
                     "Failed to deliver the tool result to the session runner.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 ) from exc
-            return {"queued": True, "item_id": body.data["call_id"]}
+            return await _finish_driver_response({"queued": True, "item_id": body.data["call_id"]})
         # Whether the runner was initially unavailable or was woken below. In
         # that case the session-init handshake may still be racing the first
         # message, even if we reused the original binding instead of launching
@@ -21529,7 +21561,7 @@ def create_sessions_router(
                             runner_router,
                             created_by=_attribution_user(user_id),
                         )
-                        return {"queued": True, "item_id": item_id}
+                        return await _finish_driver_response({"queued": True, "item_id": item_id})
                     relaunched_runner_id = launch_attempt.runner_id
                 else:
                     relaunched_runner_id = None
@@ -21613,7 +21645,7 @@ def create_sessions_router(
                     runner_router,
                     created_by=_attribution_user(user_id),
                 )
-                return {"queued": True, "item_id": item_id}
+                return await _finish_driver_response({"queued": True, "item_id": item_id})
             # Raise so the Omnigent server doesn't persist an item the
             # harness will never see. Other event paths (interrupt,
             # approval) are best-effort and silently skip when no
@@ -21693,7 +21725,7 @@ def create_sessions_router(
             )
             if pending_background_title is not None:
                 pending_background_title.schedule()
-            return {"queued": True, "item_id": item_id}
+            return await _finish_driver_response({"queued": True, "item_id": item_id})
         dispatch = await _dispatch_session_event_to_runner(
             session_id,
             conv,
@@ -21721,7 +21753,7 @@ def create_sessions_router(
         # stability) and relies on stableKey + FIFO instead.
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
-        return response
+        return await _finish_driver_response(response)
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 

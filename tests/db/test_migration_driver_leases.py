@@ -7,12 +7,20 @@ from pathlib import Path
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from alembic.script import ScriptDirectory
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.utils import _build_alembic_config
 
-_PRIOR_REVISION = "b28c39d40e51"
+_PRIOR_REVISION = "g6b7c8d9e0f1"
 _THIS_REVISION = "a6b7c8d9e0f1"
+
+
+def test_driver_lease_migration_is_the_single_head(tmp_path: Path) -> None:
+    """The lease migration extends current main instead of creating a branch."""
+    uri = f"sqlite:///{tmp_path / 'heads.db'}"
+    script = ScriptDirectory.from_config(_build_alembic_config(uri))
+    assert script.get_heads() == [_THIS_REVISION]
 
 
 def _migrate(engine: sa.Engine, uri: str, revision: str, *, downgrade: bool = False) -> None:
@@ -32,6 +40,7 @@ def test_driver_lease_migration_round_trip(tmp_path: Path) -> None:
         inspector = sa.inspect(engine)
         assert "session_driver_leases" not in inspector.get_table_names()
         assert "session_driver_events" not in inspector.get_table_names()
+        assert "session_driver_dispatches" not in inspector.get_table_names()
         assert "driver_generation" not in {
             column["name"] for column in inspector.get_columns("conversation_items")
         }
@@ -40,6 +49,7 @@ def test_driver_lease_migration_round_trip(tmp_path: Path) -> None:
         inspector = sa.inspect(engine)
         assert "session_driver_leases" in inspector.get_table_names()
         assert "session_driver_events" in inspector.get_table_names()
+        assert "session_driver_dispatches" in inspector.get_table_names()
         assert inspector.get_pk_constraint("session_driver_leases")["constrained_columns"] == [
             "workspace_id",
             "session_id",
@@ -51,7 +61,17 @@ def test_driver_lease_migration_round_trip(tmp_path: Path) -> None:
         inspector = sa.inspect(engine)
         assert "session_driver_leases" not in inspector.get_table_names()
         assert "session_driver_events" not in inspector.get_table_names()
+        assert "session_driver_dispatches" not in inspector.get_table_names()
         assert "driver_generation" not in {
+            column["name"] for column in inspector.get_columns("conversation_items")
+        }
+
+        _migrate(engine, uri, _THIS_REVISION)
+        inspector = sa.inspect(engine)
+        assert "session_driver_leases" in inspector.get_table_names()
+        assert "session_driver_events" in inspector.get_table_names()
+        assert "session_driver_dispatches" in inspector.get_table_names()
+        assert "driver_generation" in {
             column["name"] for column in inspector.get_columns("conversation_items")
         }
     finally:

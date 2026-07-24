@@ -76,6 +76,7 @@ SWITCH_PREVIOUS_BUILTIN_LABEL_KEY = "omnigent.switch.previous_builtin_id"
 # normal approval/sandbox stance.
 CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 
+
 # Reserved label key that stores a session's sidebar "project" membership
 # (implicit collections — a project exists while ≥1 session carries this key).
 # Namespaced so it never collides with the user-facing "project" term or other
@@ -280,6 +281,8 @@ class ConversationStore(ABC):
     updates, and deletion.
     """
 
+    supports_driver_leases = False
+
     def __init__(
         self, storage_location: str, conversation_storage_location: str | None = None
     ) -> None:
@@ -312,14 +315,24 @@ class ConversationStore(ABC):
         """
         raise NotImplementedError
 
-    def accept_driver_event(
+    def begin_driver_event(
         self,
         session_id: str,
         actor_user_id: str,
         generation: int | None,
         event_type: str,
-    ) -> SessionDriverLease | None:
-        """Atomically fence and durably accept a human turn/control event."""
+    ) -> str | None:
+        """Atomically validate, accept, and claim a human driver event."""
+        raise NotImplementedError
+
+    def complete_driver_event(
+        self,
+        session_id: str,
+        dispatch_id: str,
+        *,
+        succeeded: bool,
+    ) -> None:
+        """Finish a claimed event, unblocking subsequent lease mutations."""
         raise NotImplementedError
 
     def acquire_driver_lease(
