@@ -182,6 +182,7 @@ from omnigent.server.managed_hosts import (
     RepoWorkspace,
     host_resume_supported,
     host_sandbox_is_running,
+    reserve_managed_host_turn,
 )
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.permissions import check_session_access
@@ -20398,6 +20399,13 @@ def create_sessions_router(
                 "Session is closed. Start a new sub-agent session to continue.",
                 code=ErrorCode.CONFLICT,
             )
+        if body.type == "message" and body.data.get("role") == "user" and conv.host_id:
+            host_store_for_managed = getattr(request.app.state, "host_store", None)
+            if host_store_for_managed is not None:
+                try:
+                    await reserve_managed_host_turn(host_store_for_managed, conv.host_id)
+                except RuntimeError as exc:
+                    raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
         if (
             body.type == "message"
             and body.data.get("role") == "user"

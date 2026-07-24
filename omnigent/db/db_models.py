@@ -765,6 +765,8 @@ class SqlConversationMetadata(OmnigentBase):
         ),
         # Supports list_conversations_by_runner_id and get_runner_ids.
         Index("ix_conversation_metadata_runner_id", "workspace_id", "runner_id", "id"),
+        # Supports the managed-sandbox idle controller's host-binding scan.
+        Index("ix_conversation_metadata_host_id", "workspace_id", "host_id", "id"),
         # "list sessions in project X" + per-project counts (GROUP BY project_id).
         Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id"),
         Index("ix_conversation_metadata_team_id", "workspace_id", "team_id", "id"),
@@ -1427,6 +1429,13 @@ class SqlHost(OmnigentBase):
     token_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sandbox_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Latest admitted managed-session activity. Kept on the host row so idle
+    # suspension can atomically fence a turn when conversations use another DB.
+    managed_activity_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    managed_activity_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    wake_fence_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    suspend_claim_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    suspend_claim_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 

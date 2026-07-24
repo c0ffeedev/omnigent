@@ -702,17 +702,14 @@ def test_terminate_is_idempotent_on_404(fake_core: _FakeCore) -> None:
     assert fake_core.deleted_secrets == ["omnigent-pod-7-token"]
 
 
-def test_terminate_retries_transient_then_gives_up_best_effort(
-    fake_core: _FakeCore, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A persistent transient delete error is retried, then warned (not raised)."""
+def test_terminate_retries_transient_then_reports_failure(fake_core: _FakeCore) -> None:
+    """A persistent transient delete error remains an explicit lifecycle failure."""
     from urllib3.exceptions import HTTPError
 
     fake_core.delete_pod_errors = [HTTPError("timeout")] * k8s._POD_DELETE_MAX_ATTEMPTS
-    _launcher().terminate("omnigent-pod-8")  # best-effort: must not raise
-    assert "could not delete Kubernetes pod 'omnigent-pod-8'" in capsys.readouterr().err
-    # The Secret delete still runs after the Pod gives up.
-    assert fake_core.deleted_secrets == ["omnigent-pod-8-token"]
+    with pytest.raises(click.ClickException, match="Could not delete Kubernetes pod"):
+        _launcher().terminate("omnigent-pod-8")
+    assert fake_core.deleted_secrets == []
 
 
 def test_provision_reserves_pod_name_and_run_is_unsupported() -> None:

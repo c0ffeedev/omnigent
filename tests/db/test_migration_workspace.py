@@ -269,6 +269,17 @@ def test_runner_id_is_indexed(db_engine: Engine) -> None:
     )
 
 
+def test_managed_host_binding_is_indexed(db_engine: Engine) -> None:
+    """The recurring managed-sandbox idle scan must not full-scan sessions."""
+    index_names = {
+        ix["name"] for ix in sa.inspect(db_engine).get_indexes("omnigent_conversation_metadata")
+    }
+    assert "ix_conversation_metadata_host_id" in index_names, (
+        "Expected ix_conversation_metadata_host_id on omnigent_conversation_metadata; "
+        f"got {sorted(n for n in index_names if n is not None)}."
+    )
+
+
 def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
     """
     After the FK was removed, deleting a host leaves metadata.host_id

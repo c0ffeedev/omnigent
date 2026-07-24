@@ -50,9 +50,12 @@ from omnigent.server.managed_hosts import (
     launch_managed_host,
     parse_repo_workspace,
     parse_sandbox_config,
+    reap_idle_managed_hosts_once,
     recover_managed_credential_leases,
     relaunch_managed_host,
+    reserve_managed_host_turn,
     resume_managed_host,
+    suspend_managed_host,
     terminate_managed_host,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -540,6 +543,7 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
                 "service_account": "omnigent-runner",
                 "node_selector": {"omnigent.ai/runner-ready": "true"},
                 "in_cluster": True,
+                "idle_timeout_s": 900,
                 "resources": {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}},
             },
         }
@@ -549,6 +553,7 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
     assert cfg.token_ttl_s == KUBERNETES_MANAGED_TOKEN_TTL_S
     assert cfg.managed_launch_supported is True
     assert cfg.provider == "kubernetes"
+    assert cfg.idle_timeout_s == 900
     fake = FakeSandboxLauncher()
     install_fake_kubernetes_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -578,6 +583,20 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
     assert fake.secret_name is None
     assert fake.in_cluster is None
     assert fake.resources is None
+    assert cfg.idle_timeout_s is None
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "900"])
+async def test_parse_kubernetes_rejects_invalid_idle_timeout(value: object) -> None:
+    """Idle suspension is opt-in and must use a positive integer duration."""
+    with pytest.raises(ValueError, match=r"idle_timeout_s.*positive integer"):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "https://s.example.com",
+                "kubernetes": {"idle_timeout_s": value},
+            }
+        )
 
 
 def test_parse_kubernetes_wires_concrete_github_credential_hook() -> None:
@@ -1784,6 +1803,464 @@ async def test_launch_entrypoint_provider_cleans_up_on_launch_failure(db_uri: st
     # The reserved sandbox was terminated and no host row survives.
     assert fake.terminated == ["omnigent-pod-1"]
     assert host_store.list_hosts(_OWNER) == []
+
+
+# ── idle suspension ─────────────────────────────────────────
+
+
+async def test_idle_reap_retains_session_host_and_workspace_for_next_turn(db_uri: str) -> None:
+    """An idle generation is deleted, but its durable relaunch contract survives."""
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    host_id = "1" * 32
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            invocation.host_id,
+            invocation.host_name,
+            _OWNER,
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    config = dataclasses.replace(_injected_config(fake), idle_timeout_s=60)
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-idle",
+        user_id=_OWNER,
+        token="old-token",
+        provider=fake.provider,
+        sandbox_id="sb-idle-1",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.upsert_on_connect(host_id, "managed-idle", _OWNER)
+    conversation = conversations.create_conversation(
+        host_id=host_id,
+        workspace="/root/workspace/repo",
+    )
+
+    reaped = await reap_idle_managed_hosts_once(
+        config,
+        host_store,
+        conversations,
+        now=conversation.updated_at + 61,
+    )
+
+    assert reaped == [host_id]
+    assert fake.terminated == ["sb-idle-1"]
+    retained = host_store.get_host(host_id)
+    assert retained is not None
+    assert retained.status == "offline"
+    assert retained.sandbox_id == "sb-idle-1"
+    assert host_store.resolve_launch_token(host_id, "old-token") is None
+    bound = conversations.get_conversation(conversation.id)
+    assert bound is not None
+    assert bound.host_id == host_id
+    assert bound.workspace == "/root/workspace/repo"
+    assert (
+        await reap_idle_managed_hosts_once(
+            config,
+            host_store,
+            conversations,
+            now=conversation.updated_at + 122,
+        )
+        == []
+    )
+    assert fake.terminated == ["sb-idle-1"]
+
+    # This is the same fresh-generation operation the next message dispatches.
+    relaunched = await relaunch_managed_host(
+        config=config,
+        host=retained,
+        host_store=host_store,
+        repo=RepoWorkspace(url="https://github.com/org/repo", branch=None, repo_name="repo"),
+        session_id=conversation.id,
+    )
+    rebound = conversations.set_host_id(conversation.id, relaunched.host_id, relaunched.workspace)
+    assert relaunched.host_id == host_id
+    assert rebound.host_id == host_id
+    assert rebound.workspace == "/root/workspace/repo"
+    assert host_store.get_host(host_id).sandbox_id == "sb-fake-1"  # type: ignore[union-attr]
+
+
+async def test_idle_reap_never_terminates_a_live_active_turn(db_uri: str) -> None:
+    """Long quiet tool calls stay protected by live status plus runner heartbeat."""
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    host_id = "2" * 32
+    fake = FakeSandboxLauncher()
+    config = dataclasses.replace(_injected_config(fake), idle_timeout_s=60)
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-active",
+        user_id=_OWNER,
+        token="active-token",
+        provider=fake.provider,
+        sandbox_id="sb-active-1",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.upsert_on_connect(host_id, "managed-active", _OWNER)
+    conversation = conversations.create_conversation(
+        runner_id="runner-active",
+        host_id=host_id,
+        workspace="/root/workspace",
+    )
+    conversations.set_session_live_status(conversation.id, "running")
+    conversations.touch_runner_liveness(["runner-active"], now_epoch())
+
+    reaped = await reap_idle_managed_hosts_once(
+        config,
+        host_store,
+        conversations,
+        now=conversation.updated_at + 3600,
+    )
+
+    assert reaped == []
+    assert fake.terminated == []
+    assert host_store.get_host(host_id) is not None
+
+
+async def test_turn_reservation_fences_stale_idle_candidate(db_uri: str) -> None:
+    """A turn admitted after selection makes the suspension CAS lose."""
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher()
+    host = host_store.register_managed_host(
+        host_id="3" * 32,
+        name="managed-race",
+        user_id=_OWNER,
+        token="race-token",
+        provider=fake.provider,
+        sandbox_id="sb-race-1",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+    await reserve_managed_host_turn(host_store, host.host_id)
+    suspended = await suspend_managed_host(
+        host,
+        host_store,
+        _injected_config(fake),
+        idle_before=now_epoch() + 60,
+    )
+
+    assert suspended is False
+    assert fake.terminated == []
+    assert host_store.get_host(host.host_id).managed_activity_seq == host.managed_activity_seq + 1  # type: ignore[union-attr]
+
+
+async def test_concurrent_idle_sweepers_terminate_generation_once(db_uri: str) -> None:
+    """The durable host claim single-flights provider termination across replicas."""
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    fake = FakeSandboxLauncher()
+    config = dataclasses.replace(_injected_config(fake), idle_timeout_s=1)
+    host_id = "4" * 32
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-concurrent",
+        user_id=_OWNER,
+        token="concurrent-token",
+        provider=fake.provider,
+        sandbox_id="sb-concurrent-1",
+        token_expires_at=now_epoch() + 3600,
+    )
+    conversation = conversations.create_conversation(host_id=host_id, workspace="/workspace")
+
+    results = await asyncio.gather(
+        reap_idle_managed_hosts_once(
+            config, host_store, conversations, now=conversation.updated_at + 2
+        ),
+        reap_idle_managed_hosts_once(
+            config, host_store, conversations, now=conversation.updated_at + 2
+        ),
+    )
+
+    assert sorted(results, key=len) == [[], [host_id]]
+    assert fake.terminated == ["sb-concurrent-1"]
+
+
+async def test_cold_wake_fence_survives_registration_until_host_connects(db_uri: str) -> None:
+    """A slow cold wake cannot be reaped between token arm and tunnel connect."""
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher()
+    host = host_store.register_managed_host(
+        host_id="7" * 32,
+        name="managed-slow-wake",
+        user_id=_OWNER,
+        token="old-wake-token",
+        provider=fake.provider,
+        sandbox_id="sb-wake-old",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert host_store.claim_managed_host_suspension(
+        host.host_id,
+        expected_sandbox_id="sb-wake-old",
+        observed_activity_at=host.managed_activity_at,
+        observed_activity_seq=host.managed_activity_seq,
+        idle_before=now_epoch() + 60,
+        claim_owner="suspender",
+        claim_expires_at=now_epoch() + 60,
+    )
+    assert host_store.mark_managed_host_suspended(
+        host.host_id,
+        expected_sandbox_id="sb-wake-old",
+        claim_owner="suspender",
+    )
+
+    await reserve_managed_host_turn(host_store, host.host_id)
+    warming = host_store.register_managed_host(
+        host_id=host.host_id,
+        name=host.name,
+        user_id=_OWNER,
+        token="new-wake-token",
+        provider=fake.provider,
+        sandbox_id="sb-wake-new",
+        token_expires_at=now_epoch() + 3600,
+        expected_sandbox_id="sb-wake-old",
+    )
+
+    assert warming.wake_fence_expires_at is not None
+    assert (
+        await suspend_managed_host(
+            warming,
+            host_store,
+            _injected_config(fake),
+            idle_before=now_epoch() + 3600,
+        )
+        is False
+    )
+    assert fake.terminated == []
+    assert host_store.connect_managed_host(host.host_id, "new-wake-token", host.name) is not None
+    assert host_store.get_host(host.host_id).wake_fence_expires_at is None  # type: ignore[union-attr]
+
+
+async def test_failed_suspension_releases_host_and_credential_claims(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An uncertain provider delete leaves the generation active and retryable."""
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher()
+    host = host_store.register_managed_host(
+        host_id="5" * 32,
+        name="managed-delete-fail",
+        user_id=_OWNER,
+        token="delete-fail-token",
+        provider=fake.provider,
+        sandbox_id="sb-delete-fail",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.upsert_on_connect(host.host_id, host.name, _OWNER)
+    owner = "launch-owner"
+    lease = host_store.record_credential_lease(
+        host_id=host.host_id,
+        user_id=_OWNER,
+        host_name=host.name,
+        sandbox_provider=fake.provider,
+        sandbox_id="sb-delete-fail",
+        session_id=None,
+        repo_url=None,
+        repo_branch=None,
+        repo_name=None,
+        reference=None,
+        owner_token=owner,
+        owner_expires_at=now_epoch() + 60,
+        credential_cleanup_required=False,
+    )
+    assert host_store.activate_credential_lease(
+        host.host_id, lease.generation, owner, expected_sandbox_id="sb-delete-fail"
+    )
+
+    def _fail_termination(_sandbox_id: str) -> None:
+        raise RuntimeError("provider delete failed")
+
+    monkeypatch.setattr(fake, "terminate", _fail_termination)
+
+    assert await suspend_managed_host(host, host_store, _injected_config(fake)) is False
+
+    retained = host_store.get_host(host.host_id)
+    assert retained is not None and retained.suspend_claim_owner is None
+    leases = host_store.list_credential_leases(host.host_id)
+    assert len(leases) == 1
+    assert leases[0].state == "active"
+    assert leases[0].claim_owner is None
+
+
+async def test_suspension_cas_loss_cleans_terminated_generation_lease(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-delete host CAS loss cannot strand retiring lease claims."""
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher()
+    host = host_store.register_managed_host(
+        host_id="6" * 32,
+        name="managed-cas-loss",
+        user_id=_OWNER,
+        token="cas-loss-token",
+        provider=fake.provider,
+        sandbox_id="sb-cas-loss",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.upsert_on_connect(host.host_id, host.name, _OWNER)
+    owner = "cas-owner"
+    lease = host_store.record_credential_lease(
+        host_id=host.host_id,
+        user_id=_OWNER,
+        host_name=host.name,
+        sandbox_provider=fake.provider,
+        sandbox_id="sb-cas-loss",
+        session_id=None,
+        repo_url=None,
+        repo_branch=None,
+        repo_name=None,
+        reference=None,
+        owner_token=owner,
+        owner_expires_at=now_epoch() + 60,
+        credential_cleanup_required=False,
+    )
+    assert host_store.activate_credential_lease(
+        host.host_id, lease.generation, owner, expected_sandbox_id="sb-cas-loss"
+    )
+    monkeypatch.setattr(host_store, "mark_managed_host_suspended", lambda *args, **kwargs: False)
+
+    assert await suspend_managed_host(host, host_store, _injected_config(fake)) is False
+
+    assert fake.terminated == ["sb-cas-loss"]
+    assert host_store.list_credential_leases(host.host_id) == []
+
+
+@pytest.mark.parametrize("failure_stage", ["claim", "mark"])
+async def test_suspension_store_error_cleans_durable_claims(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    """Store failures cannot strand host or credential claims."""
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher()
+    host = host_store.register_managed_host(
+        host_id="8" * 32,
+        name="managed-store-error",
+        user_id=_OWNER,
+        token="store-error-token",
+        provider=fake.provider,
+        sandbox_id="sb-store-error",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.upsert_on_connect(host.host_id, host.name, _OWNER)
+    owner = "store-error-owner"
+    lease = host_store.record_credential_lease(
+        host_id=host.host_id,
+        user_id=_OWNER,
+        host_name=host.name,
+        sandbox_provider=fake.provider,
+        sandbox_id="sb-store-error",
+        session_id=None,
+        repo_url=None,
+        repo_branch=None,
+        repo_name=None,
+        reference=None,
+        owner_token=owner,
+        owner_expires_at=now_epoch() + 60,
+        credential_cleanup_required=False,
+    )
+    assert host_store.activate_credential_lease(
+        host.host_id, lease.generation, owner, expected_sandbox_id="sb-store-error"
+    )
+    error = RuntimeError(f"{failure_stage} failed")
+    if failure_stage == "claim":
+        original_claim: Callable[..., Any] = host_store.claim_active_credential_leases
+
+        def _claim_then_raise(*args: object, **kwargs: object) -> None:
+            original_claim(*args, **kwargs)
+            raise error
+
+        monkeypatch.setattr(host_store, "claim_active_credential_leases", _claim_then_raise)
+    else:
+
+        def _mark_then_raise(*args: object, **kwargs: object) -> None:
+            raise error
+
+        monkeypatch.setattr(host_store, "mark_managed_host_suspended", _mark_then_raise)
+
+    with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
+        await suspend_managed_host(host, host_store, _injected_config(fake))
+
+    retained = host_store.get_host(host.host_id)
+    assert retained is not None and retained.suspend_claim_owner is None
+    leases = host_store.list_credential_leases(host.host_id)
+    if failure_stage == "claim":
+        assert len(leases) == 1
+        assert leases[0].state == "active"
+        assert leases[0].claim_owner is None
+        assert fake.terminated == []
+    else:
+        assert leases == []
+        assert fake.terminated == ["sb-store-error"]
+
+
+async def test_suspension_cancellation_keeps_credential_claim_retryable(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation during provider work keeps leases fenced for recovery."""
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher()
+    host = host_store.register_managed_host(
+        host_id="9" * 32,
+        name="managed-cancel",
+        user_id=_OWNER,
+        token="cancel-token",
+        provider=fake.provider,
+        sandbox_id="sb-cancel",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.upsert_on_connect(host.host_id, host.name, _OWNER)
+    owner = "cancel-owner"
+    lease = host_store.record_credential_lease(
+        host_id=host.host_id,
+        user_id=_OWNER,
+        host_name=host.name,
+        sandbox_provider=fake.provider,
+        sandbox_id="sb-cancel",
+        session_id=None,
+        repo_url=None,
+        repo_branch=None,
+        repo_name=None,
+        reference=None,
+        owner_token=owner,
+        owner_expires_at=now_epoch() + 60,
+        credential_cleanup_required=False,
+    )
+    assert host_store.activate_credential_lease(
+        host.host_id, lease.generation, owner, expected_sandbox_id="sb-cancel"
+    )
+    entered = threading.Event()
+    finish = threading.Event()
+    original_terminate = fake.terminate
+
+    def _blocking_terminate(sandbox_id: str) -> None:
+        entered.set()
+        assert finish.wait(timeout=5)
+        original_terminate(sandbox_id)
+
+    monkeypatch.setattr(fake, "terminate", _blocking_terminate)
+    task = asyncio.create_task(suspend_managed_host(host, host_store, _injected_config(fake)))
+    assert await asyncio.to_thread(entered.wait, 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    retained = host_store.get_host(host.host_id)
+    assert retained is not None and retained.suspend_claim_owner is None
+    leases = host_store.list_credential_leases(host.host_id)
+    assert len(leases) == 1
+    assert leases[0].state == "retiring"
+    assert leases[0].claim_owner is not None
+    assert leases[0].claim_expires_at is not None
+
+    finish.set()
+    for _ in range(100):
+        if fake.terminated:
+            break
+        await asyncio.sleep(0.01)
+    assert fake.terminated == ["sb-cancel"]
 
 
 # ── relaunch_managed_host ───────────────────────────────────
