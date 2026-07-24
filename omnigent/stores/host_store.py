@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import Engine, and_, func, or_, select, update
+from sqlalchemy import Engine, and_, case, func, or_, select, update
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -50,6 +50,7 @@ from omnigent.harness_availability import HarnessAvailability, is_harness_availa
 # (PING_INTERVAL_S * PING_MISS_THRESHOLD) so a healthy host that is
 # still heart-beating is never falsely aged out.
 HOST_LIVENESS_TTL_S = 90
+MANAGED_WAKE_FENCE_TTL_S = 300
 
 
 @dataclass
@@ -90,6 +91,11 @@ class Host:
     updated_at: int
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
+    managed_activity_at: int | None = None
+    managed_activity_seq: int = 0
+    wake_fence_expires_at: int | None = None
+    suspend_claim_owner: str | None = None
+    suspend_claim_expires_at: int | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
 
 
@@ -205,6 +211,11 @@ def _row_to_host(row: SqlHost) -> Host:
         updated_at=row.updated_at,
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
+        managed_activity_at=row.managed_activity_at,
+        managed_activity_seq=row.managed_activity_seq or 0,
+        wake_fence_expires_at=row.wake_fence_expires_at,
+        suspend_claim_owner=row.suspend_claim_owner,
+        suspend_claim_expires_at=row.suspend_claim_expires_at,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
     )
 
@@ -1440,6 +1451,10 @@ class HostStore:
                 existing.token_expires_at = token_expires_at
                 existing.sandbox_provider = provider
                 existing.sandbox_id = sandbox_id
+                existing.managed_activity_at = now
+                existing.managed_activity_seq += 1
+                existing.suspend_claim_owner = None
+                existing.suspend_claim_expires_at = None
                 if sandbox_changed:
                     existing.status = encode_host_status("offline")
                 existing.updated_at = now
@@ -1457,6 +1472,8 @@ class HostStore:
                 token_expires_at=token_expires_at,
                 sandbox_provider=provider,
                 sandbox_id=sandbox_id,
+                managed_activity_at=now,
+                managed_activity_seq=0,
             )
             session.add(row)
             return _row_to_host(row)
@@ -1555,6 +1572,7 @@ class HostStore:
                 return None
             row.name = name
             row.status = encode_host_status("online")
+            row.wake_fence_expires_at = None
             row.updated_at = now
             row.configured_harnesses = harnesses_json
             return _row_to_host(row)
@@ -1611,6 +1629,7 @@ class HostStore:
         host_id: str,
         *,
         expected_sandbox_id: str,
+        claim_owner: str,
     ) -> bool:
         """Mark one terminated sandbox generation offline without deleting it.
 
@@ -1628,13 +1647,152 @@ class HostStore:
                 )
                 .with_for_update()
             ).scalar_one_or_none()
-            if row is None or row.sandbox_id != expected_sandbox_id:
+            if (
+                row is None
+                or row.sandbox_id != expected_sandbox_id
+                or row.suspend_claim_owner != claim_owner
+            ):
                 return False
             row.status = encode_host_status("offline")
             row.token_hash = None
             row.token_expires_at = None
+            row.suspend_claim_owner = None
+            row.suspend_claim_expires_at = None
             row.updated_at = now_epoch()
             return True
+
+    def claim_managed_host_suspension(
+        self,
+        host_id: str,
+        *,
+        expected_sandbox_id: str,
+        observed_activity_at: int | None,
+        observed_activity_seq: int,
+        idle_before: int,
+        claim_owner: str,
+        claim_expires_at: int,
+    ) -> bool:
+        """Atomically fence one idle managed generation for termination."""
+        activity_matches = (
+            SqlHost.managed_activity_at.is_(None)
+            if observed_activity_at is None
+            else SqlHost.managed_activity_at == observed_activity_at
+        )
+        with self._write_session() as session:
+            result = session.execute(
+                update(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.sandbox_id == expected_sandbox_id,
+                    SqlHost.token_hash.is_not(None),
+                    activity_matches,
+                    SqlHost.managed_activity_seq == observed_activity_seq,
+                    or_(
+                        SqlHost.wake_fence_expires_at.is_(None),
+                        SqlHost.wake_fence_expires_at < now_epoch(),
+                    ),
+                    or_(
+                        SqlHost.managed_activity_at.is_(None),
+                        SqlHost.managed_activity_at <= idle_before,
+                    ),
+                    or_(
+                        SqlHost.suspend_claim_owner.is_(None),
+                        SqlHost.suspend_claim_expires_at < now_epoch(),
+                    ),
+                )
+                .values(
+                    suspend_claim_owner=claim_owner,
+                    suspend_claim_expires_at=claim_expires_at,
+                )
+            )
+            return _rowcount(result) == 1
+
+    def release_managed_host_suspension_claim(
+        self,
+        host_id: str,
+        *,
+        expected_sandbox_id: str,
+        claim_owner: str,
+    ) -> bool:
+        """Release a failed provider-termination claim by compare-and-swap."""
+        with self._write_session() as session:
+            result = session.execute(
+                update(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.sandbox_id == expected_sandbox_id,
+                    SqlHost.suspend_claim_owner == claim_owner,
+                )
+                .values(suspend_claim_owner=None, suspend_claim_expires_at=None)
+            )
+            return _rowcount(result) == 1
+
+    def reserve_managed_host_activity(self, host_id: str, *, activity_at: int) -> bool:
+        """Reserve a managed host for a turn unless suspension is in flight."""
+        now = now_epoch()
+        with self._write_session() as session:
+            result = session.execute(
+                update(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.sandbox_provider.is_not(None),
+                    or_(
+                        SqlHost.suspend_claim_owner.is_(None),
+                        SqlHost.suspend_claim_expires_at < now,
+                    ),
+                )
+                .values(
+                    managed_activity_at=case(
+                        (
+                            or_(
+                                SqlHost.managed_activity_at.is_(None),
+                                SqlHost.managed_activity_at < activity_at,
+                            ),
+                            activity_at,
+                        ),
+                        else_=SqlHost.managed_activity_at,
+                    ),
+                    managed_activity_seq=SqlHost.managed_activity_seq + 1,
+                    wake_fence_expires_at=case(
+                        (SqlHost.token_hash.is_(None), now + MANAGED_WAKE_FENCE_TTL_S),
+                        else_=SqlHost.wake_fence_expires_at,
+                    ),
+                    suspend_claim_owner=None,
+                    suspend_claim_expires_at=None,
+                )
+            )
+            return _rowcount(result) == 1
+
+    def abandon_credential_lease_claim(
+        self,
+        host_id: str,
+        generation: int,
+        *,
+        claim_owner: str,
+    ) -> bool:
+        """Restore an active lease when its sandbox cleanup did not happen."""
+        with self._write_session() as session:
+            result = session.execute(
+                update(SqlManagedCredentialLease)
+                .where(
+                    SqlManagedCredentialLease.workspace_id == current_workspace_id(),
+                    SqlManagedCredentialLease.host_id == host_id,
+                    SqlManagedCredentialLease.generation == generation,
+                    SqlManagedCredentialLease.state
+                    == encode_managed_credential_lease_state("retiring"),
+                    SqlManagedCredentialLease.claim_owner == claim_owner,
+                )
+                .values(
+                    state=encode_managed_credential_lease_state("active"),
+                    claim_owner=None,
+                    claim_expires_at=None,
+                    updated_at=now_epoch(),
+                )
+            )
+            return _rowcount(result) == 1
 
     def revoke_launch_token(
         self,

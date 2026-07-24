@@ -1,7 +1,7 @@
 """Index managed host session bindings for idle lifecycle scans.
 
-Revision ID: f5a6b7c8d9e0
-Revises: e4f5a6b7c8d9
+Revision ID: a17b28c39d40
+Revises: f5a6b7c8d9e0
 Create Date: 2026-07-24 10:00:00.000000
 
 The managed-sandbox idle controller periodically resolves sessions bound to the
@@ -15,8 +15,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "f5a6b7c8d9e0"
-down_revision: str | None = "e4f5a6b7c8d9"
+revision: str = "a17b28c39d40"
+down_revision: str | None = "a7b8c9d0e1f2"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

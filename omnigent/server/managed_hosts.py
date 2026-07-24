@@ -2666,6 +2666,22 @@ async def _release_stored_credential_leases(
     return all_released
 
 
+async def _abandon_credential_lease_claims(
+    host_store: HostStore,
+    records: list[CredentialLeaseRecord],
+) -> None:
+    """Return cleanup claims to active when the sandbox was not terminated."""
+    for record in records:
+        if record.claim_owner is None:
+            continue
+        await asyncio.to_thread(
+            host_store.abandon_credential_lease_claim,
+            record.host_id,
+            record.generation,
+            claim_owner=record.claim_owner,
+        )
+
+
 async def recover_managed_credential_leases(
     config: ManagedSandboxConfig,
     host_store: HostStore,
@@ -3308,6 +3324,8 @@ async def suspend_managed_host(
     host: Host,
     host_store: HostStore,
     config: ManagedSandboxConfig,
+    *,
+    idle_before: int | None = None,
 ) -> bool:
     """Terminate one sandbox generation while retaining durable host identity.
 
@@ -3320,27 +3338,55 @@ async def suspend_managed_host(
     if launcher is None or host.sandbox_id is None:
         return False
     claim_owner = secrets.token_urlsafe(24)
+    claim_expires_at = now_epoch() + _CREDENTIAL_CLAIM_TTL_S
+    owns_host_claim = await asyncio.to_thread(
+        host_store.claim_managed_host_suspension,
+        host.host_id,
+        expected_sandbox_id=host.sandbox_id,
+        observed_activity_at=host.managed_activity_at,
+        observed_activity_seq=host.managed_activity_seq,
+        idle_before=idle_before if idle_before is not None else now_epoch(),
+        claim_owner=claim_owner,
+        claim_expires_at=claim_expires_at,
+    )
+    if not owns_host_claim:
+        return False
     claimed = await asyncio.to_thread(
         host_store.claim_active_credential_leases,
         host.host_id,
         claim_owner=claim_owner,
-        claim_expires_at=now_epoch() + _CREDENTIAL_CLAIM_TTL_S,
+        claim_expires_at=claim_expires_at,
         expected_sandbox_id=host.sandbox_id,
         expected_provider=host.sandbox_provider,
     )
     terminated = await _terminate_sandbox_best_effort(launcher, host)
     if not terminated:
+        await _abandon_credential_lease_claims(host_store, claimed)
+        await asyncio.to_thread(
+            host_store.release_managed_host_suspension_claim,
+            host.host_id,
+            expected_sandbox_id=host.sandbox_id,
+            claim_owner=claim_owner,
+        )
         return False
     suspended = await asyncio.to_thread(
         host_store.mark_managed_host_suspended,
         host.host_id,
         expected_sandbox_id=host.sandbox_id,
+        claim_owner=claim_owner,
     )
     if not suspended:
         _logger.info(
             "Managed idle suspension lost generation CAS for host %s sandbox %s",
             host.host_id,
             host.sandbox_id,
+        )
+        await _release_stored_credential_leases(config, host_store, claimed)
+        await asyncio.to_thread(
+            host_store.release_managed_host_suspension_claim,
+            host.host_id,
+            expected_sandbox_id=host.sandbox_id,
+            claim_owner=claim_owner,
         )
         return False
     await _release_stored_credential_leases(config, host_store, claimed)
@@ -3351,6 +3397,29 @@ async def suspend_managed_host(
         host.sandbox_provider,
     )
     return True
+
+
+async def reserve_managed_host_turn(
+    host_store: HostStore,
+    host_id: str,
+    *,
+    timeout_s: float = _CREDENTIAL_CLAIM_TTL_S,
+) -> None:
+    """Persist turn activity, waiting for any in-flight suspension to settle."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None or host.sandbox_provider is None:
+            return
+        if await asyncio.to_thread(
+            host_store.reserve_managed_host_activity,
+            host_id,
+            activity_at=now_epoch(),
+        ):
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"timed out waiting for managed host {host_id!r} suspension")
+        await asyncio.sleep(0.1)
 
 
 async def reap_idle_managed_hosts_once(
@@ -3404,7 +3473,12 @@ async def reap_idle_managed_hosts_once(
             cutoff=cutoff,
         ):
             continue
-        if await suspend_managed_host(binding.host, host_store, config):
+        if await suspend_managed_host(
+            binding.host,
+            host_store,
+            config,
+            idle_before=cutoff,
+        ):
             suspended.append(binding.host.host_id)
     return suspended
 

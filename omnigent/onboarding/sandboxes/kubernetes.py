@@ -1534,12 +1534,13 @@ class KubernetesSandboxLauncher(SandboxLauncher):
     def _delete_with_retry(self, kind: str, name: str, delete: Callable[[], object]) -> None:
         """
         Run *delete* with bounded retries on a transient timeout/connection
-        error, treating 404 as success and never raising on a transient failure.
+        error, treating 404 as success and surfacing exhausted retries.
 
         :param kind: The object kind, for the warning, e.g. ``"pod"``.
         :param name: The object name, for the warning/error.
         :param delete: The zero-arg delete call.
-        :raises click.ClickException: On an ``ApiException`` other than 404.
+        :raises click.ClickException: On an ``ApiException`` other than 404 or
+            when transient retries are exhausted.
         """
         from kubernetes.client.rest import ApiException
         from urllib3.exceptions import HTTPError
@@ -1557,11 +1558,10 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                 reason = _api_reason(exc)
             if attempt + 1 < _POD_DELETE_MAX_ATTEMPTS:
                 time.sleep(_POD_DELETE_BACKOFF_S)
-        click.echo(
-            f"  → warning: could not delete Kubernetes {kind} '{name}' after "
+        raise click.ClickException(
+            f"Could not delete Kubernetes {kind} '{name}' after "
             f"{_POD_DELETE_MAX_ATTEMPTS} attempts ({reason}); it may still exist "
-            "and carries the omnigent managed-by/role labels for GC.",
-            err=True,
+            "and carries the omnigent managed-by/role labels for GC."
         )
 
     # ── unsupported: no exec transport (the host is the Pod entrypoint) ──
