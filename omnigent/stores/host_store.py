@@ -1794,6 +1794,36 @@ class HostStore:
             )
             return _rowcount(result) == 1
 
+    def abandon_credential_lease_claims(
+        self,
+        host_id: str,
+        *,
+        claim_owner: str,
+        expected_sandbox_id: str,
+        expected_provider: str | None,
+    ) -> int:
+        """Restore every retiring lease acquired by one failed cleanup attempt."""
+        with self._write_session() as session:
+            result = session.execute(
+                update(SqlManagedCredentialLease)
+                .where(
+                    SqlManagedCredentialLease.workspace_id == current_workspace_id(),
+                    SqlManagedCredentialLease.host_id == host_id,
+                    SqlManagedCredentialLease.sandbox_id == expected_sandbox_id,
+                    SqlManagedCredentialLease.sandbox_provider == expected_provider,
+                    SqlManagedCredentialLease.state
+                    == encode_managed_credential_lease_state("retiring"),
+                    SqlManagedCredentialLease.claim_owner == claim_owner,
+                )
+                .values(
+                    state=encode_managed_credential_lease_state("active"),
+                    claim_owner=None,
+                    claim_expires_at=None,
+                    updated_at=now_epoch(),
+                )
+            )
+            return _rowcount(result)
+
     def revoke_launch_token(
         self,
         host_id: str,

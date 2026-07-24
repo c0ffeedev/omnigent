@@ -2126,6 +2126,143 @@ async def test_suspension_cas_loss_cleans_terminated_generation_lease(
     assert host_store.list_credential_leases(host.host_id) == []
 
 
+@pytest.mark.parametrize("failure_stage", ["claim", "mark"])
+async def test_suspension_store_error_cleans_durable_claims(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    """Store failures cannot strand host or credential claims."""
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher()
+    host = host_store.register_managed_host(
+        host_id="8" * 32,
+        name="managed-store-error",
+        user_id=_OWNER,
+        token="store-error-token",
+        provider=fake.provider,
+        sandbox_id="sb-store-error",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.upsert_on_connect(host.host_id, host.name, _OWNER)
+    owner = "store-error-owner"
+    lease = host_store.record_credential_lease(
+        host_id=host.host_id,
+        user_id=_OWNER,
+        host_name=host.name,
+        sandbox_provider=fake.provider,
+        sandbox_id="sb-store-error",
+        session_id=None,
+        repo_url=None,
+        repo_branch=None,
+        repo_name=None,
+        reference=None,
+        owner_token=owner,
+        owner_expires_at=now_epoch() + 60,
+        credential_cleanup_required=False,
+    )
+    assert host_store.activate_credential_lease(
+        host.host_id, lease.generation, owner, expected_sandbox_id="sb-store-error"
+    )
+    error = RuntimeError(f"{failure_stage} failed")
+    if failure_stage == "claim":
+        original_claim: Callable[..., Any] = host_store.claim_active_credential_leases
+
+        def _claim_then_raise(*args: object, **kwargs: object) -> None:
+            original_claim(*args, **kwargs)
+            raise error
+
+        monkeypatch.setattr(host_store, "claim_active_credential_leases", _claim_then_raise)
+    else:
+
+        def _mark_then_raise(*args: object, **kwargs: object) -> None:
+            raise error
+
+        monkeypatch.setattr(host_store, "mark_managed_host_suspended", _mark_then_raise)
+
+    with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
+        await suspend_managed_host(host, host_store, _injected_config(fake))
+
+    retained = host_store.get_host(host.host_id)
+    assert retained is not None and retained.suspend_claim_owner is None
+    leases = host_store.list_credential_leases(host.host_id)
+    if failure_stage == "claim":
+        assert len(leases) == 1
+        assert leases[0].state == "active"
+        assert leases[0].claim_owner is None
+        assert fake.terminated == []
+    else:
+        assert leases == []
+        assert fake.terminated == ["sb-store-error"]
+
+
+async def test_suspension_cancellation_keeps_credential_claim_retryable(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation during provider work keeps leases fenced for recovery."""
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher()
+    host = host_store.register_managed_host(
+        host_id="9" * 32,
+        name="managed-cancel",
+        user_id=_OWNER,
+        token="cancel-token",
+        provider=fake.provider,
+        sandbox_id="sb-cancel",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.upsert_on_connect(host.host_id, host.name, _OWNER)
+    owner = "cancel-owner"
+    lease = host_store.record_credential_lease(
+        host_id=host.host_id,
+        user_id=_OWNER,
+        host_name=host.name,
+        sandbox_provider=fake.provider,
+        sandbox_id="sb-cancel",
+        session_id=None,
+        repo_url=None,
+        repo_branch=None,
+        repo_name=None,
+        reference=None,
+        owner_token=owner,
+        owner_expires_at=now_epoch() + 60,
+        credential_cleanup_required=False,
+    )
+    assert host_store.activate_credential_lease(
+        host.host_id, lease.generation, owner, expected_sandbox_id="sb-cancel"
+    )
+    entered = threading.Event()
+    finish = threading.Event()
+    original_terminate = fake.terminate
+
+    def _blocking_terminate(sandbox_id: str) -> None:
+        entered.set()
+        assert finish.wait(timeout=5)
+        original_terminate(sandbox_id)
+
+    monkeypatch.setattr(fake, "terminate", _blocking_terminate)
+    task = asyncio.create_task(suspend_managed_host(host, host_store, _injected_config(fake)))
+    assert await asyncio.to_thread(entered.wait, 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    retained = host_store.get_host(host.host_id)
+    assert retained is not None and retained.suspend_claim_owner is None
+    leases = host_store.list_credential_leases(host.host_id)
+    assert len(leases) == 1
+    assert leases[0].state == "retiring"
+    assert leases[0].claim_owner is not None
+    assert leases[0].claim_expires_at is not None
+
+    finish.set()
+    for _ in range(100):
+        if fake.terminated:
+            break
+        await asyncio.sleep(0.01)
+    assert fake.terminated == ["sb-cancel"]
+
+
 # ── relaunch_managed_host ───────────────────────────────────
 
 
