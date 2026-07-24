@@ -168,6 +168,32 @@ class SessionConnectivity:
     runner_last_seen: int | None = None
 
 
+@dataclass(frozen=True)
+class SessionDriverLease:
+    """Persisted driver ownership and fencing generation for one session."""
+
+    session_id: str
+    holder_user_id: str | None
+    generation: int
+    acquired_at: int | None
+    renewed_at: int | None
+    expires_at: int | None
+    released_at: int | None
+
+    def is_active(self, now: int | None = None) -> bool:
+        """Return whether this lease currently authorizes its holder."""
+        ref = int(time.time()) if now is None else now
+        return (
+            self.holder_user_id is not None
+            and self.expires_at is not None
+            and self.expires_at > ref
+        )
+
+
+class DriverLeaseConflictError(Exception):
+    """Raised when a lease mutation loses ownership or generation fencing."""
+
+
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
 # replica refreshes live runners every ~30s (the tunnel ping interval),
 # so 3 missed refreshes = offline — the same budget the tunnel's own
@@ -268,6 +294,64 @@ class ConversationStore(ABC):
         """
         self.storage_location = storage_location
         self.conversation_storage_location = conversation_storage_location
+
+    def get_driver_lease(self, session_id: str) -> SessionDriverLease | None:
+        """Return the persisted driver lease for a session, if any."""
+        raise NotImplementedError
+
+    def validate_driver_lease(
+        self,
+        session_id: str,
+        actor_user_id: str,
+        generation: int | None,
+    ) -> SessionDriverLease | None:
+        """Validate a human input against the current persisted lease.
+
+        Sessions without a lease row retain the legacy unfenced input path.
+        Once a row exists, inputs require its active holder and generation.
+        """
+        raise NotImplementedError
+
+    def acquire_driver_lease(
+        self,
+        session_id: str,
+        actor_user_id: str,
+        ttl_seconds: int,
+        *,
+        force: bool = False,
+    ) -> SessionDriverLease:
+        """Acquire an absent/expired lease, or take it over when forced."""
+        raise NotImplementedError
+
+    def renew_driver_lease(
+        self,
+        session_id: str,
+        actor_user_id: str,
+        generation: int,
+        ttl_seconds: int,
+    ) -> SessionDriverLease:
+        """Renew a matching active lease without changing generation."""
+        raise NotImplementedError
+
+    def release_driver_lease(
+        self,
+        session_id: str,
+        actor_user_id: str,
+        generation: int,
+    ) -> SessionDriverLease:
+        """Release a matching active lease while retaining its tombstone."""
+        raise NotImplementedError
+
+    def handoff_driver_lease(
+        self,
+        session_id: str,
+        actor_user_id: str,
+        holder_user_id: str,
+        generation: int,
+        ttl_seconds: int,
+    ) -> SessionDriverLease:
+        """Atomically hand an active lease to another user."""
+        raise NotImplementedError
 
     @abstractmethod
     def create_conversation(

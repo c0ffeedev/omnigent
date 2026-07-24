@@ -72,6 +72,7 @@ from omnigent.entities import (
     ErrorData,
     MessageData,
     NewConversationItem,
+    ResourceEventData,
     SlashCommandData,
     StoredFile,
     synthesize_conversation_title,
@@ -234,6 +235,10 @@ from omnigent.server.schemas import (
     CopyFilesRequest,
     CopyFilesResponse,
     CreatedSessionResponse,
+    DriverLeaseAcquireRequest,
+    DriverLeaseGenerationRequest,
+    DriverLeaseHandoffRequest,
+    DriverLeaseResponse,
     ElicitationRequestEvent,
     ElicitationRequestParams,
     ElicitationResult,
@@ -249,6 +254,7 @@ from omnigent.server.schemas import (
     PermissionObject,
     PolicyDeniedEvent,
     PolicySummary,
+    PresenceHeartbeatRequest,
     ReadStatePutRequest,
     ReasoningStartedEvent,
     ReasoningTextDeltaEvent,
@@ -273,6 +279,7 @@ from omnigent.server.schemas import (
     SessionMcpStartupEvent,
     SessionModelEvent,
     SessionModelOptionsEvent,
+    SessionPresenceResponse,
     SessionReasoningEffortEvent,
     SessionResourceListPage,
     SessionResourceObject,
@@ -308,7 +315,9 @@ from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
     PROJECT_LABEL_KEY,
     ConversationNotFoundError,
+    DriverLeaseConflictError,
     NameAlreadyExistsError,
+    SessionDriverLease,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
@@ -2663,6 +2672,38 @@ def _pending_elicitation_snapshot_for_session(
     return events
 
 
+def _driver_lease_response(lease: SessionDriverLease | None) -> DriverLeaseResponse | None:
+    """Project a persisted lease without treating expiry as ownership."""
+    if lease is None:
+        return None
+    return DriverLeaseResponse(
+        session_id=lease.session_id,
+        holder_user_id=lease.holder_user_id,
+        generation=lease.generation,
+        acquired_at=lease.acquired_at,
+        renewed_at=lease.renewed_at,
+        expires_at=lease.expires_at,
+        released_at=lease.released_at,
+        active=lease.is_active(),
+    )
+
+
+def _requires_driver_fence(body: SessionEventInput) -> bool:
+    """Return whether an event can drive or control a human-authored turn."""
+    if body.type == "message":
+        return body.data.get("role") == "user"
+    if body.type == "function_call" and body.data.get("evaluate_policy"):
+        return False
+    return body.type in {
+        "function_call_output",
+        _APPROVAL_TYPE,
+        _COMPACT_TYPE,
+        _INTERRUPT_TYPE,
+        _SLASH_COMMAND_TYPE,
+        _STOP_SESSION_TYPE,
+    }
+
+
 def _build_session_response(
     conv: Conversation,
     items: list[ConversationItem],
@@ -2682,6 +2723,8 @@ def _build_session_response(
     subtree_usage: dict[str, Any] | None = None,
     model_options: list[dict[str, Any]] | None = None,
     visible_team_ids: set[str] | None = None,
+    driver_lease: SessionDriverLease | None = None,
+    presence_state: dict[str, Any] | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -2787,6 +2830,10 @@ def _build_session_response(
         reasoning_effort=conv.reasoning_effort,
         items=items,
         permission_level=permission_level,
+        driver_lease=_driver_lease_response(driver_lease),
+        presence=(
+            SessionPresenceResponse.model_validate(presence_state) if presence_state else None
+        ),
         sub_agent_name=conv.sub_agent_name,
         parent_session_id=conv.parent_conversation_id,
         root_conversation_id=conv.root_conversation_id,
@@ -5401,6 +5448,8 @@ async def _persist_external_conversation_item(
             # bubble then disappear once the committed item arrived.
             if drained.created_by is not None and item.created_by is None:
                 item = item.model_copy(update={"created_by": drained.created_by})
+            if drained.driver_generation is not None and item.driver_generation is None:
+                item = item.model_copy(update={"driver_generation": drained.driver_generation})
         elif item.created_by is None and created_by is not None:
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
@@ -5445,6 +5494,7 @@ async def _persist_skipped_kiro_pending_input(
         response_id=turn_id,
         data=MessageData(role="user", content=skipped.content),
         created_by=skipped.created_by,
+        driver_generation=skipped.driver_generation,
     )
     error = ErrorData(
         source="execution",
@@ -8873,6 +8923,7 @@ def _build_new_item(
         response_id=response_id,
         data=data,
         created_by=created_by,
+        driver_generation=body.driver_generation,
     )
 
 
@@ -9257,6 +9308,7 @@ async def _persist_session_event(
     session_id: str,
     body: SessionEventInput,
     conversation_store: ConversationStore,
+    created_by: str | None = None,
 ) -> str:
     """
     Persist a user event without forwarding to a runner.
@@ -9274,7 +9326,7 @@ async def _persist_session_event(
     import uuid
 
     turn_id = f"turn_{uuid.uuid4().hex}"
-    item = _build_new_item(body, turn_id)
+    item = _build_new_item(body, turn_id, created_by=created_by)
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
@@ -9504,6 +9556,8 @@ async def _forward_event_to_runner(
         # resolved copy — id-based dedup, not a role/content guess.
         "persisted_item_id": persisted_items[0].id,
     }
+    if body.driver_generation is not None:
+        runner_body["driver_generation"] = body.driver_generation
     if created_by is not None:
         runner_body["actor"] = _build_actor(created_by)
     # Forward request-supplied client-side tool schemas so non-native
@@ -9828,7 +9882,12 @@ async def _dispatch_session_event_to_runner(
         # received doesn't replay as a ghost.
         content = body.data.get("content")
         pending_id: str | None = (
-            pending_inputs.record(session_id, content, created_by=created_by)
+            pending_inputs.record(
+                session_id,
+                content,
+                created_by=created_by,
+                driver_generation=body.driver_generation,
+            )
             if isinstance(content, list) and content
             else None
         )
@@ -20219,6 +20278,229 @@ def create_sessions_router(
             "content_preview": params.get("content_preview", ""),
         }
 
+    def _publish_driver_lease(session_id: str, lease: SessionDriverLease) -> None:
+        payload = _driver_lease_response(lease)
+        session_stream.publish(
+            session_id,
+            {
+                "type": "session.driver_lease",
+                "conversation_id": session_id,
+                "driver_lease": payload.model_dump() if payload is not None else None,
+            },
+        )
+
+    async def _mutate_driver_lease(
+        operation: Callable[[], SessionDriverLease],
+        session_id: str,
+        actor_user_id: str,
+        transition: str | Callable[[SessionDriverLease], str],
+    ) -> DriverLeaseResponse:
+        try:
+            lease = await asyncio.to_thread(operation)
+        except DriverLeaseConflictError as exc:
+            current = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
+            current_response = _driver_lease_response(current)
+            raise OmnigentError(
+                str(exc),
+                code=ErrorCode.CONFLICT,
+                details={
+                    "driver_lease": (
+                        current_response.model_dump() if current_response is not None else None
+                    )
+                },
+            ) from exc
+        event_type = transition(lease) if callable(transition) else transition
+        await asyncio.to_thread(
+            conversation_store.append,
+            session_id,
+            [
+                NewConversationItem(
+                    type="resource_event",
+                    response_id=session_id,
+                    data=ResourceEventData(
+                        event_type=f"session.driver_lease.{event_type}",
+                        resource_id=session_id,
+                        resource_type="driver_lease",
+                        resource={
+                            "session_id": lease.session_id,
+                            "holder_user_id": lease.holder_user_id,
+                            "generation": lease.generation,
+                            "acquired_at": lease.acquired_at,
+                            "renewed_at": lease.renewed_at,
+                            "expires_at": lease.expires_at,
+                            "released_at": lease.released_at,
+                            "actor_user_id": actor_user_id,
+                        },
+                    ),
+                    created_by=actor_user_id,
+                    driver_generation=lease.generation,
+                )
+            ],
+        )
+        _publish_driver_lease(session_id, lease)
+        response = _driver_lease_response(lease)
+        assert response is not None
+        return response
+
+    @router.get(
+        "/sessions/{session_id}/driver",
+        response_model=DriverLeaseResponse | None,
+    )
+    async def get_driver_lease(
+        session_id: str,
+        request: Request,
+    ) -> DriverLeaseResponse | None:
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        lease = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
+        return _driver_lease_response(lease)
+
+    @router.post(
+        "/sessions/{session_id}/driver/acquire",
+        response_model=DriverLeaseResponse,
+    )
+    async def acquire_driver_lease(
+        session_id: str,
+        body: DriverLeaseAcquireRequest,
+        request: Request,
+    ) -> DriverLeaseResponse:
+        user_id = _get_user_id(request, auth_provider)
+        actor_user_id = user_id or RESERVED_USER_PUBLIC
+        minimum_level = LEVEL_MANAGE if body.force else LEVEL_EDIT
+        await _require_access_and_level(
+            user_id, session_id, minimum_level, permission_store, conversation_store
+        )
+        previous = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
+
+        def transition(lease: SessionDriverLease) -> str:
+            if previous is None or previous.holder_user_id is None:
+                return "acquired"
+            if lease.generation == previous.generation:
+                return "renewed"
+            return "taken_over"
+
+        return await _mutate_driver_lease(
+            lambda: conversation_store.acquire_driver_lease(
+                session_id,
+                actor_user_id,
+                body.ttl_seconds,
+                force=body.force,
+            ),
+            session_id,
+            actor_user_id,
+            transition,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/driver/renew",
+        response_model=DriverLeaseResponse,
+    )
+    async def renew_driver_lease(
+        session_id: str,
+        body: DriverLeaseGenerationRequest,
+        request: Request,
+    ) -> DriverLeaseResponse:
+        user_id = _get_user_id(request, auth_provider)
+        actor_user_id = user_id or RESERVED_USER_PUBLIC
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        return await _mutate_driver_lease(
+            lambda: conversation_store.renew_driver_lease(
+                session_id, actor_user_id, body.generation, body.ttl_seconds
+            ),
+            session_id,
+            actor_user_id,
+            "renewed",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/driver/release",
+        response_model=DriverLeaseResponse,
+    )
+    async def release_driver_lease(
+        session_id: str,
+        body: DriverLeaseGenerationRequest,
+        request: Request,
+    ) -> DriverLeaseResponse:
+        user_id = _get_user_id(request, auth_provider)
+        actor_user_id = user_id or RESERVED_USER_PUBLIC
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        return await _mutate_driver_lease(
+            lambda: conversation_store.release_driver_lease(
+                session_id, actor_user_id, body.generation
+            ),
+            session_id,
+            actor_user_id,
+            "released",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/driver/handoff",
+        response_model=DriverLeaseResponse,
+    )
+    async def handoff_driver_lease(
+        session_id: str,
+        body: DriverLeaseHandoffRequest,
+        request: Request,
+    ) -> DriverLeaseResponse:
+        user_id = _get_user_id(request, auth_provider)
+        actor_user_id = user_id or RESERVED_USER_PUBLIC
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_MANAGE, permission_store, conversation_store
+        )
+        target_level = await _get_permission_level(
+            body.holder_user_id, session_id, permission_store
+        )
+        if permission_store is not None and (target_level is None or target_level < LEVEL_EDIT):
+            raise OmnigentError(
+                "driver handoff target requires edit access",
+                code=ErrorCode.FORBIDDEN,
+            )
+        return await _mutate_driver_lease(
+            lambda: conversation_store.handoff_driver_lease(
+                session_id,
+                actor_user_id,
+                body.holder_user_id,
+                body.generation,
+                body.ttl_seconds,
+            ),
+            session_id,
+            actor_user_id,
+            "handed_off",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/presence/heartbeat",
+        response_model=SessionPresenceResponse,
+    )
+    async def heartbeat_session_presence(
+        session_id: str,
+        body: PresenceHeartbeatRequest,
+        request: Request,
+    ) -> SessionPresenceResponse:
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        root_id = conv.root_conversation_id or conv.id
+        actor_user_id = _attribution_user(user_id)
+        state = (
+            presence.heartbeat(root_id, conv.id, actor_user_id, body.ttl_seconds)
+            if actor_user_id is not None
+            else presence.presence_state(root_id, conv.id)
+        )
+        return SessionPresenceResponse.model_validate(state)
+
     @router.post(
         "/sessions/{session_id}/events",
         # Internal event ingestion — hidden from the public API reference.
@@ -20380,6 +20662,26 @@ def create_sessions_router(
                 parse_client_side_tool_specs(body.tools)
             except ValueError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
+        # Fence human-authored turn/control events before policy evaluation,
+        # persistence, or runner side effects. A session remains backward
+        # compatible until its first lease row is created; after that, even an
+        # expired/released lease requires reacquisition and a current generation.
+        if _requires_driver_fence(body):
+            actor_user_id = user_id or RESERVED_USER_PUBLIC
+            try:
+                await asyncio.to_thread(
+                    conversation_store.validate_driver_lease,
+                    session_id,
+                    actor_user_id,
+                    body.driver_generation,
+                )
+            except NotImplementedError:
+                # Alternate stores that predate leases retain legacy input
+                # behavior, matching the snapshot's optional lease projection.
+                pass
+            except DriverLeaseConflictError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
         # ── Policy evaluation (path-agnostic) ────────────────
         # Evaluate policies BEFORE persistence/runner forwarding so
         # enforcement fires on both paths. On DENY, persist the
@@ -22943,6 +23245,15 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+    try:
+        raw_driver_lease = await asyncio.to_thread(conv_store.get_driver_lease, session_id)
+        driver_lease = (
+            raw_driver_lease if isinstance(raw_driver_lease, SessionDriverLease) else None
+        )
+    except NotImplementedError:
+        driver_lease = None
+    root_id = conv.root_conversation_id or conv.id
+    current_presence = presence.presence_state(root_id, conv.id)
     return _build_session_response(
         conv,
         items,
@@ -22965,5 +23276,7 @@ async def _get_session_snapshot(
             conv,
         ),
         subtree_usage=subtree_usage,
+        driver_lease=driver_lease,
+        presence_state=current_presence,
         visible_team_ids=visible_team_ids,
     )

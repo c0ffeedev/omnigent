@@ -690,6 +690,7 @@ class NewConversationItem(BaseModel):
     response_id: str
     data: ItemData
     created_by: str | None = None
+    driver_generation: int | None = None
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> NewConversationItem:
@@ -726,6 +727,7 @@ class ConversationItem(BaseModel):
     created_at: int
     data: ItemData
     created_by: str | None = None
+    driver_generation: int | None = None
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> ConversationItem:
@@ -775,4 +777,9 @@ class ConversationItem(BaseModel):
             # omitted (not null) for agent/tool/system messages so the
             # two stay distinguishable, matching exclude_none above.
             **({"created_by": self.created_by} if self.created_by is not None else {}),
+            **(
+                {"driver_generation": self.driver_generation}
+                if self.driver_generation is not None
+                else {}
+            ),
         }
