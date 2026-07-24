@@ -252,6 +252,8 @@ def test_driver_mutations_hold_at_most_one_pool_connection_per_thread(
 ) -> None:
     """Backend locks and mutations share one pool checkout per operation."""
     session_ids = [conversation_store.create_conversation().id for _ in range(8)]
+    for session_id in session_ids:
+        conversation_store.acquire_driver_lease(session_id, ALICE, 30)
     engine = conversation_store._conv_engine
     counts: dict[int, int] = {}
     max_counts: dict[int, int] = {}
@@ -274,7 +276,9 @@ def test_driver_mutations_hold_at_most_one_pool_connection_per_thread(
         with ThreadPoolExecutor(max_workers=8) as executor:
             generations = list(
                 executor.map(
-                    lambda sid: conversation_store.acquire_driver_lease(sid, ALICE, 30).generation,
+                    lambda sid: (
+                        conversation_store.renew_driver_lease(sid, ALICE, 1, 30).generation
+                    ),
                     session_ids,
                 )
             )
