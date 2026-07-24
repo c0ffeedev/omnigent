@@ -4,13 +4,13 @@ This independent TypeScript package implements ADR slice 2: authenticated Micros
 
 ## Security boundary
 
-- Microsoft Teams SDK validates Bot Framework service JWT signature, issuer, audience/app ID, expiry, and activity service URL before dispatch.
-- The package then requires the configured recipient app ID, an allowlisted Entra resource tenant, a Teams sender object ID, and a personal conversation.
-- Team and group-chat scopes, missing/mismatched tenant identity, malformed identity fields, and non-Teams activities fail closed.
+- Microsoft Teams SDK validates Bot Framework service JWT signature, issuer, audience/app ID, expiry, and the exact activity service URL before dispatch. The activity must supply a canonical HTTPS service URL so omission cannot disable the SDK's claim-to-body comparison; forwarded authorization headers are not trusted.
+- The package then requires the canonical `28:<bot-app-id>` recipient, matching UUID tenant IDs in both `conversation.tenantId` and `channelData.tenant.id`, a UUID `from.aadObjectId`, an opaque Teams sender ID, and a personal conversation. Opaque IDs must be bounded printable ASCII without surrounding whitespace; UUID comparisons are case-normalized.
+- Team and group-chat scopes, either missing tenant field, mismatched tenant identity, malformed identity fields, alternate recipient forms, and non-Teams activities fail closed.
 - The manifest declares only personal bot scope and no Graph permissions.
-- Bot credentials come from deployment secret management and are never stored in SQLite.
+- Bot credentials come from deployment secret management and are never stored in SQLite. A redacting logger drops structured SDK arguments (including activity bodies and exception objects) and removes bearer/JWT/known-secret material from string messages before forwarding logs.
 
-The SQLite dedupe key is `(bot_app_id, tenant_id, conversation_id, sender_id, activity_id)`. Claiming a key atomically stores one pending Teams reply operation and a renewable delivery lease. A successful send records the channel receipt and marks the operation delivered; a failed send releases the lease, and a crashed worker's lease can be reclaimed after expiry. Duplicate requests receive a retryable server error while a lease is active and are acknowledged without another send after delivery. WAL plus an immediate transaction and unique primary key serialize competing local worker processes. Every record carries an indexed expiry timestamp; claims prune expired records transactionally, and operators may call `cleanupExpired()` from a maintenance loop during idle periods. A full unexpired store rejects new work instead of evicting dedupe evidence.
+The SQLite dedupe key is `(bot_app_id, tenant_id, conversation_id, sender_id, activity_id)`, where `sender_id` is the normalized Entra sender object ID rather than a display name or mutable message field. Claiming a key atomically stores one pending Teams reply operation and a renewable delivery lease. A successful send records the channel receipt and marks the operation delivered; a failed send releases the lease, and a crashed worker's lease can be reclaimed after expiry. Duplicate requests receive a retryable server error while a lease is active and are acknowledged without another send after delivery. WAL plus an immediate transaction and unique primary key serialize competing local worker processes. Every record carries an indexed expiry timestamp; claims prune expired records transactionally, and operators may call `cleanupExpired()` from a maintenance loop during idle periods. A full unexpired store rejects new work instead of evicting dedupe evidence. Databases created by the initial channel-sender-key implementation remain fail-closed: existing rows are detected and completed under their legacy key, while new rows use the Entra principal key.
 
 A hard crash or transport error after Teams accepts a reply but before its receipt is persisted is an inherently ambiguous remote outcome; recovery may resend that static reply, but it never creates a second recorded operation. Legacy claim-only rows are also migrated as pending because they contain no proof that Teams accepted the reply; retrying the bounded static response is safer than permanently suppressing it. A single SQLite file is suitable for multiple processes on one host; a multi-host deployment must replace it with a shared transactional database while preserving the same state, lease, and fencing contract.
 
@@ -30,6 +30,7 @@ Requires Node.js 20 or later.
        npm run build
 
 Production should inject environment variables directly rather than using `.env`.
+Configuration parsing and dedupe database initialization occur before `app.start`, so invalid or ambiguous security configuration and unusable durable storage fail before the SDK binds a listening socket.
 
 ## Run a local smoke test
 

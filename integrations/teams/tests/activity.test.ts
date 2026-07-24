@@ -9,6 +9,7 @@ import { ActivityDedupeStore } from "../src/dedupe.js";
 
 const appId = "11111111-1111-4111-8111-111111111111";
 const tenantId = "22222222-2222-4222-8222-222222222222";
+const objectId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const temporaryDirectories: string[] = [];
 
 function activity(overrides: Record<string, unknown> = {}) {
@@ -18,7 +19,7 @@ function activity(overrides: Record<string, unknown> = {}) {
     channelId: "msteams",
     serviceUrl: "https://smba.trafficmanager.net/amer/",
     text: "help",
-    from: { id: "sender-1", aadObjectId: "object-1" },
+    from: { id: "sender-1", aadObjectId: objectId },
     recipient: { id: `28:${appId}` },
     conversation: { id: "conversation-1", conversationType: "personal", tenantId },
     channelData: { tenant: { id: tenantId } },
@@ -51,14 +52,20 @@ describe("validateActivity", () => {
 
   it.each([
     ["missing activity type", activity({ type: undefined })],
+    ["missing service URL", activity({ serviceUrl: undefined })],
     ["missing tenant", activity({ conversation: { id: "conversation-1", conversationType: "personal" }, channelData: {} })],
+    ["missing conversation tenant", activity({ conversation: { id: "conversation-1", conversationType: "personal" } })],
+    ["missing channel tenant", activity({ channelData: {} })],
     ["missing sender object ID", activity({ from: { id: "sender-1" } })],
+    ["malformed sender object ID", activity({ from: { id: "sender-1", aadObjectId: "not-a-guid" } })],
     ["disallowed tenant", activity({ conversation: { id: "conversation-1", conversationType: "personal", tenantId: "33333333-3333-4333-8333-333333333333" }, channelData: { tenant: { id: "33333333-3333-4333-8333-333333333333" } } })],
     ["mismatched tenant fields", activity({ channelData: { tenant: { id: "33333333-3333-4333-8333-333333333333" } } })],
     ["group chat", activity({ conversation: { id: "conversation-1", conversationType: "groupChat", tenantId } })],
     ["team channel", activity({ conversation: { id: "conversation-1", conversationType: "channel", tenantId } })],
     ["wrong recipient app", activity({ recipient: { id: "28:44444444-4444-4444-8444-444444444444" } })],
+    ["unprefixed recipient app", activity({ recipient: { id: appId } })],
     ["non-Teams channel", activity({ channelId: "slack" })],
+    ["whitespace-padded activity ID", activity({ id: " activity-1" })],
   ])("rejects %s", (_name, candidate) => {
     expect(validateActivity(candidate, constraints)).toMatchObject({ ok: false });
   });
@@ -78,6 +85,50 @@ describe("handlePersonalMessage", () => {
     expect(results.filter((result) => result === "sent")).toHaveLength(1);
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0][0]).toContain("help");
+    expect(dedupe.count()).toBe(1);
+    dedupe.close();
+  });
+
+  it("isolates replay records by the Entra sender object ID", async () => {
+    const dedupe = store();
+    const send = vi.fn(async (_message: string) => undefined);
+    const constraints = { botAppId: appId, allowedTenantIds: new Set([tenantId]) };
+
+    await handlePersonalMessage(activity(), constraints, dedupe, send);
+    await handlePersonalMessage(
+      activity({ from: { id: "sender-1", aadObjectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" } }),
+      constraints,
+      dedupe,
+      send,
+    );
+
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(dedupe.count()).toBe(2);
+    dedupe.close();
+  });
+
+  it("does not replay an operation recorded under the legacy channel sender key", async () => {
+    const dedupe = store();
+    const legacyKey = {
+      activityId: "activity-1",
+      botAppId: appId,
+      conversationId: "conversation-1",
+      senderId: "sender-1",
+      tenantId,
+    };
+    const now = Date.now();
+    dedupe.claim(legacyKey, { kind: "teams_reply", payload: "legacy help" }, "legacy-worker", now);
+    dedupe.complete(legacyKey, "legacy-worker", "legacy-reply", now + 1);
+    const send = vi.fn(async (_message: string) => undefined);
+
+    await expect(handlePersonalMessage(
+      activity(),
+      { botAppId: appId, allowedTenantIds: new Set([tenantId]) },
+      dedupe,
+      send,
+    )).resolves.toBe("duplicate");
+
+    expect(send).not.toHaveBeenCalled();
     expect(dedupe.count()).toBe(1);
     dedupe.close();
   });
@@ -103,7 +154,7 @@ describe("handlePersonalMessage", () => {
       activityId: "activity-1",
       botAppId: appId,
       conversationId: "conversation-1",
-      senderId: "sender-1",
+      senderId: objectId,
       tenantId,
     })).toMatchObject({ state: "pending" });
     first.close();
@@ -120,7 +171,7 @@ describe("handlePersonalMessage", () => {
       activityId: "activity-1",
       botAppId: appId,
       conversationId: "conversation-1",
-      senderId: "sender-1",
+      senderId: objectId,
       tenantId,
     })).toMatchObject({
       attemptCount: 2,
