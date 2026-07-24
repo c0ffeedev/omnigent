@@ -38,12 +38,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): TeamsConfig {
   const allowlist = required(env, "TEAMS_ALLOWED_TENANT_IDS")
     .split(",")
     .map((value) => uuid(value.trim(), "TEAMS_ALLOWED_TENANT_IDS"));
+  const allowedTenantIds = new Set(allowlist);
+  if (allowedTenantIds.size !== allowlist.length) {
+    throw new Error("TEAMS_ALLOWED_TENANT_IDS must not contain duplicate tenant IDs");
+  }
 
   return {
     botAppId: uuid(required(env, "TEAMS_BOT_APP_ID"), "TEAMS_BOT_APP_ID"),
     botClientSecret: required(env, "TEAMS_BOT_CLIENT_SECRET"),
     botTenantId: uuid(required(env, "TEAMS_BOT_TENANT_ID"), "TEAMS_BOT_TENANT_ID"),
-    allowedTenantIds: new Set(allowlist),
+    allowedTenantIds,
     dedupeDatabase: resolve(required(env, "TEAMS_DEDUPE_DATABASE")),
     dedupeRetentionDays: integer(env.TEAMS_DEDUPE_RETENTION_DAYS, 7, "TEAMS_DEDUPE_RETENTION_DAYS", 1, 365),
     dedupeMaxRecords: integer(env.TEAMS_DEDUPE_MAX_RECORDS, 100_000, "TEAMS_DEDUPE_MAX_RECORDS", 1, 10_000_000),

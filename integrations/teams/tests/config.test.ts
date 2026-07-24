@@ -28,6 +28,14 @@ describe("loadConfig", () => {
     ["missing app tenant", { TEAMS_BOT_TENANT_ID: undefined }],
     ["missing tenant allowlist", { TEAMS_ALLOWED_TENANT_IDS: "" }],
     ["invalid tenant allowlist", { TEAMS_ALLOWED_TENANT_IDS: "bad" }],
+    [
+      "duplicate tenant allowlist entries",
+      {
+        TEAMS_ALLOWED_TENANT_IDS:
+          "22222222-2222-4222-8222-222222222222,22222222-2222-4222-8222-222222222222",
+      },
+    ],
+    ["empty tenant allowlist entry", { TEAMS_ALLOWED_TENANT_IDS: `${validEnv.TEAMS_BOT_TENANT_ID},` }],
     ["invalid port", { PORT: "70000" }],
   ])("rejects %s", (_name, override) => {
     expect(() => loadConfig({ ...validEnv, ...override })).toThrow();
