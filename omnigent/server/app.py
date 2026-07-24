@@ -58,6 +58,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
+    reap_idle_managed_hosts,
     reconcile_managed_credential_leases,
 )
 from omnigent.server.mcp_pool import ServerMcpPool
@@ -1497,6 +1498,7 @@ def create_app(
             # sweep and no periodic reconcile.
 
         credential_recovery_task: asyncio.Task[None] | None = None
+        managed_idle_reaper_task: asyncio.Task[None] | None = None
         if sandbox_config is not None and host_store is not None:
             # Recovery is intentionally detached from startup. Each provider
             # operation is bounded, and the loop retries expired claims, so a
@@ -1504,6 +1506,10 @@ def create_app(
             credential_recovery_task = asyncio.create_task(
                 reconcile_managed_credential_leases(sandbox_config, host_store)
             )
+            if sandbox_config.idle_timeout_s is not None:
+                managed_idle_reaper_task = asyncio.create_task(
+                    reap_idle_managed_hosts(sandbox_config, host_store, conversation_store)
+                )
 
         try:
             yield
@@ -1517,6 +1523,10 @@ def create_app(
                 credential_recovery_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await credential_recovery_task
+            if managed_idle_reaper_task is not None:
+                managed_idle_reaper_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await managed_idle_reaper_task
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task

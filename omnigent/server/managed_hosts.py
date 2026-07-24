@@ -154,6 +154,7 @@ from omnigent.stores.host_store import CredentialLeaseRecord, Host, HostStore
 
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxLauncher
+    from omnigent.stores import ConversationStore
 
 _logger = logging.getLogger(__name__)
 
@@ -194,6 +195,7 @@ _CREDENTIAL_OWNER_RENEW_INTERVAL_S = 30.0
 _CREDENTIAL_RECOVERY_INTERVAL_S = 60.0
 _CREDENTIAL_RECOVERY_BATCH_SIZE = 100
 _PROVIDER_CLEANUP_MAX_WORKERS = 4
+MANAGED_IDLE_REAP_INTERVAL_S = 30.0
 
 _T = TypeVar("_T")
 
@@ -525,6 +527,10 @@ class ManagedSandboxConfig:
     :param credential_acquisition_timeout_s: Maximum seconds to wait for
         ``credential_hook.acquire``. Hooks must honor task cancellation so a
         timed-out producer cannot create credentials after launch cleanup.
+    :param idle_timeout_s: Optional server-observed inactivity window after
+        which a managed sandbox generation is terminated while its host row and
+        session binding are retained. The next turn transparently relaunches a
+        fresh generation. ``None`` disables server-side idle suspension.
     """
 
     server_url: str
@@ -535,6 +541,7 @@ class ManagedSandboxConfig:
     host_config: dict[str, object] | None = None
     credential_hook: ManagedCredentialHook | None = None
     credential_acquisition_timeout_s: float = _CREDENTIAL_ACQUISITION_TIMEOUT_S
+    idle_timeout_s: int | None = None
 
 
 @dataclass
@@ -1044,6 +1051,11 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         host_config=host_config,
         credential_hook=credential_hook,
         credential_acquisition_timeout_s=credential_acquisition_timeout_s,
+        idle_timeout_s=(
+            _parse_provider_positive_int(raw, "kubernetes", "idle_timeout_s")
+            if provider == "kubernetes"
+            else None
+        ),
     )
 
 
@@ -3272,6 +3284,147 @@ async def resume_managed_host(
             raise HTTPException(
                 status_code=502, detail=f"managed host wake failed: {message}"
             ) from exc
+
+
+def _binding_is_idle(
+    session_ids: tuple[str, ...],
+    *,
+    has_active_turn: bool,
+    conversation_store: ConversationStore,
+    cutoff: int,
+) -> bool:
+    """Return whether every durable session in one host binding is inactive."""
+    if has_active_turn or not session_ids:
+        return False
+    conversations = conversation_store.get_conversations(list(session_ids))
+    # Missing AP rows can be transient in split-database deployments. Fail safe:
+    # never terminate compute unless every operational binding has activity data.
+    if len(conversations) != len(set(session_ids)):
+        return False
+    return all(conversation.updated_at <= cutoff for conversation in conversations.values())
+
+
+async def suspend_managed_host(
+    host: Host,
+    host_store: HostStore,
+    config: ManagedSandboxConfig,
+) -> bool:
+    """Terminate one sandbox generation while retaining durable host identity.
+
+    Unlike :func:`terminate_managed_host`, this lifecycle transition never
+    deletes the host row. Session ``host_id`` and workspace bindings therefore
+    remain intact, and the existing message path can relaunch a fresh sandbox
+    generation under the same host id on the next turn.
+    """
+    launcher = _launcher_for_teardown(host, config)
+    if launcher is None or host.sandbox_id is None:
+        return False
+    claim_owner = secrets.token_urlsafe(24)
+    claimed = await asyncio.to_thread(
+        host_store.claim_active_credential_leases,
+        host.host_id,
+        claim_owner=claim_owner,
+        claim_expires_at=now_epoch() + _CREDENTIAL_CLAIM_TTL_S,
+        expected_sandbox_id=host.sandbox_id,
+        expected_provider=host.sandbox_provider,
+    )
+    terminated = await _terminate_sandbox_best_effort(launcher, host)
+    if not terminated:
+        return False
+    suspended = await asyncio.to_thread(
+        host_store.mark_managed_host_suspended,
+        host.host_id,
+        expected_sandbox_id=host.sandbox_id,
+    )
+    if not suspended:
+        _logger.info(
+            "Managed idle suspension lost generation CAS for host %s sandbox %s",
+            host.host_id,
+            host.sandbox_id,
+        )
+        return False
+    await _release_stored_credential_leases(config, host_store, claimed)
+    _logger.info(
+        "Suspended idle managed host %s (sandbox %s, provider %s)",
+        host.host_id,
+        host.sandbox_id,
+        host.sandbox_provider,
+    )
+    return True
+
+
+async def reap_idle_managed_hosts_once(
+    config: ManagedSandboxConfig,
+    host_store: HostStore,
+    conversation_store: ConversationStore,
+    *,
+    now: int | None = None,
+) -> list[str]:
+    """Suspend every managed host whose bound sessions exceeded the idle policy.
+
+    Activity is conversation-item time, not host heartbeat time (a healthy idle
+    Pod keeps heartbeating). Running/waiting turns with a fresh runner heartbeat
+    are protected even when they have emitted no item for the full timeout.
+    Candidates are re-read immediately before provider teardown to narrow the
+    race with a newly-arriving message.
+    """
+    if config.idle_timeout_s is None:
+        return []
+    launcher = config.launcher_factory()
+    cutoff = (now if now is not None else now_epoch()) - config.idle_timeout_s
+    bindings = await asyncio.to_thread(host_store.list_managed_host_bindings, launcher.provider)
+    suspended: list[str] = []
+    for candidate in bindings:
+        if not await asyncio.to_thread(
+            _binding_is_idle,
+            candidate.session_ids,
+            has_active_turn=candidate.has_active_turn,
+            conversation_store=conversation_store,
+            cutoff=cutoff,
+        ):
+            continue
+        # Re-read both generation ownership and active-turn state at the edge of
+        # the side effect. Kubernetes managed runners are single-replica today;
+        # the sandbox-id CAS in suspend_managed_host protects generation races.
+        refreshed = await asyncio.to_thread(
+            host_store.list_managed_host_bindings,
+            launcher.provider,
+        )
+        binding = next(
+            (item for item in refreshed if item.host.host_id == candidate.host.host_id),
+            None,
+        )
+        if binding is None or binding.host.sandbox_id != candidate.host.sandbox_id:
+            continue
+        if not await asyncio.to_thread(
+            _binding_is_idle,
+            binding.session_ids,
+            has_active_turn=binding.has_active_turn,
+            conversation_store=conversation_store,
+            cutoff=cutoff,
+        ):
+            continue
+        if await suspend_managed_host(binding.host, host_store, config):
+            suspended.append(binding.host.host_id)
+    return suspended
+
+
+async def reap_idle_managed_hosts(
+    config: ManagedSandboxConfig,
+    host_store: HostStore,
+    conversation_store: ConversationStore,
+) -> None:
+    """Periodically apply the configured managed-sandbox idle policy."""
+    if config.idle_timeout_s is None:
+        return
+    while True:
+        await asyncio.sleep(MANAGED_IDLE_REAP_INTERVAL_S)
+        try:
+            await reap_idle_managed_hosts_once(config, host_store, conversation_store)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _logger.exception("Managed sandbox idle reaper failed; retrying")
 
 
 async def terminate_managed_host(

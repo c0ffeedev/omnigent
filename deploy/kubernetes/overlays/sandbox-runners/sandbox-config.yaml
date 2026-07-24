@@ -45,5 +45,6 @@ data:
         # resources:                 # runner Pod sizing (defaults: 0.5-2 cpu / 1-4Gi)
         #   requests: {cpu: "500m", memory: "1Gi"}
         #   limits: {cpu: "2", memory: "4Gi"}
+        # idle_timeout_s: 900        # delete idle Pods; next turn transparently launches a fresh Pod
         # in_cluster: true           # config source: true=in-cluster SA only, false=kubeconfig only, omit=try both
         # kubeconfig: /path/to/config  # out-of-cluster kubeconfig (env: OMNIGENT_KUBERNETES_KUBECONFIG)

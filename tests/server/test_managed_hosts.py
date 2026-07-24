@@ -50,6 +50,7 @@ from omnigent.server.managed_hosts import (
     launch_managed_host,
     parse_repo_workspace,
     parse_sandbox_config,
+    reap_idle_managed_hosts_once,
     recover_managed_credential_leases,
     relaunch_managed_host,
     resume_managed_host,
@@ -540,6 +541,7 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
                 "service_account": "omnigent-runner",
                 "node_selector": {"omnigent.ai/runner-ready": "true"},
                 "in_cluster": True,
+                "idle_timeout_s": 900,
                 "resources": {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}},
             },
         }
@@ -549,6 +551,7 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
     assert cfg.token_ttl_s == KUBERNETES_MANAGED_TOKEN_TTL_S
     assert cfg.managed_launch_supported is True
     assert cfg.provider == "kubernetes"
+    assert cfg.idle_timeout_s == 900
     fake = FakeSandboxLauncher()
     install_fake_kubernetes_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -578,6 +581,20 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
     assert fake.secret_name is None
     assert fake.in_cluster is None
     assert fake.resources is None
+    assert cfg.idle_timeout_s is None
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "900"])
+async def test_parse_kubernetes_rejects_invalid_idle_timeout(value: object) -> None:
+    """Idle suspension is opt-in and must use a positive integer duration."""
+    with pytest.raises(ValueError, match=r"idle_timeout_s.*positive integer"):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "https://s.example.com",
+                "kubernetes": {"idle_timeout_s": value},
+            }
+        )
 
 
 def test_parse_kubernetes_wires_concrete_github_credential_hook() -> None:
@@ -1784,6 +1801,120 @@ async def test_launch_entrypoint_provider_cleans_up_on_launch_failure(db_uri: st
     # The reserved sandbox was terminated and no host row survives.
     assert fake.terminated == ["omnigent-pod-1"]
     assert host_store.list_hosts(_OWNER) == []
+
+
+# ── idle suspension ─────────────────────────────────────────
+
+
+async def test_idle_reap_retains_session_host_and_workspace_for_next_turn(db_uri: str) -> None:
+    """An idle generation is deleted, but its durable relaunch contract survives."""
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    host_id = "1" * 32
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            invocation.host_id,
+            invocation.host_name,
+            _OWNER,
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    config = dataclasses.replace(_injected_config(fake), idle_timeout_s=60)
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-idle",
+        user_id=_OWNER,
+        token="old-token",
+        provider=fake.provider,
+        sandbox_id="sb-idle-1",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.upsert_on_connect(host_id, "managed-idle", _OWNER)
+    conversation = conversations.create_conversation(
+        host_id=host_id,
+        workspace="/root/workspace/repo",
+    )
+
+    reaped = await reap_idle_managed_hosts_once(
+        config,
+        host_store,
+        conversations,
+        now=conversation.updated_at + 61,
+    )
+
+    assert reaped == [host_id]
+    assert fake.terminated == ["sb-idle-1"]
+    retained = host_store.get_host(host_id)
+    assert retained is not None
+    assert retained.status == "offline"
+    assert retained.sandbox_id == "sb-idle-1"
+    assert host_store.resolve_launch_token(host_id, "old-token") is None
+    bound = conversations.get_conversation(conversation.id)
+    assert bound is not None
+    assert bound.host_id == host_id
+    assert bound.workspace == "/root/workspace/repo"
+    assert (
+        await reap_idle_managed_hosts_once(
+            config,
+            host_store,
+            conversations,
+            now=conversation.updated_at + 122,
+        )
+        == []
+    )
+    assert fake.terminated == ["sb-idle-1"]
+
+    # This is the same fresh-generation operation the next message dispatches.
+    relaunched = await relaunch_managed_host(
+        config=config,
+        host=retained,
+        host_store=host_store,
+        repo=RepoWorkspace(url="https://github.com/org/repo", branch=None, repo_name="repo"),
+        session_id=conversation.id,
+    )
+    rebound = conversations.set_host_id(conversation.id, relaunched.host_id, relaunched.workspace)
+    assert relaunched.host_id == host_id
+    assert rebound.host_id == host_id
+    assert rebound.workspace == "/root/workspace/repo"
+    assert host_store.get_host(host_id).sandbox_id == "sb-fake-1"  # type: ignore[union-attr]
+
+
+async def test_idle_reap_never_terminates_a_live_active_turn(db_uri: str) -> None:
+    """Long quiet tool calls stay protected by live status plus runner heartbeat."""
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    host_id = "2" * 32
+    fake = FakeSandboxLauncher()
+    config = dataclasses.replace(_injected_config(fake), idle_timeout_s=60)
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-active",
+        user_id=_OWNER,
+        token="active-token",
+        provider=fake.provider,
+        sandbox_id="sb-active-1",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host_store.upsert_on_connect(host_id, "managed-active", _OWNER)
+    conversation = conversations.create_conversation(
+        runner_id="runner-active",
+        host_id=host_id,
+        workspace="/root/workspace",
+    )
+    conversations.set_session_live_status(conversation.id, "running")
+    conversations.touch_runner_liveness(["runner-active"], now_epoch())
+
+    reaped = await reap_idle_managed_hosts_once(
+        config,
+        host_store,
+        conversations,
+        now=conversation.updated_at + 3600,
+    )
+
+    assert reaped == []
+    assert fake.terminated == []
+    assert host_store.get_host(host_id) is not None
 
 
 # ── relaunch_managed_host ───────────────────────────────────
