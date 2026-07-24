@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from typing import Any
 
 from sqlalchemy import (
@@ -36,6 +37,7 @@ from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlPolicy,
     SqlProject,
+    SqlSessionDriverEvent,
     SqlSessionDriverLease,
     SqlSessionPermission,
     SqlUserDailyCost,
@@ -1870,12 +1872,39 @@ class SqlAlchemyConversationStore(ConversationStore):
             SqlSessionDriverLease.workspace_id == current_workspace_id(),
             SqlSessionDriverLease.session_id == session_id,
         )
-        if self._meta_supports_for_update:
+        if self._supports_for_update:
             statement = statement.with_for_update()
         return session.execute(statement).scalar_one_or_none()
 
+    @staticmethod
+    def _record_driver_event(
+        session: Session,
+        *,
+        session_id: str,
+        event_type: str,
+        actor_user_id: str,
+        holder_user_id: str | None,
+        previous_holder_user_id: str | None,
+        generation: int,
+        created_at: int,
+        input_type: str | None = None,
+    ) -> None:
+        session.add(
+            SqlSessionDriverEvent(
+                id=uuid.uuid4().hex,
+                session_id=session_id,
+                event_type=event_type,
+                actor_user_id=actor_user_id,
+                holder_user_id=holder_user_id,
+                previous_holder_user_id=previous_holder_user_id,
+                generation=generation,
+                input_type=input_type,
+                created_at=created_at,
+            )
+        )
+
     def get_driver_lease(self, session_id: str) -> SessionDriverLease | None:
-        with self._session() as session:
+        with self._conv_session() as session:
             row = session.get(
                 SqlSessionDriverLease,
                 (current_workspace_id(), session_id),
@@ -1896,7 +1925,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         stale client from bypassing fencing by omitting its generation.
         """
         now = now_epoch()
-        with self._session() as session:
+        with self._conv_session() as session:
             row = session.get(
                 SqlSessionDriverLease,
                 (current_workspace_id(), session_id),
@@ -1918,6 +1947,45 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             return self._driver_lease_entity(row)
 
+    def accept_driver_event(
+        self,
+        session_id: str,
+        actor_user_id: str,
+        generation: int | None,
+        event_type: str,
+    ) -> SessionDriverLease | None:
+        """Validate and record acceptance in the lease's transaction."""
+        now = now_epoch()
+        with self._conv_session_immediate() as session:
+            row = self._locked_driver_lease(session, session_id)
+            if row is None:
+                if generation is not None:
+                    raise DriverLeaseConflictError("driver lease does not exist")
+                return None
+            if (
+                row.holder_user_id != actor_user_id
+                or generation is None
+                or row.generation != generation
+                or row.expires_at is None
+                or row.expires_at <= now
+                or row.released_at is not None
+            ):
+                raise DriverLeaseConflictError(
+                    "driver lease is stale, expired, or not held by actor"
+                )
+            self._record_driver_event(
+                session,
+                session_id=session_id,
+                event_type="input_accepted",
+                actor_user_id=actor_user_id,
+                holder_user_id=row.holder_user_id,
+                previous_holder_user_id=row.holder_user_id,
+                generation=row.generation,
+                input_type=event_type,
+                created_at=now,
+            )
+            return self._driver_lease_entity(row)
+
     def acquire_driver_lease(
         self,
         session_id: str,
@@ -1927,7 +1995,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         force: bool = False,
     ) -> SessionDriverLease:
         now = now_epoch()
-        with self._session_immediate() as session:
+        with self._conv_session_immediate() as session:
             row = self._locked_driver_lease(session, session_id)
             if row is None:
                 row = SqlSessionDriverLease(
@@ -1948,6 +2016,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                     if row is None:
                         raise
                 else:
+                    self._record_driver_event(
+                        session,
+                        session_id=session_id,
+                        event_type="acquired",
+                        actor_user_id=actor_user_id,
+                        holder_user_id=actor_user_id,
+                        previous_holder_user_id=None,
+                        generation=1,
+                        created_at=now,
+                    )
                     return self._driver_lease_entity(row)
 
             active = (
@@ -1959,6 +2037,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise DriverLeaseConflictError("session is actively driven by another user")
 
             old_generation = row.generation
+            previous_holder = row.holder_user_id
             same_holder = active and row.holder_user_id == actor_user_id
             generation = old_generation if same_holder else old_generation + 1
             result = session.execute(
@@ -1982,6 +2061,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             session.flush()
             row = self._locked_driver_lease(session, session_id)
             assert row is not None
+            self._record_driver_event(
+                session,
+                session_id=session_id,
+                event_type=("renewed" if same_holder else "taken_over" if active else "acquired"),
+                actor_user_id=actor_user_id,
+                holder_user_id=row.holder_user_id,
+                previous_holder_user_id=previous_holder,
+                generation=row.generation,
+                created_at=now,
+            )
             return self._driver_lease_entity(row)
 
     def renew_driver_lease(
@@ -1992,7 +2081,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         ttl_seconds: int,
     ) -> SessionDriverLease:
         now = now_epoch()
-        with self._session_immediate() as session:
+        with self._conv_session_immediate() as session:
             result = session.execute(
                 update(SqlSessionDriverLease)
                 .where(
@@ -2011,6 +2100,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             row = self._locked_driver_lease(session, session_id)
             assert row is not None
+            self._record_driver_event(
+                session,
+                session_id=session_id,
+                event_type="renewed",
+                actor_user_id=actor_user_id,
+                holder_user_id=row.holder_user_id,
+                previous_holder_user_id=row.holder_user_id,
+                generation=row.generation,
+                created_at=now,
+            )
             return self._driver_lease_entity(row)
 
     def release_driver_lease(
@@ -2020,7 +2119,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         generation: int,
     ) -> SessionDriverLease:
         now = now_epoch()
-        with self._session_immediate() as session:
+        with self._conv_session_immediate() as session:
             result = session.execute(
                 update(SqlSessionDriverLease)
                 .where(
@@ -2039,6 +2138,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             row = self._locked_driver_lease(session, session_id)
             assert row is not None
+            self._record_driver_event(
+                session,
+                session_id=session_id,
+                event_type="released",
+                actor_user_id=actor_user_id,
+                holder_user_id=None,
+                previous_holder_user_id=actor_user_id,
+                generation=row.generation,
+                created_at=now,
+            )
             return self._driver_lease_entity(row)
 
     def handoff_driver_lease(
@@ -2052,7 +2161,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         if not actor_user_id:
             raise DriverLeaseConflictError("driver handoff actor is required")
         now = now_epoch()
-        with self._session_immediate() as session:
+        with self._conv_session_immediate() as session:
             row = self._locked_driver_lease(session, session_id)
             if (
                 row is None
@@ -2066,6 +2175,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             if row.holder_user_id == holder_user_id:
                 raise DriverLeaseConflictError("target user already holds the driver lease")
             old_generation = row.generation
+            previous_holder = row.holder_user_id
             result = session.execute(
                 update(SqlSessionDriverLease)
                 .where(
@@ -2087,6 +2197,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             session.flush()
             row = self._locked_driver_lease(session, session_id)
             assert row is not None
+            self._record_driver_event(
+                session,
+                session_id=session_id,
+                event_type="handed_off",
+                actor_user_id=actor_user_id,
+                holder_user_id=row.holder_user_id,
+                previous_holder_user_id=previous_holder,
+                generation=row.generation,
+                created_at=now,
+            )
             return self._driver_lease_entity(row)
 
     def append(

@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.utils import _build_alembic_config
 
-_PRIOR_REVISION = "f5a6b7c8d9e0"
+_PRIOR_REVISION = "b28c39d40e51"
 _THIS_REVISION = "a6b7c8d9e0f1"
 
 
@@ -31,6 +31,7 @@ def test_driver_lease_migration_round_trip(tmp_path: Path) -> None:
         _migrate(engine, uri, _PRIOR_REVISION)
         inspector = sa.inspect(engine)
         assert "session_driver_leases" not in inspector.get_table_names()
+        assert "session_driver_events" not in inspector.get_table_names()
         assert "driver_generation" not in {
             column["name"] for column in inspector.get_columns("conversation_items")
         }
@@ -38,6 +39,7 @@ def test_driver_lease_migration_round_trip(tmp_path: Path) -> None:
         _migrate(engine, uri, _THIS_REVISION)
         inspector = sa.inspect(engine)
         assert "session_driver_leases" in inspector.get_table_names()
+        assert "session_driver_events" in inspector.get_table_names()
         assert inspector.get_pk_constraint("session_driver_leases")["constrained_columns"] == [
             "workspace_id",
             "session_id",
@@ -48,6 +50,7 @@ def test_driver_lease_migration_round_trip(tmp_path: Path) -> None:
         _migrate(engine, uri, _PRIOR_REVISION, downgrade=True)
         inspector = sa.inspect(engine)
         assert "session_driver_leases" not in inspector.get_table_names()
+        assert "session_driver_events" not in inspector.get_table_names()
         assert "driver_generation" not in {
             column["name"] for column in inspector.get_columns("conversation_items")
         }

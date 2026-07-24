@@ -3155,6 +3155,75 @@ async def test_driver_lease_routes_authorize_fence_and_snapshot(
     assert [item.driver_generation for item in lease_events] == [1, 2, 3, 3]
 
 
+async def test_driver_takeover_between_fail_fast_check_and_dispatch_rejects_stale_input(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dispatch-boundary CAS prevents persistence and runner forwarding."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    forwarded: list[str] = []
+
+    class _Runner:
+        async def post(self, path: str, **_: Any) -> httpx.Response:
+            forwarded.append(path)
+            return httpx.Response(202, request=httpx.Request("POST", f"http://runner{path}"))
+
+    async def _runner(*_: Any, **__: Any) -> _Runner:
+        return _Runner()
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    headers = {"X-Forwarded-Email": "alice@example.com"}
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers=headers,
+    )
+    assert acquired.status_code == 200
+
+    original_accept = SqlAlchemyConversationStore.accept_driver_event
+    took_over = False
+
+    def _take_over_then_accept(
+        store: SqlAlchemyConversationStore,
+        event_session_id: str,
+        actor_user_id: str,
+        generation: int | None,
+        event_type: str,
+    ) -> Any:
+        nonlocal took_over
+        if not took_over:
+            took_over = True
+            store.acquire_driver_lease(event_session_id, "bob@example.com", 30, force=True)
+        return original_accept(store, event_session_id, actor_user_id, generation, event_type)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "accept_driver_event", _take_over_then_accept)
+    response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "driver_generation": 1,
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "must be rejected"}],
+            },
+        },
+        headers=headers,
+    )
+    assert response.status_code == 409
+    assert forwarded == []
+    items = SqlAlchemyConversationStore(db_uri).list_items(session_id).data
+    assert not any(
+        item.type == "message"
+        and item.created_by == "alice@example.com"
+        and item.driver_generation == 1
+        for item in items
+    )
+
+
 async def test_expired_driver_lease_takeover_is_audited_in_session_history(
     auth_client: httpx.AsyncClient,
     db_uri: str,
