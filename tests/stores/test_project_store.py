@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 
@@ -31,6 +32,11 @@ def store(db_uri: str) -> SqlAlchemyProjectStore:
     :returns: A ready-to-use :class:`SqlAlchemyProjectStore` instance.
     """
     return SqlAlchemyProjectStore(db_uri)
+
+
+def test_resource_extension_does_not_add_required_abstract_methods() -> None:
+    """Legacy project-store adapters remain instantiable after the extension."""
+    assert ProjectStore.__abstractmethods__ == {"create", "get", "list", "update", "delete"}
 
 
 # ── create / get ──────────────────────────────────────────────────────────

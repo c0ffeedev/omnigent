@@ -115,7 +115,6 @@ class ProjectStore(ABC):
         """
         ...
 
-    @abstractmethod
     def add_resource(
         self,
         resource_id: str,
@@ -131,9 +130,8 @@ class ProjectStore(ABC):
         Returns ``None`` when the project does not exist or is not owned by the
         caller. The association does not take ownership of the source object.
         """
-        ...
+        raise NotImplementedError("project resources are not supported by this store")
 
-    @abstractmethod
     def list_resources(
         self,
         project_id: str,
@@ -146,9 +144,8 @@ class ProjectStore(ABC):
         Returns ``None`` when the project is absent or not owned; an empty list
         means the project exists but has no matching resources.
         """
-        ...
+        raise NotImplementedError("project resources are not supported by this store")
 
-    @abstractmethod
     def remove_resource(
         self,
         project_id: str,
@@ -157,4 +154,4 @@ class ProjectStore(ABC):
         owner_user_id: str | None,
     ) -> bool:
         """Remove one association from an owned project."""
-        ...
+        raise NotImplementedError("project resources are not supported by this store")
