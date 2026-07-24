@@ -271,6 +271,7 @@ def test_ranked_latest_message_items_omits_search_text(
         "type",
         "data",
         "created_by",
+        "driver_generation",
         "row_num",
     } <= columns
 

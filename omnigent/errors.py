@@ -92,17 +92,25 @@ class OmnigentError(Exception):
     exception handler converts it to a JSON response automatically.
     """
 
-    def __init__(self, message: str, *, code: str = ErrorCode.INTERNAL_ERROR) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = ErrorCode.INTERNAL_ERROR,
+        details: dict[str, object] | None = None,
+    ) -> None:
         """
         Create a new application error.
 
         :param message: Human-readable error description.
         :param code: Machine-readable error code from
             :class:`ErrorCode`, e.g. ``ErrorCode.NOT_FOUND``.
+        :param details: Optional machine-readable context safe to return to clients.
         """
         super().__init__(message)
         self.code = code
         self.message = message
+        self.details = details
 
     @property
     def http_status(self) -> int:

@@ -81,6 +81,22 @@ async def test_connect_broadcasts_full_state_join() -> None:
         await collector.stop()
 
 
+async def test_explicit_heartbeat_expires_and_isolated_by_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REST heartbeat presence is TTL-bound and cannot bleed across sessions."""
+    now = 100
+    monkeypatch.setattr(presence.time, "time", lambda: now)
+
+    state = presence.heartbeat(ROOT, CHILD, ALICE, ttl_seconds=10)
+    assert state["active_user_ids"] == [ALICE]
+    assert state["entries"] == [{"user_id": ALICE, "last_seen": 100, "expires_at": 110}]
+    assert presence.presence_state("conv_other_root", "conv_other_root")["active_user_ids"] == []
+
+    now = 110
+    assert presence.presence_state(ROOT, CHILD)["active_user_ids"] == []
+
+
 async def test_second_tab_same_user_is_silent() -> None:
     """A 1→2 connection edge neither broadcasts nor duplicates the viewer."""
     collector = await start_session_stream_collector(CONV)
