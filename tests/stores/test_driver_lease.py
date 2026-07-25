@@ -16,7 +16,7 @@ from omnigent.db.db_models import (
     SqlSessionDriverEvent,
     workspace_scope,
 )
-from omnigent.stores.conversation_store import DriverLeaseConflictError
+from omnigent.stores.conversation_store import DriverDispatchClaim, DriverLeaseConflictError
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -725,3 +725,89 @@ def test_release_and_handoff_are_fenced_by_an_active_dispatch(
     assert handed_off.holder_user_id == BOB
     released = conversation_store.release_driver_lease(session_id, BOB, 2)
     assert released.holder_user_id is None
+
+
+def test_driver_source_identity_and_consumer_claim_are_persisted_atomically(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    session_id = conversation_store.create_conversation().id
+    conversation_store.acquire_driver_lease(session_id, ALICE, 30)
+
+    claim = conversation_store.begin_driver_event(
+        session_id,
+        ALICE,
+        1,
+        "message",
+        source_id="client-event-1",
+    )
+
+    assert isinstance(claim, DriverDispatchClaim)
+    with conversation_store._conv_session() as session:
+        dispatch = session.get(SqlSessionDriverDispatch, (0, claim.dispatch_id))
+        event = session.get(SqlSessionDriverEvent, (0, claim.event_id))
+        assert dispatch is not None
+        assert event is not None
+        assert dispatch.source_id == event.source_id == "client-event-1"
+        assert dispatch.effect_id == claim.effect_id
+        assert dispatch.consumer_token == claim.consumer_token
+        assert dispatch.consumer_generation == 1
+
+
+def test_consumer_claim_recovery_rotates_fence_and_preserves_effect_identity(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    session_id = conversation_store.create_conversation().id
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 100)
+    conversation_store.acquire_driver_lease(session_id, ALICE, 30)
+    first = conversation_store.begin_driver_event(
+        session_id,
+        ALICE,
+        1,
+        "message",
+        source_id="retryable-input",
+        claim_ttl_seconds=10,
+    )
+    assert isinstance(first, DriverDispatchClaim)
+
+    with pytest.raises(DriverLeaseConflictError, match="no longer active"):
+        conversation_store.renew_driver_event(
+            session_id,
+            first.dispatch_id,
+            consumer_token="0" * 32,
+            consumer_generation=first.consumer_generation,
+        )
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 110)
+    recovered = conversation_store.begin_driver_event(
+        session_id,
+        ALICE,
+        1,
+        "message",
+        source_id="retryable-input",
+        claim_ttl_seconds=10,
+    )
+    assert isinstance(recovered, DriverDispatchClaim)
+    assert recovered.dispatch_id == first.dispatch_id
+    assert recovered.event_id == first.event_id
+    assert recovered.effect_id == first.effect_id
+    assert recovered.consumer_token != first.consumer_token
+    assert recovered.consumer_generation == first.consumer_generation + 1
+
+    with pytest.raises(DriverLeaseConflictError, match="no longer active"):
+        conversation_store.complete_driver_event(
+            session_id,
+            first.dispatch_id,
+            consumer_token=first.consumer_token,
+            consumer_generation=first.consumer_generation,
+            succeeded=True,
+        )
+    conversation_store.complete_driver_event(
+        session_id,
+        recovered.dispatch_id,
+        consumer_token=recovered.consumer_token,
+        consumer_generation=recovered.consumer_generation,
+        succeeded=True,
+    )
