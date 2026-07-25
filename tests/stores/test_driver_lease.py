@@ -558,3 +558,170 @@ def test_generation_round_trips_on_human_input(
     [loaded] = conversation_store.list_items(session_id).data
     assert loaded.driver_generation == 7
     assert loaded.to_api_dict()["driver_generation"] == 7
+
+
+def test_completed_dispatch_completion_is_a_terminal_noop(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A duplicate completion of a finished dispatch is a terminal conflict.
+
+    Models an at-least-once outbox consumer redelivering the completion for a
+    dispatch that already finished: the second call must not resurrect the
+    claim, flip its terminal state, or mutate ``completed_at`` — it is rejected
+    as a no-op so a stale delivery cannot re-open a settled turn.
+    """
+    session_id = conversation_store.create_conversation().id
+    conversation_store.acquire_driver_lease(session_id, ALICE, 30)
+    dispatch_id = conversation_store.begin_driver_event(session_id, ALICE, 1, "message")
+    assert dispatch_id is not None
+    conversation_store.complete_driver_event(session_id, dispatch_id, succeeded=True)
+
+    with conversation_store._conv_session() as session:
+        settled = session.get(SqlSessionDriverDispatch, (0, dispatch_id))
+        assert settled is not None
+        first_state = settled.state
+        first_completed_at = settled.completed_at
+    assert first_state == "completed"
+    assert settled.claim_expires_at is None
+
+    for _ in range(2):
+        with pytest.raises(DriverLeaseConflictError, match="no longer active"):
+            conversation_store.complete_driver_event(session_id, dispatch_id, succeeded=True)
+        with pytest.raises(DriverLeaseConflictError, match="no longer active"):
+            conversation_store.complete_driver_event(session_id, dispatch_id, succeeded=False)
+        with pytest.raises(DriverLeaseConflictError, match="no longer active"):
+            conversation_store.renew_driver_event(session_id, dispatch_id)
+
+    with conversation_store._conv_session() as session:
+        unchanged = session.get(SqlSessionDriverDispatch, (0, dispatch_id))
+        assert unchanged is not None
+        assert unchanged.state == first_state
+        assert unchanged.completed_at == first_completed_at
+        assert unchanged.claim_expires_at is None
+
+
+def test_stale_generation_acceptance_leaves_no_durable_trace(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A stale-generation acceptance persists neither an audit nor a dispatch.
+
+    After a force takeover advances the generation, the old holder's retried
+    acceptance must be a hard reject with zero side effects: no ``input_accepted``
+    audit row and no dispatch row, so the rejected turn cannot execute or split
+    the audit trail.
+    """
+    session_id = conversation_store.create_conversation().id
+    conversation_store.acquire_driver_lease(session_id, ALICE, 30)
+    conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
+
+    for _ in range(3):
+        with pytest.raises(
+            DriverLeaseConflictError,
+            match="stale, expired, or not held",
+        ):
+            conversation_store.begin_driver_event(session_id, ALICE, 1, "message")
+
+    with conversation_store._conv_session() as session:
+        accepted = session.scalar(
+            sa.select(sa.func.count())
+            .select_from(SqlSessionDriverEvent)
+            .where(
+                SqlSessionDriverEvent.session_id == session_id,
+                SqlSessionDriverEvent.event_type == "input_accepted",
+            )
+        )
+        dispatch_rows = session.scalar(
+            sa.select(sa.func.count())
+            .select_from(SqlSessionDriverDispatch)
+            .where(SqlSessionDriverDispatch.session_id == session_id)
+        )
+    assert accepted == 0
+    assert dispatch_rows == 0
+
+    # The current-generation holder still accepts exactly once.
+    dispatch_id = conversation_store.begin_driver_event(session_id, BOB, 2, "message")
+    assert dispatch_id is not None
+    conversation_store.complete_driver_event(session_id, dispatch_id, succeeded=True)
+
+
+def test_lost_transition_commit_retry_does_not_duplicate_audit(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retried lease transition emits exactly one durable audit resource event.
+
+    A lost commit rolls the lease mutation and its resource event back together;
+    the client retry then commits a single ``acquired``/``taken_over`` pair, so
+    the transition audit is neither lost nor duplicated across recovery.
+    """
+    session_id = conversation_store.create_conversation().id
+
+    def _lease_events() -> list[str]:
+        return [
+            getattr(item.data, "event_type", None)
+            for item in conversation_store.list_items(session_id).data
+            if item.type == "resource_event"
+            and getattr(item.data, "resource_type", None) == "driver_lease"
+        ]
+
+    _disconnect_on_next_commit(conversation_store, monkeypatch)
+    with pytest.raises(sa.exc.DBAPIError) as error:
+        conversation_store.acquire_driver_lease(session_id, ALICE, 30)
+    assert error.value.connection_invalidated
+    # The rolled-back transition left no partial audit behind.
+    assert _lease_events() == []
+    assert conversation_store.get_driver_lease(session_id) is None
+
+    acquired = conversation_store.acquire_driver_lease(session_id, ALICE, 30)
+    assert acquired.generation == 1
+    assert _lease_events() == ["session.driver_lease.acquired"]
+
+    _disconnect_on_next_commit(conversation_store, monkeypatch)
+    with pytest.raises(sa.exc.DBAPIError) as takeover_error:
+        conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
+    assert takeover_error.value.connection_invalidated
+    # The failed takeover neither advanced the generation nor duplicated audit.
+    assert conversation_store.get_driver_lease(session_id).generation == 1
+    assert _lease_events() == ["session.driver_lease.acquired"]
+
+    taken_over = conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
+    assert taken_over.generation == 2
+    assert _lease_events() == [
+        "session.driver_lease.acquired",
+        "session.driver_lease.taken_over",
+    ]
+
+
+def test_release_and_handoff_are_fenced_by_an_active_dispatch(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Lease teardown cannot split a turn that has an in-flight dispatch.
+
+    ``release`` and ``handoff`` must reject while a durable dispatch is running
+    (so a settling turn is never orphaned mid-side-effect) and succeed only once
+    the dispatch reaches a terminal state.
+    """
+    session_id = conversation_store.create_conversation().id
+    conversation_store.acquire_driver_lease(session_id, ALICE, 30)
+    dispatch_id = conversation_store.begin_driver_event(session_id, ALICE, 1, "message")
+    assert dispatch_id is not None
+
+    with pytest.raises(DriverLeaseConflictError, match="dispatch is in progress"):
+        conversation_store.release_driver_lease(session_id, ALICE, 1)
+    with pytest.raises(DriverLeaseConflictError, match="dispatch is in progress"):
+        conversation_store.handoff_driver_lease(session_id, ALICE, BOB, 1, 30)
+
+    # The fenced-out teardown wrote no lease audit and left the lease intact.
+    lease = conversation_store.get_driver_lease(session_id)
+    assert lease is not None
+    assert lease.generation == 1
+    assert lease.holder_user_id == ALICE
+    assert lease.released_at is None
+
+    conversation_store.complete_driver_event(session_id, dispatch_id, succeeded=True)
+
+    handed_off = conversation_store.handoff_driver_lease(session_id, ALICE, BOB, 1, 30)
+    assert handed_off.generation == 2
+    assert handed_off.holder_user_id == BOB
+    released = conversation_store.release_driver_lease(session_id, BOB, 2)
+    assert released.holder_user_id is None

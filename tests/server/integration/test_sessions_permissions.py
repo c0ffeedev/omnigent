@@ -3075,12 +3075,14 @@ async def test_driver_lease_routes_authorize_fence_and_snapshot(
         headers=alice_headers,
     )
     assert missing_generation.status_code == 409
+    assert missing_generation.json()["error"]["details"]["driver_lease"] == acquired.json()
     wrong_holder = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
         json={**message, "driver_generation": 1},
         headers=bob_headers,
     )
     assert wrong_holder.status_code == 409
+    assert wrong_holder.json()["error"]["details"]["driver_lease"] == acquired.json()
 
     accepted = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
@@ -3115,6 +3117,7 @@ async def test_driver_lease_routes_authorize_fence_and_snapshot(
         headers=alice_headers,
     )
     assert stale.status_code == 409
+    assert stale.json()["error"]["details"]["driver_lease"] == takeover.json()
     snapshot = await auth_client.get(
         f"/v1/sessions/{session_id}",
         headers=alice_headers,
@@ -3155,6 +3158,71 @@ async def test_driver_lease_routes_authorize_fence_and_snapshot(
         "session.driver_lease.released",
     ]
     assert [item.driver_generation for item in lease_events] == [1, 2, 3, 3]
+
+
+async def test_driver_fenced_skill_dispatch_preserves_actor_and_generation(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skill items and runner input retain the accepted driver's attribution."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    forwarded: list[dict[str, Any]] = []
+
+    class _Runner:
+        async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+            request = httpx.Request("POST", f"http://runner{path}")
+            if path.endswith("/skills/resolve"):
+                return httpx.Response(200, json={"meta_text": "<skill>review</skill>"}, request=request)
+            forwarded.append(kwargs["json"])
+            return httpx.Response(202, request=request)
+
+    async def _runner(*_: Any, **__: Any) -> _Runner:
+        return _Runner()
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    headers = {"X-Forwarded-Email": "alice@example.com"}
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers=headers,
+    )
+    assert acquired.status_code == 200, acquired.text
+
+    response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "slash_command",
+            "driver_generation": 1,
+            "data": {"kind": "skill", "name": "review", "arguments": "this"},
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 202, response.text
+    items = SqlAlchemyConversationStore(db_uri).list_items(session_id).data
+    skill_items = [item for item in items if item.response_id == items[-1].response_id]
+    assert len(skill_items) == 2
+    assert {item.created_by for item in skill_items} == {"alice@example.com"}
+    assert {item.driver_generation for item in skill_items} == {1}
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conversation is not None
+    assert forwarded == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "<skill>review</skill>"}],
+            "agent_id": conversation.agent_id,
+            "model": "test-agent",
+            "has_mcp_servers": False,
+            "persisted_item_id": skill_items[1].id,
+            "driver_generation": 1,
+            "actor": {"run_as": "alice@example.com"},
+        }
+    ]
 
 
 async def test_lease_free_event_route_preserves_legacy_wire_shape(
@@ -3208,6 +3276,45 @@ async def test_lease_free_event_route_preserves_legacy_wire_shape(
         }
     ]
     assert items[-1].driver_generation is None
+
+
+async def test_event_route_supports_store_without_driver_lease_capability(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy store can accept events without implementing lease methods."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    class _Runner:
+        async def post(self, path: str, **_: Any) -> httpx.Response:
+            return httpx.Response(202, request=httpx.Request("POST", f"http://runner{path}"))
+
+    async def _runner(*_: Any, **__: Any) -> _Runner:
+        return _Runner()
+
+    def _unsupported(*_: Any, **__: Any) -> None:
+        raise AssertionError("legacy store lease method must not be called")
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "supports_driver_leases", False)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "validate_driver_lease", _unsupported)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "begin_driver_event", _unsupported)
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+
+    response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "legacy store"}],
+            },
+        },
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+
+    assert response.status_code == 202, response.text
 
 
 async def test_driver_takeover_between_fail_fast_check_and_dispatch_rejects_stale_input(
@@ -3877,6 +3984,21 @@ async def test_presence_heartbeat_is_advisory_and_root_isolated(
     assert first_snapshot.json()["presence"]["active_user_ids"] == ["alice@example.com"]
     assert second_snapshot.json()["presence"]["active_user_ids"] == []
     assert first_snapshot.json()["driver_lease"] is None
+
+    acquired = await auth_client.post(
+        f"/v1/sessions/{first_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers=headers,
+    )
+    assert acquired.status_code == 200, acquired.text
+    second_heartbeat = await auth_client.post(
+        f"/v1/sessions/{first_id}/presence/heartbeat",
+        json={"ttl_seconds": 120},
+        headers=headers,
+    )
+    assert second_heartbeat.status_code == 200
+    after_heartbeat = await auth_client.get(f"/v1/sessions/{first_id}", headers=headers)
+    assert after_heartbeat.json()["driver_lease"] == acquired.json()
 
 
 async def test_presence_heartbeat_omits_local_single_user_sentinel(

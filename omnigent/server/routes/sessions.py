@@ -235,6 +235,7 @@ from omnigent.server.schemas import (
     CopyFilesResponse,
     CreatedSessionResponse,
     DriverLeaseAcquireRequest,
+    DriverLeaseConflictResponse,
     DriverLeaseGenerationRequest,
     DriverLeaseHandoffRequest,
     DriverLeaseResponse,
@@ -3016,6 +3017,7 @@ def _publish_input_consumed(
             type=item.type,
             data=item.data.model_dump() if item.data is not None else {},
             created_by=item.created_by,
+            driver_generation=item.driver_generation,
             cleared_pending_id=cleared_pending_id,
         ),
     )
@@ -9210,6 +9212,7 @@ async def _dispatch_skill_slash_command_to_runner(
             arguments=arguments,
         ),
         created_by=created_by,
+        driver_generation=body.driver_generation,
     )
     meta_item = NewConversationItem(
         type="message",
@@ -9220,6 +9223,7 @@ async def _dispatch_skill_slash_command_to_runner(
             is_meta=True,
         ),
         created_by=created_by,
+        driver_generation=body.driver_generation,
     )
     if side_effect_guard is not None:
         await side_effect_guard("before_item_persistence")
@@ -9255,6 +9259,10 @@ async def _dispatch_skill_slash_command_to_runner(
         # right persisted copy (see _forward_event_to_runner).
         "persisted_item_id": persisted_items[1].id,
     }
+    if body.driver_generation is not None:
+        runner_body["driver_generation"] = body.driver_generation
+    if created_by is not None:
+        runner_body["actor"] = _build_actor(created_by)
     effective_runner_override = (
         body.model_override if body.model_override is not None else conv.model_override
     )
@@ -20381,6 +20389,23 @@ def create_sessions_router(
             },
         )
 
+    async def _driver_lease_conflict(
+        exc: DriverLeaseConflictError,
+        session_id: str,
+    ) -> OmnigentError:
+        """Build a 409 containing the authoritative lease snapshot."""
+        current = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
+        current_response = _driver_lease_response(current)
+        return OmnigentError(
+            str(exc),
+            code=ErrorCode.CONFLICT,
+            details={
+                "driver_lease": (
+                    current_response.model_dump() if current_response is not None else None
+                )
+            },
+        )
+
     async def _mutate_driver_lease(
         operation: Callable[[], SessionDriverLease],
         session_id: str,
@@ -20388,17 +20413,7 @@ def create_sessions_router(
         try:
             lease = await asyncio.to_thread(operation)
         except DriverLeaseConflictError as exc:
-            current = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
-            current_response = _driver_lease_response(current)
-            raise OmnigentError(
-                str(exc),
-                code=ErrorCode.CONFLICT,
-                details={
-                    "driver_lease": (
-                        current_response.model_dump() if current_response is not None else None
-                    )
-                },
-            ) from exc
+            raise await _driver_lease_conflict(exc, session_id) from exc
         _publish_driver_lease(session_id, lease)
         response = _driver_lease_response(lease)
         assert response is not None
@@ -20422,6 +20437,7 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/driver/acquire",
         response_model=DriverLeaseResponse,
+        responses={409: {"model": DriverLeaseConflictResponse}},
     )
     async def acquire_driver_lease(
         session_id: str,
@@ -20447,6 +20463,7 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/driver/renew",
         response_model=DriverLeaseResponse,
+        responses={409: {"model": DriverLeaseConflictResponse}},
     )
     async def renew_driver_lease(
         session_id: str,
@@ -20468,6 +20485,7 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/driver/release",
         response_model=DriverLeaseResponse,
+        responses={409: {"model": DriverLeaseConflictResponse}},
     )
     async def release_driver_lease(
         session_id: str,
@@ -20489,6 +20507,7 @@ def create_sessions_router(
     @router.post(
         "/sessions/{session_id}/driver/handoff",
         response_model=DriverLeaseResponse,
+        responses={409: {"model": DriverLeaseConflictResponse}},
     )
     async def handoff_driver_lease(
         session_id: str,
@@ -20732,7 +20751,7 @@ def create_sessions_router(
                     driver_dispatch_id,
                 )
             except DriverLeaseConflictError as exc:
-                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+                raise await _driver_lease_conflict(exc, session_id) from exc
 
         def _start_driver_heartbeat() -> None:
             nonlocal driver_heartbeat_task
@@ -20788,7 +20807,7 @@ def create_sessions_router(
                     "conversation store cannot atomically begin driver dispatches"
                 ) from exc
             except DriverLeaseConflictError as exc:
-                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+                raise await _driver_lease_conflict(exc, session_id) from exc
             if driver_dispatch_id is None:
                 raise RuntimeError("active driver lease disappeared before acceptance")
             _start_driver_heartbeat()
@@ -20839,7 +20858,7 @@ def create_sessions_router(
             except NotImplementedError as exc:
                 raise RuntimeError("driver-capable store cannot validate driver leases") from exc
             except DriverLeaseConflictError as exc:
-                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+                raise await _driver_lease_conflict(exc, session_id) from exc
             await _accept_driver_fence()
 
         # ── Policy evaluation (path-agnostic) ────────────────
