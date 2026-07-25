@@ -822,7 +822,7 @@ export interface SessionPresenceEvent {
 export interface SessionDriverLeaseEvent {
   type: "session_driver_lease";
   conversationId: string;
-  driverLease: DriverLease;
+  driverLease: DriverLease | null;
 }
 
 /**

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { onlineManager, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
   acquireDriverLease,
@@ -15,21 +15,28 @@ import {
   type DriverLease,
   type GenerationLeaseOptions,
   type HandoffDriverLeaseOptions,
+  type PresenceEntry,
 } from "@/lib/coordinationApi";
 import {
   applyDriverLeaseToCoordinationCache,
   coordinationAuditQueryKey,
   coordinationQueryKey,
+  mergeCoordinationSnapshot,
   type CoordinationSnapshot,
 } from "@/lib/coordinationState";
-import { getCurrentUserId } from "@/lib/identity";
+import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 
 export type { CoordinationSnapshot } from "@/lib/coordinationState";
 
 export const COORDINATION_REFRESH_INTERVAL_MS = 20_000;
+const PUBLIC_DRIVER_USER_ID = "__public__";
 
 export type CoordinationConnectionState =
-  "offline" | "connecting" | "connected" | "reconnecting" | "error";
+  | "offline"
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "error";
 
 interface OnlineEventTarget {
   addEventListener(type: "online" | "offline", listener: () => void): void;
@@ -121,7 +128,16 @@ export function startCoordinationSync(options: CoordinationSyncOptions): () => v
 export interface UseCoordinationResult extends CoordinationSnapshot {
   connectionState: CoordinationConnectionState;
   error: Error | null;
+  isLoading: boolean;
+  isRefreshing: boolean;
+  isStale: boolean;
+  updatedAt: number | null;
+  activeParticipantIds: string[];
+  participants: PresenceEntry[];
+  currentDriverUserId: string | null;
   isCurrentUserDriver: boolean;
+  isActionPending: boolean;
+  actionError: Error | null;
   refresh(): Promise<void>;
   acquire(options?: AcquireDriverLeaseOptions): Promise<DriverLease>;
   renew(options: GenerationLeaseOptions): Promise<DriverLease>;
@@ -131,46 +147,79 @@ export interface UseCoordinationResult extends CoordinationSnapshot {
 
 export function useCoordination(sessionId: string): UseCoordinationResult {
   const queryClient = useQueryClient();
-  const [connectionState, setConnectionState] = useState<CoordinationConnectionState>("connecting");
-  const [error, setError] = useState<Error | null>(null);
+  const actionSequence = useRef(0);
+  const isOnline = useSyncExternalStore(
+    (listener) => onlineManager.subscribe(listener),
+    () => onlineManager.isOnline(),
+    () => true,
+  );
+  const [viewer, setViewer] = useState<{ loaded: boolean; userId: string | null }>(() => {
+    const userId = getCurrentUserId();
+    return { loaded: userId !== null, userId };
+  });
+  const [actionError, setActionError] = useState<Error | null>(null);
+  const [offlineRecoveryTimestamp, setOfflineRecoveryTimestamp] = useState<number | null>(null);
+  const [refreshFailure, setRefreshFailure] = useState<{
+    error: Error;
+    dataUpdatedAt: number;
+  } | null>(null);
   const query = useQuery<CoordinationSnapshot>({
     queryKey: coordinationQueryKey(sessionId),
-    queryFn: async ({ signal }: { signal: AbortSignal }) => ({
-      driverLease: await getDriverLease(sessionId, { signal }),
-      presence: await heartbeatPresence(sessionId, { signal }),
-    }),
-    enabled: false,
+    queryFn: async ({ signal }: { signal: AbortSignal }) => {
+      const [driverLease, presence] = await Promise.all([
+        getDriverLease(sessionId, { signal }),
+        heartbeatPresence(sessionId, { signal }),
+      ]);
+      return { driverLease, presence };
+    },
+    refetchInterval: COORDINATION_REFRESH_INTERVAL_MS,
+    refetchOnReconnect: "always",
+    retry: false,
+    staleTime: COORDINATION_REFRESH_INTERVAL_MS,
+    structuralSharing: (current, incoming) =>
+      mergeCoordinationSnapshot(
+        current as CoordinationSnapshot | undefined,
+        incoming as CoordinationSnapshot,
+      ),
   });
 
   const refresh = useCallback(async () => {
-    const controller = new AbortController();
-    const snapshot = await Promise.all([
-      getDriverLease(sessionId, { signal: controller.signal }),
-      heartbeatPresence(sessionId, { signal: controller.signal }),
-    ]).then(([driverLease, presence]) => ({ driverLease, presence }));
-    queryClient.setQueryData(coordinationQueryKey(sessionId), snapshot);
-  }, [queryClient, sessionId]);
+    const result = await query.refetch({ cancelRefetch: true });
+    if (result.error) {
+      setRefreshFailure({ error: result.error, dataUpdatedAt: query.dataUpdatedAt });
+      throw result.error;
+    }
+    setRefreshFailure(null);
+  }, [query]);
 
   useEffect(() => {
-    setConnectionState("connecting");
-    setError(null);
-    return startCoordinationSync({
-      refresh: async (signal) => {
-        const [driverLease, presence] = await Promise.all([
-          getDriverLease(sessionId, { signal }),
-          heartbeatPresence(sessionId, { signal }),
-        ]);
-        return { driverLease, presence };
-      },
-      onSnapshot: (snapshot) => {
-        queryClient.setQueryData(coordinationQueryKey(sessionId), snapshot);
-      },
-      onConnectionState: (nextState, nextError) => {
-        setConnectionState(nextState);
-        setError(nextError);
-      },
+    let cancelled = false;
+    void resolveIdentity().then((userId) => {
+      if (!cancelled) setViewer({ loaded: true, userId });
     });
-  }, [queryClient, sessionId]);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isOnline) {
+      setOfflineRecoveryTimestamp(query.dataUpdatedAt);
+    } else if (
+      offlineRecoveryTimestamp !== null &&
+      query.dataUpdatedAt > offlineRecoveryTimestamp &&
+      !query.isFetching &&
+      !query.isError
+    ) {
+      setOfflineRecoveryTimestamp(null);
+    }
+  }, [isOnline, offlineRecoveryTimestamp, query.dataUpdatedAt, query.isError, query.isFetching]);
+
+  useEffect(() => {
+    if (refreshFailure && query.dataUpdatedAt > refreshFailure.dataUpdatedAt) {
+      setRefreshFailure(null);
+    }
+  }, [query.dataUpdatedAt, refreshFailure]);
 
   const settleLease = useCallback(
     (lease: DriverLease) => {
@@ -187,37 +236,89 @@ export function useCoordination(sessionId: string): UseCoordinationResult {
     },
     [queryClient, sessionId],
   );
+  const handleLeaseSuccess = useCallback(
+    (lease: DriverLease, _variables: unknown, actionId: number | undefined) => {
+      if (actionId === actionSequence.current) setActionError(null);
+      settleLease(lease);
+    },
+    [settleLease],
+  );
+  const handleLeaseError = useCallback(
+    (mutationError: Error, _variables: unknown, actionId: number | undefined) => {
+      reconcileConflict(mutationError);
+      if (actionId === actionSequence.current) {
+        setActionError(mutationError);
+      }
+    },
+    [reconcileConflict],
+  );
+  const beginAction = useCallback(() => {
+    actionSequence.current += 1;
+    setActionError(null);
+    return actionSequence.current;
+  }, []);
 
   const acquireMutation = useMutation({
     mutationFn: (options: AcquireDriverLeaseOptions = {}) => acquireDriverLease(sessionId, options),
-    onSuccess: settleLease,
-    onError: reconcileConflict,
+    onMutate: beginAction,
+    onSuccess: handleLeaseSuccess,
+    onError: handleLeaseError,
   });
   const renewMutation = useMutation({
     mutationFn: (options: GenerationLeaseOptions) => renewDriverLease(sessionId, options),
-    onSuccess: settleLease,
-    onError: reconcileConflict,
+    onMutate: beginAction,
+    onSuccess: handleLeaseSuccess,
+    onError: handleLeaseError,
   });
   const releaseMutation = useMutation({
     mutationFn: (options: GenerationLeaseOptions) => releaseDriverLease(sessionId, options),
-    onSuccess: settleLease,
-    onError: reconcileConflict,
+    onMutate: beginAction,
+    onSuccess: handleLeaseSuccess,
+    onError: handleLeaseError,
   });
   const handoffMutation = useMutation({
     mutationFn: (options: HandoffDriverLeaseOptions) => handoffDriverLease(sessionId, options),
-    onSuccess: settleLease,
-    onError: reconcileConflict,
+    onMutate: beginAction,
+    onSuccess: handleLeaseSuccess,
+    onError: handleLeaseError,
   });
 
   const driverLease = query.data?.driverLease ?? null;
-  const currentUserId = getCurrentUserId();
+  const currentDriverUserId =
+    driverLease?.active === true ? (driverLease.holderUserId ?? null) : null;
+  const expectedDriverUserId = viewer.loaded ? (viewer.userId ?? PUBLIC_DRIVER_USER_ID) : null;
+  const refreshError = refreshFailure?.error ?? null;
+  const connectionState: CoordinationConnectionState =
+    !isOnline || query.fetchStatus === "paused"
+      ? "offline"
+      : query.data === undefined && query.isFetching
+        ? "connecting"
+        : (refreshError !== null || query.isError) && !query.isFetching
+          ? "error"
+          : offlineRecoveryTimestamp !== null ||
+              (query.isFetching && (refreshError !== null || query.isRefetchError))
+            ? "reconnecting"
+            : "connected";
   return {
     driverLease,
     presence: query.data?.presence ?? null,
     connectionState,
-    error,
+    error: refreshError ?? query.error,
+    isLoading: query.isPending,
+    isRefreshing: query.data !== undefined && query.isFetching,
+    isStale: query.data !== undefined && connectionState !== "connected",
+    updatedAt: query.dataUpdatedAt || null,
+    activeParticipantIds: query.data?.presence?.activeUserIds ?? [],
+    participants: query.data?.presence?.entries ?? [],
+    currentDriverUserId,
     isCurrentUserDriver:
-      driverLease?.active === true && driverLease.holderUserId === (currentUserId ?? "local"),
+      currentDriverUserId !== null && currentDriverUserId === expectedDriverUserId,
+    isActionPending:
+      acquireMutation.isPending ||
+      renewMutation.isPending ||
+      releaseMutation.isPending ||
+      handoffMutation.isPending,
+    actionError,
     refresh,
     acquire: acquireMutation.mutateAsync,
     renew: renewMutation.mutateAsync,

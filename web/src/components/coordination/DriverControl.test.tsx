@@ -250,7 +250,7 @@ describe("DriverControl", () => {
 
     expect(screen.getByText("Control state may be out of date")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Transfer" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Refresh control state" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Refresh control state" })).toBeEnabled();
   });
 
   it("does not expose control mutations to a read-only participant", () => {
@@ -262,6 +262,21 @@ describe("DriverControl", () => {
     expect(screen.queryByRole("button", { name: "Release control" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Take control" })).not.toBeInTheDocument();
     expect(usePermissionsMock).toHaveBeenCalledWith(null);
+  });
+
+  it("preserves an active lease whose holder identity is unavailable", () => {
+    useCoordinationMock.mockReturnValue(
+      coordination({
+        driverLease: { ...activeLease, holderUserId: null },
+        currentDriverUserId: null,
+        isCurrentUserDriver: false,
+      }),
+    );
+    render(<DriverControl sessionId="sess-1" permissionLevel={3} />);
+
+    expect(screen.getByText("Active driver unavailable")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Take control" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Transfer" })).toBeInTheDocument();
   });
 
   it("uses non-forced acquire only when no active driver exists", async () => {

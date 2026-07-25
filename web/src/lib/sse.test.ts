@@ -190,6 +190,19 @@ describe("parseEvent — session.driver_lease", () => {
     });
   });
 
+  it("accepts the backend's nullable no-lease snapshot", () => {
+    expect(
+      parseEvent("session.driver_lease", {
+        conversation_id: "sess-1",
+        driver_lease: null,
+      }),
+    ).toEqual({
+      type: "session_driver_lease",
+      conversationId: "sess-1",
+      driverLease: null,
+    });
+  });
+
   it("rejects a mismatched session", () => {
     expect(
       parseEvent("session.driver_lease", {

@@ -816,6 +816,13 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const conversationId = data.conversation_id;
     const rawLease = data.driver_lease;
     if (typeof conversationId !== "string" || !conversationId) return null;
+    if (rawLease === null) {
+      return {
+        type: "session_driver_lease",
+        conversationId,
+        driverLease: null,
+      } satisfies SessionDriverLeaseEvent;
+    }
     if (!rawLease || typeof rawLease !== "object" || Array.isArray(rawLease)) return null;
     const lease = rawLease as Record<string, unknown>;
     if (lease.session_id !== conversationId) return null;

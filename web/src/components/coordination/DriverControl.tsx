@@ -31,7 +31,7 @@ type Confirmation =
   | {
       action: "handoff";
       generation: number;
-      holderUserId: string;
+      holderUserId: string | null;
       targetUserId: string;
     }
   | {
@@ -40,7 +40,8 @@ type Confirmation =
       holderUserId: string;
     };
 
-function displayIdentity(userId: string): string {
+function displayIdentity(userId: string | null): string {
+  if (userId === null) return "an unknown driver";
   return userId === "__public__" ? "the local user" : userId;
 }
 
@@ -71,8 +72,10 @@ function failureMessage(error: unknown, refreshFailed: boolean): string {
     : " The current control state has been refreshed.";
   if (error instanceof DriverLeaseConflictError) {
     const currentHolder =
-      error.currentLease?.active === true && error.currentLease.holderUserId
-        ? ` Control is now held by ${displayIdentity(error.currentLease.holderUserId)}.`
+      error.currentLease?.active === true
+        ? error.currentLease.holderUserId
+          ? ` Control is now held by ${displayIdentity(error.currentLease.holderUserId)}.`
+          : " The active lease does not identify a driver."
         : " There is no active driver now.";
     return `Control changed before the action completed.${currentHolder}${refreshSuffix}`;
   }
@@ -102,13 +105,15 @@ export function DriverControl({ sessionId, permissionLevel }: DriverControlProps
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [localPending, setLocalPending] = useState(false);
+  const [refreshPending, setRefreshPending] = useState(false);
   const pendingRef = useRef(false);
   const lastTriggerRef = useRef<HTMLButtonElement | null>(null);
   const sectionRef = useRef<HTMLElement | null>(null);
 
   const lease = coordination.driverLease;
-  const activeLease = lease?.active === true && coordination.currentDriverUserId !== null;
-  const holderUserId = activeLease ? coordination.currentDriverUserId : null;
+  const activeLease = lease?.active === true ? lease : null;
+  const holderUserId = activeLease?.holderUserId ?? null;
+  const activeParticipantIds = coordination.presence?.activeUserIds;
   const editableUsers = useMemo(
     () =>
       new Set(
@@ -118,10 +123,10 @@ export function DriverControl({ sessionId, permissionLevel }: DriverControlProps
   );
   const handoffCandidates = useMemo(
     () =>
-      coordination.activeParticipantIds.filter(
+      (activeParticipantIds ?? []).filter(
         (userId) => userId !== holderUserId && editableUsers.has(userId),
       ),
-    [coordination.activeParticipantIds, editableUsers, holderUserId],
+    [activeParticipantIds, editableUsers, holderUserId],
   );
 
   useEffect(() => {
@@ -129,11 +134,9 @@ export function DriverControl({ sessionId, permissionLevel }: DriverControlProps
   }, [handoffCandidates, selectedTarget]);
 
   const stateUnavailable =
-    coordination.connectionState !== "connected" ||
-    coordination.isStale ||
-    coordination.error !== null;
-  const actionPending = localPending || coordination.isActionPending;
-  const actionsDisabled = stateUnavailable || coordination.isRefreshing || actionPending;
+    coordination.connectionState !== "connected" || coordination.error !== null;
+  const actionPending = localPending;
+  const actionsDisabled = stateUnavailable || refreshPending || actionPending;
   const confirmationIsCurrent =
     confirmation !== null &&
     lease?.active === true &&
@@ -154,12 +157,13 @@ export function DriverControl({ sessionId, permissionLevel }: DriverControlProps
   }, [actionPending, confirmation, confirmationIsCurrent]);
 
   const hasCollaborationContext =
-    coordination.activeParticipantIds.length > 1 ||
-    (activeLease && !coordination.isCurrentUserDriver);
+    (activeParticipantIds?.length ?? 0) > 1 ||
+    (activeLease !== null && !coordination.isCurrentUserDriver);
   if (!hasCollaborationContext && !coordination.error) return null;
 
   const refreshState = async () => {
     setFeedback(null);
+    setRefreshPending(true);
     try {
       await coordination.refresh();
     } catch {
@@ -167,6 +171,8 @@ export function DriverControl({ sessionId, permissionLevel }: DriverControlProps
         kind: "error",
         message: "Control state could not be refreshed. Check the connection and try again.",
       });
+    } finally {
+      setRefreshPending(false);
     }
   };
 
@@ -218,10 +224,12 @@ export function DriverControl({ sessionId, permissionLevel }: DriverControlProps
     );
   };
 
-  const statusText = holderUserId
-    ? coordination.isCurrentUserDriver
-      ? "You have control"
-      : `${displayIdentity(holderUserId)} has control`
+  const statusText = activeLease
+    ? holderUserId
+      ? coordination.isCurrentUserDriver
+        ? "You have control"
+        : `${displayIdentity(holderUserId)} has control`
+      : "Active driver unavailable"
     : "No active driver";
 
   return (
@@ -310,7 +318,7 @@ export function DriverControl({ sessionId, permissionLevel }: DriverControlProps
                   setConfirmation({
                     action: "handoff",
                     generation: lease.generation,
-                    holderUserId: holderUserId!,
+                    holderUserId,
                     targetUserId: selectedTarget,
                   });
                 }}
@@ -325,10 +333,10 @@ export function DriverControl({ sessionId, permissionLevel }: DriverControlProps
             size="icon-sm"
             variant="ghost"
             aria-label="Refresh control state"
-            disabled={coordination.isRefreshing || actionPending}
+            disabled={refreshPending || actionPending}
             onClick={() => void refreshState()}
           >
-            <RefreshCwIcon className={coordination.isRefreshing ? "animate-spin" : undefined} />
+            <RefreshCwIcon className={refreshPending ? "animate-spin" : undefined} />
           </Button>
         </div>
       </div>
