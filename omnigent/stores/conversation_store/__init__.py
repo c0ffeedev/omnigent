@@ -261,6 +261,7 @@ class DriverDispatchClaim:
     consumer_token: str
     consumer_generation: int
     claim_expires_at: int
+    completed: bool = False
 
 
 class DriverLeaseConflictError(Exception):
@@ -395,6 +396,7 @@ class ConversationStore(ABC):
         event_type: str,
         *,
         source_id: str | None = None,
+        payload: dict[str, Any] | None = None,
         claim_ttl_seconds: int = DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
     ) -> DriverDispatchClaim | str | None:
         """Atomically validate, accept, and claim a human driver event."""

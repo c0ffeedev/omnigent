@@ -70,6 +70,7 @@ def upgrade() -> None:
         sa.Column("actor_user_id", sa.String(length=128), nullable=False),
         sa.Column("generation", sa.Integer(), nullable=False),
         sa.Column("input_type", sa.String(length=64), nullable=False),
+        sa.Column("payload_json", sa.Text(), nullable=True),
         sa.Column("event_id", Uuid16(), nullable=True),
         sa.Column("source_id", sa.String(length=128), nullable=True),
         sa.Column("effect_id", sa.String(length=128), nullable=True),

@@ -2289,12 +2289,16 @@ class SqlAlchemyConversationStore(ConversationStore):
         event_type: str,
         *,
         source_id: str | None = None,
+        payload: dict[str, Any] | None = None,
         claim_ttl_seconds: int = DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
     ) -> DriverDispatchClaim | str | None:
         """Validate, audit, and durably claim an event in one transaction."""
         if claim_ttl_seconds <= 0:
             raise ValueError("claim_ttl_seconds must be positive")
         now = now_epoch()
+        payload_json = (
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) if payload else None
+        )
         with self._driver_session(session_id) as session:
             row = self._locked_driver_lease(session, session_id)
             if row is None:
@@ -2327,12 +2331,25 @@ class SqlAlchemyConversationStore(ConversationStore):
                         existing.actor_user_id != actor_user_id
                         or existing.generation != row.generation
                         or existing.input_type != event_type
+                        or existing.payload_json != payload_json
                         or existing.event_id is None
                         or existing.effect_id is None
                     ):
                         raise DriverLeaseConflictError("driver event source identity was reused")
                     if existing.state == "completed":
-                        raise DriverLeaseConflictError("driver event source was already completed")
+                        assert existing.consumer_token is not None
+                        assert existing.consumer_generation is not None
+                        return DriverDispatchClaim(
+                            dispatch_id=existing.id,
+                            event_id=existing.event_id,
+                            source_id=source_id,
+                            effect_id=existing.effect_id,
+                            driver_generation=existing.generation,
+                            consumer_token=existing.consumer_token,
+                            consumer_generation=existing.consumer_generation,
+                            claim_expires_at=0,
+                            completed=True,
+                        )
                     if (
                         existing.state == "running"
                         and existing.claim_expires_at is not None
@@ -2382,6 +2399,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     actor_user_id=actor_user_id,
                     generation=row.generation,
                     input_type=event_type,
+                    payload_json=payload_json,
                     event_id=event_id,
                     source_id=source_id,
                     effect_id=effect_id,

@@ -51,6 +51,9 @@ def test_driver_lease_migration_round_trip(tmp_path: Path) -> None:
         assert "session_driver_leases" in inspector.get_table_names()
         assert "session_driver_events" in inspector.get_table_names()
         assert "session_driver_dispatches" in inspector.get_table_names()
+        assert "payload_json" in {
+            column["name"] for column in inspector.get_columns("session_driver_dispatches")
+        }
         assert inspector.get_pk_constraint("session_driver_leases")["constrained_columns"] == [
             "workspace_id",
             "session_id",

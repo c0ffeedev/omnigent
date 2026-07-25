@@ -14,7 +14,15 @@ from __future__ import annotations
 import re
 from typing import Annotated, Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, Strict, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    Strict,
+    field_validator,
+    model_validator,
+)
 
 from omnigent.entities import ConversationItem, ProjectResourceKind
 

@@ -600,6 +600,43 @@ def test_completed_dispatch_completion_is_a_terminal_noop(
         assert unchanged.claim_expires_at is None
 
 
+def test_completed_source_returns_existing_terminal_claim(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A retried source id resolves to its settled effect without reopening it."""
+    session_id = conversation_store.create_conversation().id
+    conversation_store.acquire_driver_lease(session_id, ALICE, 30)
+    first = conversation_store.begin_driver_event(
+        session_id,
+        ALICE,
+        1,
+        "message",
+        source_id="source-once",
+    )
+    assert isinstance(first, DriverDispatchClaim)
+    conversation_store.complete_driver_event(
+        session_id,
+        first.dispatch_id,
+        consumer_token=first.consumer_token,
+        consumer_generation=first.consumer_generation,
+        succeeded=True,
+    )
+
+    duplicate = conversation_store.begin_driver_event(
+        session_id,
+        ALICE,
+        1,
+        "message",
+        source_id="source-once",
+    )
+
+    assert isinstance(duplicate, DriverDispatchClaim)
+    assert duplicate.completed is True
+    assert duplicate.dispatch_id == first.dispatch_id
+    assert duplicate.event_id == first.event_id
+    assert duplicate.effect_id == first.effect_id
+
+
 def test_stale_generation_acceptance_leaves_no_durable_trace(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -739,6 +776,7 @@ def test_driver_source_identity_and_consumer_claim_are_persisted_atomically(
         1,
         "message",
         source_id="client-event-1",
+        payload={"type": "message", "data": {"text": "hello"}},
     )
 
     assert isinstance(claim, DriverDispatchClaim)
@@ -748,6 +786,7 @@ def test_driver_source_identity_and_consumer_claim_are_persisted_atomically(
         assert dispatch is not None
         assert event is not None
         assert dispatch.source_id == event.source_id == "client-event-1"
+        assert dispatch.payload_json == '{"data":{"text":"hello"},"type":"message"}'
         assert dispatch.effect_id == claim.effect_id
         assert dispatch.consumer_token == claim.consumer_token
         assert dispatch.consumer_generation == 1
