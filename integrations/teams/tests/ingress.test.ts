@@ -5,9 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { PUBLIC } from "@microsoft/teams.api";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { createTeamsApp, type TeamsAppOptions } from "../src/app.js";
+import { createTeamsApp, type TeamsAppOptions, type TeamsAppServices } from "../src/app.js";
 import { HELP_TEXT } from "../src/activity.js";
 import type { TeamsConfig } from "../src/config.js";
 import { ActivityDedupeStore } from "../src/dedupe.js";
@@ -62,6 +62,13 @@ const config: TeamsConfig = {
   botClientSecret: "test-secret",
   botTenantId: tenantId,
   allowedTenantIds: new Set([tenantId]),
+  ssoAudience: `api://${appId}`,
+  ssoConnectionName: "teams-sso",
+  omnigentOrigin: "https://omnigent.example",
+  omnigentDeviceClientId: "teams",
+  grantDatabase: join(directory, "grants.sqlite3"),
+  tokenEncryptionKey: Buffer.alloc(32, 1),
+  grantMaximumLifetimeDays: 30,
   dedupeDatabase: join(directory, "dedupe.sqlite3"),
   dedupeRetentionDays: 7,
   dedupeMaxRecords: 100,
@@ -93,6 +100,7 @@ async function request(
   activity = body(),
   client?: NonNullable<TeamsAppOptions["client"]>,
   logger?: TeamsAppOptions["logger"],
+  services?: TeamsAppServices,
 ) {
   const dedupe = new ActivityDedupeStore(config.dedupeDatabase, {
     maxRecords: config.dedupeMaxRecords,
@@ -106,7 +114,7 @@ async function request(
     },
     client,
     logger,
-  });
+  }, services);
   await app.initialize();
   try {
     return await app.server.handleRequest({
@@ -212,6 +220,24 @@ describe("authenticated Teams ingress", () => {
       tenantId,
     })).toMatchObject({ attemptCount: 2, receipt: "reply-1", state: "delivered" });
     persisted.close();
+  });
+
+  it("disables the principal binding on an authenticated personal uninstall", async () => {
+    const uninstall = vi.fn();
+    const services = {
+      identityValidator: {} as TeamsAppServices["identityValidator"],
+      lifecycle: { uninstall } as unknown as TeamsAppServices["lifecycle"],
+    };
+
+    expect(await request(
+      token(),
+      body({ action: "remove", type: "installationUpdate" }),
+      undefined,
+      undefined,
+      services,
+    )).toMatchObject({ status: 200 });
+    expect(uninstall).toHaveBeenCalledOnce();
+    expect(uninstall).toHaveBeenCalledWith({ objectId, tenantId });
   });
 
   it.each([
