@@ -52,6 +52,7 @@ def upgrade() -> None:
         sa.Column("previous_holder_user_id", sa.String(128), nullable=True),
         sa.Column("generation", sa.Integer(), nullable=False),
         sa.Column("input_type", sa.String(64), nullable=True),
+        sa.Column("source_id", sa.String(128), nullable=True),
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.CheckConstraint("generation > 0", name="ck_session_driver_events_generation_positive"),
         sa.PrimaryKeyConstraint("workspace_id", "id"),
@@ -69,12 +70,22 @@ def upgrade() -> None:
         sa.Column("actor_user_id", sa.String(length=128), nullable=False),
         sa.Column("generation", sa.Integer(), nullable=False),
         sa.Column("input_type", sa.String(length=64), nullable=False),
+        sa.Column("payload_json", sa.Text(), nullable=False),
+        sa.Column("event_id", Uuid16(), nullable=False),
+        sa.Column("source_id", sa.String(length=128), nullable=False),
+        sa.Column("effect_id", sa.String(length=128), nullable=False),
+        sa.Column("consumer_token", Uuid16(), nullable=False),
+        sa.Column("consumer_generation", sa.Integer(), nullable=False),
         sa.Column("state", sa.String(length=16), nullable=False),
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("completed_at", sa.Integer(), nullable=True),
         sa.Column("claim_expires_at", sa.Integer(), nullable=True),
         sa.CheckConstraint(
             "generation > 0", name="ck_session_driver_dispatches_generation_positive"
+        ),
+        sa.CheckConstraint(
+            "consumer_generation > 0",
+            name="ck_session_driver_dispatches_consumer_generation_positive",
         ),
         sa.CheckConstraint(
             "state IN ('running', 'completed', 'failed')",
@@ -91,6 +102,12 @@ def upgrade() -> None:
             name="ck_session_driver_dispatches_lifecycle",
         ),
         sa.PrimaryKeyConstraint("workspace_id", "id"),
+        sa.UniqueConstraint(
+            "workspace_id",
+            "session_id",
+            "source_id",
+            name="uq_session_driver_dispatches_source",
+        ),
     )
     op.create_index(
         "ix_session_driver_dispatches_recovery",

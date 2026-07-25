@@ -249,6 +249,35 @@ class SessionDriverLease:
         )
 
 
+@dataclass(frozen=True)
+class DriverDispatchEnvelope:
+    """Durable payload accepted into the driver outbox."""
+
+    dispatch_id: str
+    event_id: str
+    source_id: str
+    effect_id: str
+    driver_generation: int
+    payload: dict[str, Any]
+    completed: bool = False
+
+
+@dataclass(frozen=True)
+class DriverDispatchClaim:
+    """Durable identity and consumer fence for one accepted driver input."""
+
+    dispatch_id: str
+    event_id: str
+    source_id: str
+    effect_id: str
+    driver_generation: int
+    consumer_token: str
+    consumer_generation: int
+    claim_expires_at: int
+    payload: dict[str, Any]
+    completed: bool = False
+
+
 class DriverLeaseConflictError(Exception):
     """Raised when a lease mutation loses ownership or generation fencing."""
 
@@ -380,9 +409,52 @@ class ConversationStore(ABC):
         generation: int | None,
         event_type: str,
         *,
+        source_id: str | None = None,
+        payload: dict[str, Any] | None = None,
         claim_ttl_seconds: int = DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
-    ) -> str | None:
-        """Atomically validate, accept, and claim a human driver event."""
+    ) -> DriverDispatchClaim | str | None:
+        """Atomically validate, accept, and claim a human driver event.
+
+        Lease-protected events require ``source_id``. Its idempotency scope is
+        ``(workspace_id, session_id, source_id)``; retries must preserve the
+        actor, lease generation, event type, and canonical payload.
+        """
+        raise NotImplementedError
+
+    def enqueue_driver_event(
+        self,
+        session_id: str,
+        actor_user_id: str,
+        generation: int | None,
+        event_type: str,
+        *,
+        source_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> DriverDispatchEnvelope | None:
+        """Atomically validate and enqueue a payload without claiming it."""
+        raise NotImplementedError
+
+    def claim_driver_event(
+        self,
+        session_id: str,
+        dispatch_id: str,
+        actor_user_id: str,
+        generation: int,
+        *,
+        claim_ttl_seconds: int = DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
+    ) -> DriverDispatchClaim:
+        """Claim pending or recoverable outbox work for one consumer."""
+        raise NotImplementedError
+
+    def validate_driver_event(
+        self,
+        session_id: str,
+        dispatch_id: str,
+        *,
+        consumer_token: str,
+        consumer_generation: int,
+    ) -> None:
+        """Revalidate a claim and lease generation without extending its TTL."""
         raise NotImplementedError
 
     def renew_driver_event(
@@ -390,6 +462,8 @@ class ConversationStore(ABC):
         session_id: str,
         dispatch_id: str,
         *,
+        consumer_token: str | None = None,
+        consumer_generation: int | None = None,
         claim_ttl_seconds: int = DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
     ) -> None:
         """Renew an unexpired durable dispatch claim."""
@@ -400,6 +474,8 @@ class ConversationStore(ABC):
         session_id: str,
         dispatch_id: str,
         *,
+        consumer_token: str | None = None,
+        consumer_generation: int | None = None,
         succeeded: bool,
     ) -> None:
         """Finish a claimed event, unblocking subsequent lease mutations."""

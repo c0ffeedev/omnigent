@@ -974,13 +974,55 @@ Request body matches `SessionEventInput`:
     against the item-type's Pydantic data class for non-interrupt
     types (400 on schema mismatch).
 
+  driver_generation (integer, optional)
+    Required when the session has a driver lease. Must equal the active
+    holder's fencing generation.
+
+  source_id (string, optional; 1–128 characters)
+    Required when the session has a driver lease. The tuple
+    `(workspace_id, session_id, source_id)` is the idempotency key. A retry
+    must preserve the actor, driver generation, event type, and payload.
+    Retrying a completed event returns its existing result without replaying
+    persistence, enqueue, or runner effects. Reusing a source id with
+    different input, or while its first dispatch is still running, returns
+    409. Failed or claim-expired dispatches retry in place with the same
+    event/effect ids and a newly fenced consumer claim.
+
+**Driver-fencing guarantees.** For lease-protected input, acceptance linearizes
+when one database transaction, while holding the session's driver lock, commits
+both the `input_accepted` audit event and its pending outbox dispatch. Nothing
+has been dispatched at that point. The server then claims that durable row and
+revalidates the current lease plus consumer token/generation immediately before
+each local side effect. A bound runner performs the same revalidation before it
+executes the forwarded effect. Lease takeover, claim expiry, or consumer
+replacement therefore makes a paused stale request fail with 409 before it can
+persist, enqueue, interrupt, approve, or execute work; stale heartbeats and
+completion attempts are fenced compare-and-swap failures and cannot mutate the
+new owner's state.
+
+Clients must retain the same `source_id` across ambiguous responses and retries.
+An exact retry reuses the original audit event, dispatch, and effect identity;
+it never creates a second durable acceptance or replays a completed effect.
+Incompatible reuse fails with 409. If the server crashes after acceptance but
+before claiming, the pending row remains durable and blocks ownership changes
+until its accepting lease expires. If it crashes with claimed work, the bounded
+claim expires; the next valid retry reclaims the same row and effect identity
+with a higher consumer generation, permanently fencing the old worker.
+
+Sessions with no driver-lease row retain the legacy behavior: callers may omit
+both `driver_generation` and `source_id`, and no outbox or consumer fence is
+introduced. Once a lease row exists, release or expiry does not restore this
+fallback; a new active lease and its current generation are required.
+
 202 Accepted
 {"queued": true}                            # regular queued item events
 {"queued": false}                           # "interrupt" and status/control bypasses
 {"queued": false, "item_id": "item_..."}    # "external_conversation_item"
 {"queued": true, "pending_id": "pending_..."} # native-terminal "message" (see below)
+{"queued": false, "duplicate": true}         # completed source-id retry
 
 400 Bad Request — unknown `type`, or `data` fails the per-type schema
+409 Conflict — stale driver fence, missing/reused source id, or active duplicate
 404 Not Found — no session with that id
 422 Unprocessable Entity — request body fails Pydantic validation
 ```

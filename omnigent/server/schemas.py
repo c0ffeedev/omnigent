@@ -14,7 +14,15 @@ from __future__ import annotations
 import re
 from typing import Annotated, Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    Strict,
+    field_validator,
+    model_validator,
+)
 
 from omnigent.entities import ConversationItem, ProjectResourceKind
 
@@ -1175,6 +1183,18 @@ class SessionEventInput(BaseModel):
         ge=1,
         exclude_if=lambda value: value is None,
     )
+    source_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Stable caller-supplied event identity required for lease-fenced sessions. "
+            "Together with the workspace and session, this is the idempotency key; "
+            "retries must preserve the actor, generation, type, and payload."
+        ),
+    )
+    _driver_claim: dict[str, Any] | None = PrivateAttr(default=None)
 
 
 class SessionGitOptions(BaseModel):
@@ -1595,6 +1615,26 @@ class DriverLeaseResponse(BaseModel):
     active: bool
 
 
+class DriverLeaseConflictDetails(BaseModel):
+    """Machine-readable state returned when driver fencing rejects a request."""
+
+    driver_lease: DriverLeaseResponse | None = None
+
+
+class DriverLeaseConflictBody(BaseModel):
+    """Structured error payload for a driver lease conflict."""
+
+    code: Literal["conflict"]
+    message: str
+    details: DriverLeaseConflictDetails
+
+
+class DriverLeaseConflictResponse(BaseModel):
+    """HTTP 409 response carrying the authoritative current driver lease."""
+
+    error: DriverLeaseConflictBody
+
+
 class DriverLeaseAcquireRequest(BaseModel):
     """Acquire or, for managers, force-take a session driver lease."""
 
@@ -1607,6 +1647,14 @@ class DriverLeaseGenerationRequest(BaseModel):
 
     generation: int = Field(ge=1)
     ttl_seconds: int = Field(default=30, ge=5, le=300)
+
+
+class DriverDispatchValidationRequest(BaseModel):
+    """Opaque consumer claim revalidated by a bound runner before execution."""
+
+    dispatch_id: str = Field(min_length=32, max_length=32)
+    consumer_token: str = Field(min_length=32, max_length=32)
+    consumer_generation: int = Field(ge=1)
 
 
 class DriverLeaseHandoffRequest(BaseModel):
@@ -3023,6 +3071,8 @@ class SessionInputConsumedPayload(BaseModel):
         e.g. ``"alice@example.com"``. ``None`` for agent/tool/system
         items and single-user mode. Mirrors
         :meth:`ConversationItem.to_api_dict` for live attribution.
+    :param driver_generation: Lease fencing generation accepted with the
+        input, or ``None`` for legacy lease-free sessions.
     :param cleared_pending_id: When this consumed message drains a
         :mod:`omnigent.runtime.pending_inputs` entry (a native-
         terminal web message round-tripping back from the transcript),
@@ -3038,6 +3088,7 @@ class SessionInputConsumedPayload(BaseModel):
     # (matches :class:`SessionEventInput.data`).
     data: dict[str, Any]
     created_by: str | None = None
+    driver_generation: int | None = Field(default=None, ge=1)
     cleared_pending_id: str | None = None
 
     model_config = ConfigDict(extra="ignore")

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
 import threading
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
@@ -43,6 +44,7 @@ from omnigent.server.auth import (
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+from omnigent.stores.conversation_store import DriverDispatchClaim
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -3025,8 +3027,11 @@ async def test_driver_lease_routes_authorize_fence_and_snapshot(
     """Lease APIs enforce editor/manager roles and fence message submission."""
     from omnigent.server.routes import sessions as sessions_module
 
+    forwarded: list[dict[str, Any]] = []
+
     class _Runner:
-        async def post(self, path: str, **_: Any) -> httpx.Response:
+        async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+            forwarded.append(kwargs["json"])
             return httpx.Response(202, request=httpx.Request("POST", f"http://runner{path}"))
 
     async def _runner(*_: Any, **__: Any) -> _Runner:
@@ -3090,9 +3095,17 @@ async def test_driver_lease_routes_authorize_fence_and_snapshot(
     )
     assert wrong_holder.status_code == 409
 
-    accepted = await auth_client.post(
+    missing_source = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
         json={**message, "driver_generation": 1},
+        headers=alice_headers,
+    )
+    assert missing_source.status_code == 409
+    assert "source_id is required" in missing_source.text
+
+    accepted = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={**message, "driver_generation": 1, "source_id": "lease-fenced-message"},
         headers=alice_headers,
     )
     assert accepted.status_code == 202, accepted.text
@@ -3108,6 +3121,20 @@ async def test_driver_lease_routes_authorize_fence_and_snapshot(
         level=LEVEL_MANAGE,
     )
     assert manage_grant.status_code == 200
+    in_progress_takeover = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30, "force": True},
+        headers=bob_headers,
+    )
+    assert in_progress_takeover.status_code == 409, in_progress_takeover.text
+    claim = forwarded[-1]["driver_claim"]
+    SqlAlchemyConversationStore(db_uri).complete_driver_event(
+        session_id,
+        claim["dispatch_id"],
+        consumer_token=claim["consumer_token"],
+        consumer_generation=claim["consumer_generation"],
+        succeeded=True,
+    )
     takeover = await auth_client.post(
         f"/v1/sessions/{session_id}/driver/acquire",
         json={"ttl_seconds": 30, "force": True},
@@ -3119,7 +3146,7 @@ async def test_driver_lease_routes_authorize_fence_and_snapshot(
 
     stale = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
-        json={**message, "driver_generation": 1},
+        json={**message, "driver_generation": 1, "source_id": "stale-message"},
         headers=alice_headers,
     )
     assert stale.status_code == 409
@@ -3240,7 +3267,7 @@ async def test_forwarded_actor_is_the_driver_lease_principal(
 
     accepted = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
-        json={**message, "driver_generation": 2},
+        json={**message, "driver_generation": 2, "source_id": "forwarded-actor"},
         headers=alice_headers,
     )
     assert accepted.status_code == 202, accepted.text
@@ -3282,6 +3309,7 @@ async def _assert_nonforwarded_driver_lease_principal(
         json={
             "type": "message",
             "driver_generation": 1,
+            "source_id": "sentinel-lease-holder",
             "data": {
                 "role": "user",
                 "content": [{"type": "input_text", "text": "sentinel lease holder"}],
@@ -3319,6 +3347,577 @@ async def test_auth_disabled_public_user_can_spend_its_driver_lease(
         db_uri,
         monkeypatch,
         expected_holder=RESERVED_USER_PUBLIC,
+    )
+
+
+async def test_driver_fenced_skill_dispatch_preserves_actor_and_generation(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skill items and runner input retain the accepted driver's attribution."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    forwarded: list[dict[str, Any]] = []
+
+    class _Runner:
+        async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+            request = httpx.Request("POST", f"http://runner{path}")
+            if path.endswith("/skills/resolve"):
+                return httpx.Response(
+                    200,
+                    json={"meta_text": "<skill>review</skill>"},
+                    request=request,
+                )
+            forwarded.append(kwargs["json"])
+            return httpx.Response(202, request=request)
+
+    async def _runner(*_: Any, **__: Any) -> _Runner:
+        return _Runner()
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    headers = {"X-Forwarded-Email": "alice@example.com"}
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers=headers,
+    )
+    assert acquired.status_code == 200, acquired.text
+
+    response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "slash_command",
+            "driver_generation": 1,
+            "source_id": "skill-dispatch-1",
+            "data": {"kind": "skill", "name": "review", "arguments": "this"},
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 202, response.text
+    items = SqlAlchemyConversationStore(db_uri).list_items(session_id).data
+    skill_items = [item for item in items if item.response_id == items[-1].response_id]
+    assert len(skill_items) == 2
+    assert {item.created_by for item in skill_items} == {"alice@example.com"}
+    assert {item.driver_generation for item in skill_items} == {1}
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conversation is not None
+    claim = forwarded[0].pop("driver_claim")
+    assert claim["dispatch_id"]
+    assert claim["source_id"] == "skill-dispatch-1"
+    assert claim["driver_generation"] == 1
+    assert claim["consumer_generation"] == 1
+    assert all(
+        len(claim[key]) == 32 for key in ("dispatch_id", "event_id", "effect_id", "consumer_token")
+    )
+    assert forwarded == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "<skill>review</skill>"}],
+            "agent_id": conversation.agent_id,
+            "model": "test-agent",
+            "has_mcp_servers": False,
+            "persisted_item_id": skill_items[1].id,
+            "driver_generation": 1,
+            "actor": {"run_as": "alice@example.com"},
+        }
+    ]
+    duplicate = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "slash_command",
+            "driver_generation": 1,
+            "source_id": "skill-dispatch-1",
+            "data": {"kind": "skill", "name": "review", "arguments": "this"},
+        },
+        headers=headers,
+    )
+    assert duplicate.status_code == 409, duplicate.text
+    assert "driver dispatch is in progress" in duplicate.text
+    assert len(forwarded) == 1
+
+    SqlAlchemyConversationStore(db_uri).complete_driver_event(
+        session_id,
+        claim["dispatch_id"],
+        consumer_token=claim["consumer_token"],
+        consumer_generation=claim["consumer_generation"],
+        succeeded=True,
+    )
+    completed_duplicate = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "slash_command",
+            "driver_generation": 1,
+            "source_id": "skill-dispatch-1",
+            "data": {"kind": "skill", "name": "review", "arguments": "this"},
+        },
+        headers=headers,
+    )
+    assert completed_duplicate.status_code == 202, completed_duplicate.text
+    assert completed_duplicate.json()["duplicate"] is True
+    assert len(forwarded) == 1
+
+    conflicting = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "slash_command",
+            "driver_generation": 1,
+            "source_id": "skill-dispatch-1",
+            "data": {"kind": "skill", "name": "review", "arguments": "different"},
+        },
+        headers=headers,
+    )
+    assert conflicting.status_code == 409
+    assert "source identity was reused" in conflicting.text
+    assert len(forwarded) == 1
+
+
+@pytest.mark.parametrize(
+    ("event_type", "data", "runner_type"),
+    [
+        ("interrupt", {}, "interrupt"),
+        ("approval", {"elicitation_id": "elicit_test", "action": "accept"}, "approval"),
+        ("compact", {}, "compact"),
+        (
+            "effort_change",
+            {"effort": "high"},
+            "effort_change",
+        ),
+        (
+            "function_call_output",
+            {"call_id": "call_test", "output": "done"},
+            "tool_result",
+        ),
+        ("stop_session", {}, "stop_session"),
+    ],
+)
+async def test_driver_fenced_control_dispatch_propagates_claim(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+    data: dict[str, Any],
+    runner_type: str,
+) -> None:
+    """Every runner-executed control carries the AP's exact consumer claim."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    forwarded: list[dict[str, Any]] = []
+
+    class _Runner:
+        async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+            forwarded.append(kwargs["json"])
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", f"http://runner{path}"),
+            )
+
+    async def _runner(*_: Any, **__: Any) -> _Runner:
+        return _Runner()
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    binding_token = "control-fence-runner-token"
+    store.replace_runner_id(session_id, token_bound_runner_id(binding_token))
+    headers = {"X-Forwarded-Email": "alice@example.com"}
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers=headers,
+    )
+    assert acquired.status_code == 200, acquired.text
+
+    response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": event_type,
+            "driver_generation": 1,
+            "source_id": f"control-{event_type}",
+            "data": data,
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 202, response.text
+    assert forwarded
+    payload = forwarded[-1]
+    assert payload["type"] == runner_type
+    claim = payload["driver_claim"]
+    assert claim["source_id"] == f"control-{event_type}"
+    assert claim["driver_generation"] == 1
+    assert claim["runner_id"] == token_bound_runner_id(binding_token)
+    assert claim["consumer_generation"] == 1
+
+
+async def test_driver_fenced_effort_change_retry_does_not_replay(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed effort retry resolves from its durable source identity."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    forwarded: list[dict[str, Any]] = []
+
+    class _Runner:
+        async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+            forwarded.append(kwargs["json"])
+            return httpx.Response(
+                204,
+                request=httpx.Request("POST", f"http://runner{path}"),
+            )
+
+    async def _runner(*_: Any, **__: Any) -> _Runner:
+        return _Runner()
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    binding_token = "effort-retry-runner-token"
+    store.replace_runner_id(session_id, token_bound_runner_id(binding_token))
+    headers = {"X-Forwarded-Email": "alice@example.com"}
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers=headers,
+    )
+    assert acquired.status_code == 200, acquired.text
+    event = {
+        "type": "effort_change",
+        "driver_generation": 1,
+        "source_id": "effort-drop-1",
+        "data": {"effort": "high"},
+    }
+
+    accepted = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=event,
+        headers=headers,
+    )
+    assert accepted.status_code == 202, accepted.text
+    assert len(forwarded) == 1
+    completed_retry = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=event,
+        headers=headers,
+    )
+    assert completed_retry.status_code == 202, completed_retry.text
+    assert completed_retry.json()["duplicate"] is True
+    assert len(forwarded) == 1
+
+
+@pytest.mark.parametrize("transport_failure", ["timeout", "cancellation"])
+@pytest.mark.parametrize(
+    ("event_type", "event_data"),
+    [("effort_change", {"effort": "high"}), ("interrupt", {})],
+)
+async def test_driver_fenced_control_transport_loss_defers_completion_to_runner(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    transport_failure: str,
+    event_type: str,
+    event_data: dict[str, Any],
+) -> None:
+    """AP transport loss after runner acceptance cannot release control authority."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    forwarded: list[dict[str, Any]] = []
+    runner_accepted = asyncio.Event()
+
+    class _Runner:
+        async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+            forwarded.append(kwargs["json"])
+            runner_accepted.set()
+            request = httpx.Request("POST", f"http://runner{path}")
+            if transport_failure == "cancellation":
+                await asyncio.Future()
+            raise httpx.ReadTimeout("runner terminal response pending", request=request)
+
+    async def _runner(*_: Any, **__: Any) -> _Runner:
+        return _Runner()
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    binding_token = "control-transport-loss-runner-token"
+    runner_id = token_bound_runner_id(binding_token)
+    store.replace_runner_id(session_id, runner_id)
+    alice_headers = {"X-Forwarded-Email": "alice@example.com"}
+    bob_headers = {"X-Forwarded-Email": "bob@example.com"}
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers=alice_headers,
+    )
+    assert acquired.status_code == 200, acquired.text
+    event = {
+        "type": event_type,
+        "driver_generation": 1,
+        "source_id": f"{event_type}-transport-loss-1",
+        "data": event_data,
+    }
+
+    request_task = asyncio.create_task(
+        auth_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json=event,
+            headers=alice_headers,
+        )
+    )
+    await asyncio.wait_for(runner_accepted.wait(), timeout=1.0)
+    if transport_failure == "cancellation":
+        request_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+    else:
+        timed_out = await request_task
+        assert timed_out.status_code == 202, timed_out.text
+    assert runner_accepted.is_set()
+    assert len(forwarded) == 1
+    claim = forwarded[0]["driver_claim"]
+    claim_body = {
+        "dispatch_id": claim["dispatch_id"],
+        "consumer_token": claim["consumer_token"],
+        "consumer_generation": claim["consumer_generation"],
+    }
+    runner_headers = {RUNNER_TUNNEL_TOKEN_HEADER: binding_token}
+    heartbeat = await auth_client.post(
+        f"/v1/runners/{runner_id}/sessions/{session_id}/driver-dispatch/heartbeat",
+        json=claim_body,
+        headers=runner_headers,
+    )
+    assert heartbeat.status_code == 200, heartbeat.text
+
+    active_retry = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=event,
+        headers=alice_headers,
+    )
+    assert active_retry.status_code == 409, active_retry.text
+    assert len(forwarded) == 1
+    manage_grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="alice@example.com",
+        target_user="bob@example.com",
+        level=LEVEL_MANAGE,
+    )
+    assert manage_grant.status_code == 200, manage_grant.text
+    takeover = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30, "force": True},
+        headers=bob_headers,
+    )
+    assert takeover.status_code == 409, takeover.text
+
+    terminal = await auth_client.post(
+        f"/v1/runners/{runner_id}/sessions/{session_id}/driver-dispatch/complete",
+        json=claim_body,
+        headers=runner_headers,
+    )
+    assert terminal.status_code == 200, terminal.text
+    completed_retry = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=event,
+        headers=alice_headers,
+    )
+    assert completed_retry.status_code == 202, completed_retry.text
+    assert completed_retry.json()["duplicate"] is True
+    assert len(forwarded) == 1
+
+
+async def test_bound_runner_lease_state_is_explicit_and_authenticated(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Only the bound runner can prove whether an unfenced event is safe."""
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    binding_token = "lease-state-runner-token"
+    runner_id = token_bound_runner_id(binding_token)
+    SqlAlchemyConversationStore(db_uri).replace_runner_id(session_id, runner_id)
+    headers = {"X-Forwarded-Email": "alice@example.com"}
+
+    unauthenticated = await auth_client.get(
+        f"/v1/runner/sessions/{session_id}/driver-dispatch/lease-state"
+    )
+    assert unauthenticated.status_code == 401
+
+    lease_free = await auth_client.get(
+        f"/v1/runner/sessions/{session_id}/driver-dispatch/lease-state",
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+    )
+    assert lease_free.status_code == 200, lease_free.text
+    assert lease_free.json() == {"requires_driver_claim": False, "generation": None}
+
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers=headers,
+    )
+    assert acquired.status_code == 200, acquired.text
+    leased = await auth_client.get(
+        f"/v1/runner/sessions/{session_id}/driver-dispatch/lease-state",
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+    )
+    assert leased.status_code == 200, leased.text
+    assert leased.json() == {"requires_driver_claim": True, "generation": 1}
+
+    released = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/release",
+        json={"generation": 1},
+        headers=headers,
+    )
+    assert released.status_code == 200, released.text
+    released_state = await auth_client.get(
+        f"/v1/runner/sessions/{session_id}/driver-dispatch/lease-state",
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+    )
+    assert released_state.status_code == 200, released_state.text
+    assert released_state.json() == {"requires_driver_claim": True, "generation": 1}
+
+    direct_resolve = await auth_client.post(
+        f"/v1/sessions/{session_id}/elicitations/elicit_test/resolve",
+        json={"action": "accept"},
+        headers=headers,
+    )
+    assert direct_resolve.status_code == 409, direct_resolve.text
+    assert "fenced events endpoint" in direct_resolve.text
+
+
+async def test_leased_runner_events_require_bound_runner_ingress(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Bearer callers cannot impersonate runner output after lease opt-in."""
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    owner_headers = {"X-Forwarded-Email": "alice@example.com"}
+    binding_token = "runner-binding-token"
+    runner_id = token_bound_runner_id(binding_token)
+    SqlAlchemyConversationStore(db_uri).replace_runner_id(session_id, runner_id)
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers=owner_headers,
+    )
+    assert acquired.status_code == 200, acquired.text
+
+    payload = {
+        "type": "external_session_status",
+        "source_id": "runner-status-1",
+        "data": {"status": "running"},
+    }
+    bearer_only = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=payload,
+        headers=owner_headers,
+    )
+    assert bearer_only.status_code == 403, bearer_only.text
+
+    token_on_human_route = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=payload,
+        headers={**owner_headers, RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+    )
+    assert token_on_human_route.status_code == 403, token_on_human_route.text
+
+    wrong_runner = await auth_client.post(
+        f"/v1/runners/{runner_id}/sessions/{session_id}/events",
+        json=payload,
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: "wrong-token"},
+    )
+    assert wrong_runner.status_code == 401, wrong_runner.text
+
+    accepted = await auth_client.post(
+        f"/v1/runners/{runner_id}/sessions/{session_id}/events",
+        json=payload,
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+    )
+    assert accepted.status_code == 202, accepted.text
+
+    released = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/release",
+        json={"generation": 1},
+        headers=owner_headers,
+    )
+    assert released.status_code == 200, released.text
+    still_runner_only = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={**payload, "source_id": "runner-status-after-release"},
+        headers=owner_headers,
+    )
+    assert still_runner_only.status_code == 403, still_runner_only.text
+
+    forged_input = await auth_client.post(
+        f"/v1/runners/{runner_id}/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "source_id": "runner-input-1",
+            "data": {"role": "user", "content": []},
+        },
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+    )
+    assert forged_input.status_code == 403, forged_input.text
+
+
+async def test_bound_runner_revalidates_consumer_claim_before_execution(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The hidden runner endpoint rejects stale or unauthenticated claims."""
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    binding_token = "runner-validation-token"
+    runner_id = token_bound_runner_id(binding_token)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.replace_runner_id(session_id, runner_id)
+    store.acquire_driver_lease(session_id, "alice@example.com", 30)
+    claim = store.begin_driver_event(
+        session_id,
+        "alice@example.com",
+        1,
+        "message",
+        source_id="runner-validation",
+        payload={"type": "message", "data": {"role": "user", "content": []}},
+    )
+    assert isinstance(claim, DriverDispatchClaim)
+    path = f"/v1/runners/{runner_id}/sessions/{session_id}/driver-dispatch/validate"
+    body = {
+        "dispatch_id": claim.dispatch_id,
+        "consumer_token": claim.consumer_token,
+        "consumer_generation": claim.consumer_generation,
+    }
+
+    unauthenticated = await auth_client.post(path, json=body)
+    assert unauthenticated.status_code == 401
+    valid = await auth_client.post(
+        path,
+        json=body,
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+    )
+    assert valid.status_code == 200, valid.text
+    stale = await auth_client.post(
+        path,
+        json={**body, "consumer_token": "0" * 32},
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+    )
+    assert stale.status_code == 409, stale.text
+    store.complete_driver_event(
+        session_id,
+        claim.dispatch_id,
+        consumer_token=claim.consumer_token,
+        consumer_generation=claim.consumer_generation,
+        succeeded=True,
     )
 
 
@@ -3404,28 +4003,44 @@ async def test_driver_takeover_between_fail_fast_check_and_dispatch_rejects_stal
     )
     assert acquired.status_code == 200
 
-    original_begin = SqlAlchemyConversationStore.begin_driver_event
+    original_enqueue = SqlAlchemyConversationStore.enqueue_driver_event
     took_over = False
 
-    def _take_over_then_begin(
+    def _take_over_then_enqueue(
         store: SqlAlchemyConversationStore,
         event_session_id: str,
         actor_user_id: str,
         generation: int | None,
         event_type: str,
+        *,
+        source_id: str | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> Any:
         nonlocal took_over
         if not took_over:
             took_over = True
             store.acquire_driver_lease(event_session_id, "bob@example.com", 30, force=True)
-        return original_begin(store, event_session_id, actor_user_id, generation, event_type)
+        return original_enqueue(
+            store,
+            event_session_id,
+            actor_user_id,
+            generation,
+            event_type,
+            source_id=source_id,
+            payload=payload,
+        )
 
-    monkeypatch.setattr(SqlAlchemyConversationStore, "begin_driver_event", _take_over_then_begin)
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore,
+        "enqueue_driver_event",
+        _take_over_then_enqueue,
+    )
     response = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
         json={
             "type": "message",
             "driver_generation": 1,
+            "source_id": "takeover-before-begin",
             "data": {
                 "role": "user",
                 "content": [{"type": "input_text", "text": "must be rejected"}],
@@ -3468,7 +4083,7 @@ async def test_expired_dispatch_takeover_after_acceptance_fences_resumed_request
         return _Runner()
 
     async def _driver_barrier(point: str, _: str) -> None:
-        if point == "after_acceptance":
+        if point == "after_claim":
             accepted.set()
             await asyncio.wait_for(resume.wait(), timeout=5)
 
@@ -3498,6 +4113,7 @@ async def test_expired_dispatch_takeover_after_acceptance_fences_resumed_request
             json={
                 "type": "message",
                 "driver_generation": 1,
+                "source_id": "expired-after-acceptance",
                 "data": {
                     "role": "user",
                     "content": [{"type": "input_text", "text": "must stay fenced"}],
@@ -3508,6 +4124,97 @@ async def test_expired_dispatch_takeover_after_acceptance_fences_resumed_request
     )
     try:
         await asyncio.wait_for(accepted.wait(), timeout=5)
+        clock[0] = 401
+        takeover = await auth_client.post(
+            f"/v1/sessions/{session_id}/driver/acquire",
+            json={"ttl_seconds": 30, "force": True},
+            headers={"X-Forwarded-Email": "bob@example.com"},
+        )
+        assert takeover.status_code == 200, takeover.text
+        assert takeover.json()["generation"] == 2
+        resume.set()
+        response = await asyncio.wait_for(event_task, timeout=5)
+        assert response.status_code == 409, response.text
+    finally:
+        resume.set()
+        await asyncio.gather(event_task, return_exceptions=True)
+        del auth_app.state.driver_fence_test_hook
+
+    assert forwarded == []
+    items = SqlAlchemyConversationStore(db_uri).list_items(session_id).data
+    assert not any(
+        item.type == "message"
+        and item.created_by == "alice@example.com"
+        and item.driver_generation == 1
+        for item in items
+    )
+
+
+async def test_takeover_after_pre_persist_renewal_rejects_stale_item(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persistence rechecks the generation atomically after its final renewal."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    forwarded: list[str] = []
+    renewed = asyncio.Event()
+    resume = asyncio.Event()
+    clock = [100]
+
+    class _Runner:
+        async def post(self, path: str, **_: Any) -> httpx.Response:
+            forwarded.append(path)
+            return httpx.Response(202, request=httpx.Request("POST", f"http://runner{path}"))
+
+    async def _runner(*_: Any, **__: Any) -> _Runner:
+        return _Runner()
+
+    async def _driver_barrier(point: str, _: str) -> None:
+        if point == "before_item_persistence_after_renewal":
+            renewed.set()
+            await asyncio.wait_for(resume.wait(), timeout=5)
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
+    monkeypatch.setattr(store_module, "now_epoch", lambda: clock[0])
+    auth_app.state.driver_fence_test_hook = _driver_barrier
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="alice@example.com",
+        target_user="bob@example.com",
+        level=LEVEL_MANAGE,
+    )
+    assert grant.status_code == 200
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert acquired.status_code == 200
+
+    event_task = asyncio.create_task(
+        auth_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "driver_generation": 1,
+                "source_id": "takeover-before-persist",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "atomic fence"}],
+                },
+            },
+            headers={"X-Forwarded-Email": "alice@example.com"},
+        )
+    )
+    try:
+        await asyncio.wait_for(renewed.wait(), timeout=5)
         clock[0] = 401
         takeover = await auth_client.post(
             f"/v1/sessions/{session_id}/driver/acquire",
@@ -3570,6 +4277,7 @@ async def test_driver_event_completes_with_single_default_executor_worker(
                 json={
                     "type": "message",
                     "driver_generation": 1,
+                    "source_id": "single-executor-worker",
                     "data": {
                         "role": "user",
                         "content": [{"type": "input_text", "text": "one worker"}],
@@ -3629,6 +4337,7 @@ async def test_cancelled_driver_event_finishes_dispatch_before_takeover(
             json={
                 "type": "message",
                 "driver_generation": 1,
+                "source_id": "cancelled-driver-event",
                 "data": {
                     "role": "user",
                     "content": [{"type": "input_text", "text": "cancel me"}],
@@ -3658,13 +4367,17 @@ async def test_cancelled_driver_event_finishes_dispatch_before_takeover(
 
 async def test_driver_takeover_is_rejected_at_actual_event_persistence_boundary(
     auth_client: httpx.AsyncClient,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Takeover is fenced while the real route is entering item persistence."""
     from omnigent.server.routes import sessions as sessions_module
 
+    forwarded: list[dict[str, Any]] = []
+
     class _Runner:
-        async def post(self, path: str, **_: Any) -> httpx.Response:
+        async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+            forwarded.append(kwargs["json"])
             return httpx.Response(202, request=httpx.Request("POST", f"http://runner{path}"))
 
     async def _runner(*_: Any, **__: Any) -> _Runner:
@@ -3711,6 +4424,7 @@ async def test_driver_takeover_is_rejected_at_actual_event_persistence_boundary(
             json={
                 "type": "message",
                 "driver_generation": 1,
+                "source_id": "persistence-boundary",
                 "data": {
                     "role": "user",
                     "content": [{"type": "input_text", "text": "persist first"}],
@@ -3734,6 +4448,14 @@ async def test_driver_takeover_is_rejected_at_actual_event_persistence_boundary(
         persistence_release.set()
         event_response = await asyncio.wait_for(event_task, timeout=5)
         assert event_response.status_code == 202, event_response.text
+        claim = forwarded[-1]["driver_claim"]
+        SqlAlchemyConversationStore(db_uri).complete_driver_event(
+            session_id,
+            claim["dispatch_id"],
+            consumer_token=claim["consumer_token"],
+            consumer_generation=claim["consumer_generation"],
+            succeeded=True,
+        )
         takeover_response = await auth_client.post(
             f"/v1/sessions/{session_id}/driver/acquire",
             json={"ttl_seconds": 30, "force": True},
@@ -3765,14 +4487,17 @@ async def test_driver_takeover_is_rejected_before_actual_pending_input_enqueue(
 
     enqueue_entered = asyncio.Event()
     enqueue_release = asyncio.Event()
+    forwarded_claims: list[dict[str, Any]] = []
 
     async def _terminal_ready(*_: Any, **__: Any) -> Any:
         enqueue_entered.set()
         await asyncio.wait_for(enqueue_release.wait(), timeout=5)
         return sessions_module._NativeTerminalEnsureOutcome(error=None, policy_notice=None)
 
-    async def _forward_after_pending(*_: Any, **__: Any) -> None:
-        return None
+    async def _forward_after_pending(*args: Any, **__: Any) -> None:
+        forwarded_body = args[3]
+        assert forwarded_body._driver_claim is not None
+        forwarded_claims.append(dict(forwarded_body._driver_claim))
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
     monkeypatch.setattr(sessions_orchestration, "_ensure_native_terminal_ready", _terminal_ready)
@@ -3813,6 +4538,7 @@ async def test_driver_takeover_is_rejected_before_actual_pending_input_enqueue(
             json={
                 "type": "message",
                 "driver_generation": 1,
+                "source_id": "pending-input-boundary",
                 "data": {
                     "role": "user",
                     "content": [{"type": "input_text", "text": "pending first"}],
@@ -3841,6 +4567,14 @@ async def test_driver_takeover_is_rejected_before_actual_pending_input_enqueue(
         queued = pending_inputs.snapshot_for(session_id)
         assert len(queued) == 1
         assert queued[0]["driver_generation"] == 1
+        claim = forwarded_claims[-1]
+        store.complete_driver_event(
+            session_id,
+            claim["dispatch_id"],
+            consumer_token=claim["consumer_token"],
+            consumer_generation=claim["consumer_generation"],
+            succeeded=True,
+        )
         takeover_response = await auth_client.post(
             f"/v1/sessions/{session_id}/driver/acquire",
             json={"ttl_seconds": 30, "force": True},
@@ -3867,7 +4601,7 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
 
     runner_entered = asyncio.Event()
     runner_release = asyncio.Event()
-    heartbeat_renewed = threading.Event()
+    heartbeat_renewals: queue.Queue[int] = queue.Queue()
     forwarded: list[tuple[str, dict[str, Any]]] = []
     clock = [100]
 
@@ -3889,8 +4623,15 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
         dispatch_id: str,
         **kwargs: Any,
     ) -> None:
+        renewal_started_at = clock[0]
         original_renew(store, event_session_id, dispatch_id, **kwargs)
-        heartbeat_renewed.set()
+        heartbeat_renewals.put(renewal_started_at)
+
+    async def _wait_for_heartbeat_at(expected_time: int) -> None:
+        while True:
+            renewed_at = await asyncio.to_thread(heartbeat_renewals.get, True, 1)
+            if renewed_at >= expected_time:
+                return
 
     monkeypatch.setattr(store_module, "now_epoch", lambda: clock[0])
     monkeypatch.setattr(
@@ -3923,6 +4664,7 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
             json={
                 "type": "message",
                 "driver_generation": 1,
+                "source_id": "runner-dispatch-boundary",
                 "data": {
                     "role": "user",
                     "content": [{"type": "input_text", "text": "serialized input"}],
@@ -3934,10 +4676,10 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
     takeover_task: asyncio.Task[httpx.Response] | None = None
     try:
         await asyncio.wait_for(runner_entered.wait(), timeout=5)
-        heartbeat_renewed.clear()
-        clock[0] = 399
-        assert await asyncio.to_thread(heartbeat_renewed.wait, 1)
+        clock[0] = 101
+        await _wait_for_heartbeat_at(101)
         clock[0] = 400
+        await _wait_for_heartbeat_at(400)
         takeover_task = asyncio.create_task(
             auth_client.post(
                 f"/v1/sessions/{session_id}/driver/acquire",
@@ -3952,6 +4694,14 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
         runner_release.set()
         event_response = await asyncio.wait_for(event_task, timeout=5)
         assert event_response.status_code == 202, event_response.text
+        claim = forwarded[0][1]["json"]["driver_claim"]
+        SqlAlchemyConversationStore(db_uri).complete_driver_event(
+            session_id,
+            claim["dispatch_id"],
+            consumer_token=claim["consumer_token"],
+            consumer_generation=claim["consumer_generation"],
+            succeeded=True,
+        )
         takeover_response = await auth_client.post(
             f"/v1/sessions/{session_id}/driver/acquire",
             json={"ttl_seconds": 30, "force": True},

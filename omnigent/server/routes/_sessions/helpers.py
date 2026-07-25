@@ -1462,6 +1462,7 @@ def _publish_input_consumed(
             type=item.type,
             data=item.data.model_dump() if item.data is not None else {},
             created_by=item.created_by,
+            driver_generation=item.driver_generation,
             cleared_pending_id=cleared_pending_id,
         ),
     )
@@ -2421,6 +2422,8 @@ async def _forward_approval_to_runner(
     session_id: str,
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
+    *,
+    driver_claim: dict[str, Any] | None = None,
 ) -> None:
     """
     Forward an approval verdict to the session's bound runner.
@@ -2441,14 +2444,19 @@ async def _forward_approval_to_runner(
         "action": "accept"}``.
     :param runner_router: Router used to resolve the bound runner, or
         ``None`` in in-process setups (forward skipped).
+    :param driver_claim: Optional durable consumer claim forwarded to
+        the runner for execution-time validation.
     """
     runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
         return
     try:
+        payload: dict[str, Any] = {"type": _APPROVAL_TYPE, "data": data}
+        if driver_claim is not None:
+            payload["driver_claim"] = dict(driver_claim)
         await runner_client.post(
             f"/v1/sessions/{session_id}/events",
-            json={"type": _APPROVAL_TYPE, "data": data},
+            json=payload,
             timeout=10.0,
         )
     except (httpx.HTTPError, ConnectionError):
@@ -4826,6 +4834,8 @@ async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> bool:
 async def _stop_session_via_runner_impl(
     session_id: str,
     runner_router: Any,
+    *,
+    driver_claim: dict[str, Any] | None = None,
 ) -> bool:
     """
     Forward a ``stop_session`` request to the bound runner, surfacing
@@ -4854,6 +4864,8 @@ async def _stop_session_via_runner_impl(
         ``"conv_abc123"``.
     :param runner_router: The session's ``RunnerRouter`` (may be
         ``None`` in tests / in-process setups).
+    :param driver_claim: Optional durable consumer claim forwarded to
+        the runner for execution-time validation.
     :returns: ``True`` if the stop was delivered to a runner (2xx),
         ``False`` if no runner client resolved (nothing forwarded).
     :raises OmnigentError: ``RUNNER_UNAVAILABLE`` (HTTP 503) if the
@@ -4870,9 +4882,12 @@ async def _stop_session_via_runner_impl(
     if runner_client is None:
         return False
     try:
+        payload: dict[str, Any] = {"type": _STOP_SESSION_TYPE}
+        if driver_claim is not None:
+            payload["driver_claim"] = dict(driver_claim)
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
-            json={"type": _STOP_SESSION_TYPE},
+            json=payload,
             timeout=5.0,
         )
     except (httpx.HTTPError, ConnectionError) as exc:
@@ -5239,6 +5254,7 @@ async def _dispatch_skill_slash_command_to_runner(
             arguments=arguments,
         ),
         created_by=created_by,
+        driver_generation=body.driver_generation,
     )
     meta_item = NewConversationItem(
         type="message",
@@ -5249,6 +5265,7 @@ async def _dispatch_skill_slash_command_to_runner(
             is_meta=True,
         ),
         created_by=created_by,
+        driver_generation=body.driver_generation,
     )
     if side_effect_guard is not None:
         await side_effect_guard("before_item_persistence")
@@ -5284,6 +5301,12 @@ async def _dispatch_skill_slash_command_to_runner(
         # right persisted copy (see _forward_event_to_runner).
         "persisted_item_id": persisted_items[1].id,
     }
+    if body.driver_generation is not None:
+        runner_body["driver_generation"] = body.driver_generation
+    if body._driver_claim is not None:
+        runner_body["driver_claim"] = dict(body._driver_claim)
+    if created_by is not None:
+        runner_body["actor"] = _build_actor(created_by)
     effective_runner_override = (
         body.model_override if body.model_override is not None else conv.model_override
     )

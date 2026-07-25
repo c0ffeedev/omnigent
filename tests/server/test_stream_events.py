@@ -27,6 +27,7 @@ from omnigent.server.schemas import (
     PolicyDeniedEvent,
     ServerStreamEvent,
     SessionCreatedEvent,
+    SessionInputConsumedPayload,
     SessionModelOptionsEvent,
     SessionSkillsEvent,
     SessionStatusEvent,
@@ -218,6 +219,36 @@ def test_openapi_json_surfaces_sse_routes_with_typed_schema() -> None:
         "dump_openapi.py must materialize the discriminated union "
         "as a top-level schema for the $ref to resolve."
     )
+
+    consumed = schemas["SessionInputConsumedPayload"]["properties"]
+    assert "created_by" in consumed
+    assert consumed["driver_generation"]["anyOf"][0]["minimum"] == 1
+
+
+def test_openapi_driver_mutations_document_typed_lease_conflicts() -> None:
+    """Lease mutation 409s expose the current lease as structured data."""
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    spec = json.loads((repo_root / "openapi.json").read_text())
+
+    for suffix in ("acquire", "renew", "release", "handoff"):
+        operation = spec["paths"][f"/v1/sessions/{{session_id}}/driver/{suffix}"]["post"]
+        conflict_schema = operation["responses"]["409"]["content"]["application/json"]["schema"]
+        assert conflict_schema["$ref"].endswith("/DriverLeaseConflictResponse")
+
+
+def test_input_consumed_payload_preserves_actor_and_generation() -> None:
+    """Live accepted-input events retain both human attribution fields."""
+    payload = SessionInputConsumedPayload(
+        item_id="item_1",
+        type="message",
+        data={"role": "user", "content": []},
+        created_by="alice@example.com",
+        driver_generation=7,
+    )
+
+    dumped = payload.model_dump()
+    assert dumped["created_by"] == "alice@example.com"
+    assert dumped["driver_generation"] == 7
 
 
 # ── Part 4: New event variants from the session-rearchitecture port ──

@@ -424,7 +424,6 @@ class _FakeFileServerClient:
 
     async def get(self, url: str, **kwargs: Any) -> Any:
         del kwargs
-        self.get_calls.append(url)
 
         class _Response:
             def __init__(
@@ -441,6 +440,9 @@ class _FakeFileServerClient:
             def raise_for_status(self) -> None:
                 return None
 
+        if url.endswith("/driver-dispatch/lease-state"):
+            return _Response(payload={"requires_driver_claim": False})
+        self.get_calls.append(url)
         if url.endswith("/content"):
             return _Response(body=b"png-bytes")
         return _Response(

@@ -1345,6 +1345,8 @@ async def _resolve_elicitation(
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
     conversation_store: ConversationStore | None = None,
+    *,
+    driver_claim: dict[str, Any] | None = None,
 ) -> None:
     """
     Resolve one outstanding elicitation from an approval payload.
@@ -1389,6 +1391,8 @@ async def _resolve_elicitation(
     :param conversation_store: Optional store used to mirror the
         resolved signal into ancestor streams when ``session_id`` is
         a child session. ``None`` keeps the signal scoped locally.
+    :param driver_claim: Optional durable consumer claim forwarded to
+        the runner for execution-time validation.
     """
     # Empty-string default is intentional, NOT a fail-loud miss: the
     # resolve-URL caller always supplies the id (it comes from the URL
@@ -1454,7 +1458,12 @@ async def _resolve_elicitation(
             )
     # Runner-side elicitations (policy approvals, scaffold dispatch)
     # resolve when the canonical approval event reaches the runner.
-    await _forward_approval_to_runner(session_id, data, runner_router)
+    await _forward_approval_to_runner(
+        session_id,
+        data,
+        runner_router,
+        driver_claim=driver_claim,
+    )
 
 
 def _spawn_native_approval_popup_forward(
@@ -3522,6 +3531,8 @@ async def _forward_event_to_runner(
     }
     if body.driver_generation is not None:
         runner_body["driver_generation"] = body.driver_generation
+    if body._driver_claim is not None:
+        runner_body["driver_claim"] = dict(body._driver_claim)
     if created_by is not None:
         runner_body["actor"] = _build_actor(created_by)
     # Forward request-supplied client-side tool schemas so non-native
@@ -3716,11 +3727,12 @@ async def _forward_event_to_runner(
     try:
         if side_effect_guard is not None:
             await side_effect_guard("before_runner_dispatch")
-        await runner_client.post(
+        runner_response = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
             timeout=_RUNNER_FORWARD_TIMEOUT,
         )
+        runner_response.raise_for_status()
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         _publish_input_consumed(session_id, persisted_items[0])

@@ -558,6 +558,8 @@ async def test_runner_resolves_agent_from_server_snapshot_when_msg_lacks_agent_i
         :returns: Snapshot with ``agent_id`` for the session GET; benign
             payloads otherwise so the background turn can proceed.
         """
+        if request.url.path.endswith("/driver-dispatch/lease-state"):
+            return httpx.Response(200, json={"requires_driver_claim": False})
         if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
             return httpx.Response(200, json={"id": conv, "agent_id": resolved_agent_id})
         if request.url.path.endswith("/items"):
@@ -764,6 +766,8 @@ async def test_runner_reloads_full_history_on_cold_cache_after_restart() -> None
             (prior turns + the new message, per invariant I1) for
             ``/items``; benign payloads otherwise.
         """
+        if request.url.path.endswith("/driver-dispatch/lease-state"):
+            return httpx.Response(200, json={"requires_driver_claim": False})
         if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
             return httpx.Response(200, json={"id": conv, "agent_id": "ag_restart"})
         if request.url.path.endswith("/items"):
@@ -908,6 +912,8 @@ async def test_runner_cold_cache_appends_message_when_store_lacks_it() -> None:
             new message, modeling a forward-without-persist) for
             ``/items``; benign payloads otherwise.
         """
+        if request.url.path.endswith("/driver-dispatch/lease-state"):
+            return httpx.Response(200, json={"requires_driver_claim": False})
         if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
             return httpx.Response(200, json={"id": conv, "agent_id": "ag_cold"})
         if request.url.path.endswith("/items"):
@@ -1039,6 +1045,8 @@ async def test_runner_cold_cache_keeps_trailing_user_when_no_persisted_id() -> N
             (no assistant reply, no new message) for ``/items``; benign
             payloads otherwise.
         """
+        if request.url.path.endswith("/driver-dispatch/lease-state"):
+            return httpx.Response(200, json={"requires_driver_claim": False})
         if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
             return httpx.Response(200, json={"id": conv, "agent_id": "ag_keep"})
         if request.url.path.endswith("/items"):
@@ -1161,6 +1169,8 @@ async def test_runner_cold_cache_uses_resolved_message_not_stored_file_id() -> N
             for ``/items``; snapshot for the session GET.
         """
         path = request.url.path
+        if path.endswith("/driver-dispatch/lease-state"):
+            return httpx.Response(200, json={"requires_driver_claim": False})
         if path == f"/v1/sessions/{conv}":
             return httpx.Response(200, json={"id": conv, "agent_id": "ag_media"})
         if path.endswith("/resources/files/file_img/content"):

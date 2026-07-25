@@ -2204,6 +2204,7 @@ def create_runner_app(
     _interrupted_sessions: set[str] = set()
     app.state.interrupted_sessions = _interrupted_sessions
     _background_tasks: set[asyncio.Task[Any]] = set()
+    _driver_terminal_turns: dict[str, tuple[str | None, asyncio.Future[bool]]] = {}
     _subagent_wake_pending: set[str] = set()
 
     _session_histories = _session_histories_ref
@@ -5260,6 +5261,57 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _stop_session_execution(conv_id: str) -> Response:
+        """Stop the underlying execution, not only its asyncio wrapper."""
+        test_hook = getattr(app.state, "driver_fence_stop_test_hook", None)
+        if test_hook is not None:
+            await test_hook(conv_id)
+            return Response(status_code=204)
+        harness = canonicalize_harness(_session_harness_name(conv_id))
+        if harness == "claude-native":
+            return await _handle_claude_native_stop(conv_id)
+        if harness == "codex-native":
+            return await _handle_codex_native_interrupt(conv_id)
+        if harness == "pi-native":
+            return await _handle_pi_native_interrupt(conv_id)
+        if harness == "cursor-native":
+            return await _handle_cursor_native_stop(conv_id)
+        if harness == "goose-native":
+            return await _handle_goose_native_stop(conv_id)
+        if harness == "kiro-native":
+            return await _handle_kiro_native_stop(conv_id)
+        if harness == "hermes-native":
+            return await _handle_hermes_native_stop(conv_id)
+        if harness == "qwen-native":
+            return await _handle_qwen_native_stop(conv_id)
+        if harness == "kimi-native":
+            return await _handle_kimi_native_stop(conv_id)
+        if is_native_harness(harness):
+            terminal_name = native_terminal_name(harness)
+            terminal_registry = (
+                resource_registry.terminal_registry if resource_registry is not None else None
+            )
+            if terminal_name is None or terminal_registry is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "native_stop_unavailable"},
+                )
+            try:
+                await terminal_registry.close(conv_id, terminal_name, "main")
+            except Exception as exc:  # noqa: BLE001 - terminal backends vary
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "native_stop_failed",
+                        "detail": _client_safe_error_detail(exc, context="native stop"),
+                    },
+                )
+            await _cancel_auto_forwarder_task(conv_id)
+            _publish_event(conv_id, {"type": "session.status", "status": "idle"})
+            return Response(status_code=204)
+        await _cancel_inprocess_turn(conv_id)
+        return Response(status_code=204)
+
     async def _handle_claude_native_effort_change(
         conv_id: str,
         effort: str | None,
@@ -6263,15 +6315,148 @@ def create_runner_app(
             _background_tasks.add(_notify_task)
             _notify_task.add_done_callback(_background_tasks.discard)
 
+    async def _driver_claim_action(
+        conversation_id: str,
+        claim: dict[str, Any],
+        action: str,
+        *,
+        succeeded: bool | None = None,
+    ) -> bool | None:
+        payload = {
+            "dispatch_id": claim["dispatch_id"],
+            "consumer_token": claim["consumer_token"],
+            "consumer_generation": claim["consumer_generation"],
+        }
+        path = (
+            f"/v1/runners/{claim['runner_id']}/sessions/{conversation_id}/driver-dispatch/{action}"
+        )
+        params = {"succeeded": succeeded} if succeeded is not None else None
+        try:
+            response = await server_client.post(path, json=payload, params=params, timeout=10.0)
+        except (httpx.HTTPError, ConnectionError, AttributeError, KeyError):
+            return False
+        if response.status_code == 409:
+            return None
+        return response.status_code < 400
+
+    async def _complete_driver_claim(
+        conversation_id: str,
+        claim: dict[str, Any],
+        *,
+        succeeded: bool,
+    ) -> bool:
+        """Retry terminal acknowledgement until the durable dispatch confirms it."""
+        retry_interval = float(getattr(app.state, "driver_completion_retry_interval_seconds", 1.0))
+        while True:
+            result = await _driver_claim_action(
+                conversation_id,
+                claim,
+                "complete",
+                succeeded=succeeded,
+            )
+            if result is not False:
+                return result is True
+            await asyncio.sleep(retry_interval)
+
+    async def _heartbeat_driver_claim(
+        conversation_id: str,
+        claim: dict[str, Any],
+        owner: asyncio.Task[Any] | None,
+        fence_lost: asyncio.Event,
+    ) -> None:
+        while True:
+            interval = getattr(app.state, "driver_heartbeat_interval_seconds", 5.0)
+            await asyncio.sleep(interval)
+            if await _driver_claim_action(conversation_id, claim, "heartbeat") is not True:
+                fence_lost.set()
+                if owner is not None and not owner.done():
+                    owner.cancel("driver dispatch fence lost")
+                return
+
     async def _run_turn_bg(
         msg_body: dict[str, Any],
         conv: str,
         credential_turn_id: str | None,
     ) -> None:
         _subagent_wake_pending.discard(conv)
+        driver_claim = msg_body.pop("_driver_claim", None)
+        heartbeat_task: asyncio.Task[None] | None = None
+        native_terminal: asyncio.Future[bool] | None = None
+        fence_lost = asyncio.Event()
+        complete_claim = False
+        succeeded = False
         try:
-            await _run_turn_bg_setup_and_stream(msg_body, conv, credential_turn_id)
+            if isinstance(driver_claim, dict):
+                test_hook = getattr(app.state, "driver_fence_test_hook", None)
+                if test_hook is not None:
+                    await test_hook("background_pre_execute", driver_claim["dispatch_id"])
+                if not await _driver_claim_action(conv, driver_claim, "validate"):
+                    _on_proxy_stream_end(
+                        conv,
+                        error={"message": "driver dispatch lost authority before execution"},
+                        credential_turn_id=credential_turn_id,
+                    )
+                    return
+                heartbeat_task = asyncio.create_task(
+                    _heartbeat_driver_claim(
+                        conv,
+                        driver_claim,
+                        asyncio.current_task(),
+                        fence_lost,
+                    ),
+                    name=f"driver-heartbeat-{conv}",
+                )
+                native_terminal = asyncio.get_running_loop().create_future()
+            succeeded = await _run_turn_bg_setup_and_stream(
+                msg_body,
+                conv,
+                credential_turn_id,
+                native_terminal=native_terminal,
+            )
+            if native_terminal is not None and not native_terminal.done():
+                native_terminal.set_result(succeeded)
+            complete_claim = True
         except asyncio.CancelledError as exc:
+            registered = _driver_terminal_turns.get(conv)
+            owns_terminal = (
+                native_terminal is not None
+                and registered is not None
+                and registered[1] is native_terminal
+            )
+            if owns_terminal and not _is_native_harness(conv):
+                assert native_terminal is not None
+                if not native_terminal.done():
+                    native_terminal.set_result(False)
+                succeeded = False
+                complete_claim = True
+            external_execution_started = (
+                fence_lost.is_set() and owns_terminal and _is_native_harness(conv)
+            )
+            if external_execution_started:
+                assert native_terminal is not None
+                try:
+                    stop_response = await _stop_session_execution(conv)
+                    if stop_response.status_code >= 400:
+                        _logger.error(
+                            "Native stop returned HTTP %s after driver fence loss for %s",
+                            stop_response.status_code,
+                            conv,
+                        )
+                except Exception:
+                    _logger.exception("Native stop failed after driver fence loss for %s", conv)
+                timeout = getattr(app.state, "driver_termination_timeout_seconds", 10.0)
+                try:
+                    await asyncio.wait_for(asyncio.shield(native_terminal), timeout=timeout)
+                except (TimeoutError, asyncio.CancelledError):
+                    pass
+                else:
+                    complete_claim = True
+                if not complete_claim:
+                    _logger.critical(
+                        "Driver fence lost without correlated termination for %s; "
+                        "retaining the durable execution fence",
+                        conv,
+                    )
             _logger.error(
                 "turn cancelled for %s: %s",
                 conv,
@@ -6296,12 +6481,35 @@ def create_runner_app(
                 error={"message": f"turn setup failed: {exc}"},
                 credential_turn_id=credential_turn_id,
             )
+        finally:
+            if native_terminal is not None:
+                registered = _driver_terminal_turns.get(conv)
+                if registered is not None and registered[1] is native_terminal:
+                    _driver_terminal_turns.pop(conv, None)
+            if isinstance(driver_claim, dict) and complete_claim:
+                completion = asyncio.create_task(
+                    _complete_driver_claim(
+                        conv,
+                        driver_claim,
+                        succeeded=succeeded,
+                    )
+                )
+                _background_tasks.add(completion)
+                completion.add_done_callback(_background_tasks.discard)
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.shield(completion)
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
 
     async def _run_turn_bg_setup_and_stream(
         msg_body: dict[str, Any],
         conv: str,
         credential_turn_id: str | None,
-    ) -> None:
+        *,
+        native_terminal: asyncio.Future[bool] | None = None,
+    ) -> bool:
         _dispatched_agent_id = msg_body.get("agent_id")
         _prior_agent_id = _session_agent_ids.get(conv)
         if (
@@ -6592,6 +6800,12 @@ def create_runner_app(
                 await_notify=False,
             )
 
+        wait_for_native_terminal = native_terminal is not None and is_native_harness(harness_name)
+        if native_terminal is not None:
+            _driver_terminal_turns[conv] = (ctx.turn_id, native_terminal)
+        if wait_for_native_terminal:
+            assert native_terminal is not None
+
         try:
             response = await _stream_message_to_harness(
                 harness_body,
@@ -6601,36 +6815,72 @@ def create_runner_app(
         finally:
             _session_init_envelopes.pop(conv, None)
         if isinstance(response, StreamingResponse):
-            await _drain_streaming_response(response, conv, ctx.turn_id)
-        else:
-            err_detail = "harness returned error response"
-            if hasattr(response, "body"):
-                with contextlib.suppress(
-                    UnicodeDecodeError,
-                    AttributeError,
-                ):
-                    err_detail = response.body.decode(
-                        "utf-8",
-                    )[:200]
-            _logger.error(
-                "turn bg error for %s: %s",
-                conv,
-                err_detail,
-            )
-            _on_proxy_stream_end(
-                conv,
-                error={"message": err_detail},
-                credential_turn_id=ctx.turn_id,
-            )
+            succeeded = await _drain_streaming_response(response, conv, ctx.turn_id)
+            if succeeded and wait_for_native_terminal:
+                assert native_terminal is not None
+                return await asyncio.shield(native_terminal)
+            return succeeded
+        err_detail = "harness returned error response"
+        if hasattr(response, "body"):
+            with contextlib.suppress(
+                UnicodeDecodeError,
+                AttributeError,
+            ):
+                err_detail = response.body.decode(
+                    "utf-8",
+                )[:200]
+        _logger.error(
+            "turn bg error for %s: %s",
+            conv,
+            err_detail,
+        )
+        _on_proxy_stream_end(
+            conv,
+            error={"message": err_detail},
+            credential_turn_id=ctx.turn_id,
+        )
+        return False
 
     async def _drain_streaming_response(
         response: StreamingResponse,
         session_id: str,
         credential_turn_id: str | None,
-    ) -> None:
+    ) -> bool:
+        buffer = ""
+        saw_failure = False
+
+        def observe_sse_frames(*, final: bool = False) -> None:
+            nonlocal buffer, saw_failure
+            frames = buffer.replace("\r\n", "\n").split("\n\n")
+            if not final:
+                buffer = frames.pop()
+            else:
+                buffer = ""
+            for frame in frames:
+                data = "\n".join(
+                    line[5:].lstrip() for line in frame.splitlines() if line.startswith("data:")
+                )
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(data)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(event, dict) and event.get("type") in {
+                    "response.failed",
+                    "response.cancelled",
+                }:
+                    saw_failure = True
+
         try:
-            async for _chunk in response.body_iterator:
-                pass
+            async for chunk in response.body_iterator:
+                buffer += (
+                    chunk.decode("utf-8", errors="replace")
+                    if isinstance(chunk, bytes)
+                    else str(chunk)
+                )
+                observe_sse_frames()
+            observe_sse_frames(final=True)
         except asyncio.CancelledError:
             _active_turns.pop(session_id, None)
             if credential_bridge is not None and credential_turn_id is not None:
@@ -6658,6 +6908,8 @@ def create_runner_app(
                 },
                 credential_turn_id=credential_turn_id,
             )
+            return False
+        return not saw_failure
 
     async def _stream_message_to_harness(
         body: dict[str, Any],
@@ -7349,6 +7601,107 @@ def create_runner_app(
 
         body = await request.json()
         body_type = body.get("type") if isinstance(body, dict) else None
+        if isinstance(body, dict):
+            driver_claim = body.pop("driver_claim", None)
+        else:
+            driver_claim = None
+        execution_event = body_type in {
+            None,
+            "message",
+            "function_call_output",
+            "tool_result",
+            "approval",
+            "compact",
+            "interrupt",
+            "slash_command",
+            "stop_session",
+            "effort_change",
+        }
+        if driver_claim is not None:
+            if not isinstance(driver_claim, dict):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_request",
+                        "detail": "driver_claim must be an object",
+                    },
+                )
+            required_claim_fields = {
+                "dispatch_id",
+                "consumer_token",
+                "consumer_generation",
+                "runner_id",
+            }
+            if not required_claim_fields.issubset(driver_claim):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_request",
+                        "detail": "driver_claim is missing consumer fencing fields",
+                    },
+                )
+            if stream:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_request",
+                        "detail": "driver-fenced turns do not support synchronous streaming",
+                    },
+                )
+            test_hook = getattr(app.state, "driver_fence_test_hook", None)
+            if test_hook is not None:
+                await test_hook("pre_execute", driver_claim["dispatch_id"])
+            if not await _driver_claim_action(conversation_id, driver_claim, "validate"):
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "stale_driver_dispatch",
+                        "detail": "The driver dispatch is no longer authoritative.",
+                    },
+                )
+        elif execution_event:
+            try:
+                lease_state = await server_client.get(
+                    f"/v1/runner/sessions/{conversation_id}/driver-dispatch/lease-state",
+                    timeout=10.0,
+                )
+            except (httpx.HTTPError, ConnectionError, AttributeError):
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "driver_lease_state_unavailable",
+                        "detail": "Could not prove that this session permits unfenced execution.",
+                    },
+                )
+            if lease_state.status_code >= 400:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "driver_lease_state_unavailable",
+                        "detail": "Could not prove that this session permits unfenced execution.",
+                    },
+                )
+            try:
+                lease_payload = lease_state.json()
+            except (TypeError, ValueError):
+                lease_payload = None
+            if not isinstance(lease_payload, dict) or "requires_driver_claim" not in lease_payload:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "driver_lease_state_unavailable",
+                        "detail": "The lease-state response was invalid.",
+                    },
+                )
+            if lease_payload["requires_driver_claim"] is not False:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "missing_driver_claim",
+                        "detail": "An active driver lease requires a fenced dispatch claim.",
+                    },
+                )
+
         _logger.info(
             "post_session_events: conv=%s type=%s active=%s buffer_len=%d content_types=%s",
             conversation_id,
@@ -7370,6 +7723,8 @@ def create_runner_app(
                 )
             message_body = dict(body)
             message_body["conversation_id"] = conversation_id
+            if isinstance(driver_claim, dict):
+                message_body["_driver_claim"] = driver_claim
             try:
                 actor = validate_actor_context(message_body.get("actor"))
             except ValueError as exc:
@@ -7406,6 +7761,16 @@ def create_runner_app(
                     )
 
                 if conversation_id in _active_turns:
+                    if isinstance(driver_claim, dict):
+                        return JSONResponse(
+                            status_code=409,
+                            content={
+                                "error": "driver_turn_busy",
+                                "detail": (
+                                    "A fenced dispatch cannot be buffered into an active turn."
+                                ),
+                            },
+                        )
                     _native = _is_native_harness(conversation_id)
                     _awaiting_approval = pending_approvals.has_pending(conversation_id)
                     _can_forward = (
@@ -7533,28 +7898,123 @@ def create_runner_app(
                     _ingest_now_serving[conversation_id] = _seq + 1
                     _cond.notify_all()
 
+        control_heartbeat: asyncio.Task[None] | None = None
+        control_fence_lost = asyncio.Event()
+        driver_control_terminal = (
+            _driver_terminal_turns.get(conversation_id)
+            if isinstance(driver_claim, dict) and body_type == "interrupt"
+            else None
+        )
+        if isinstance(driver_claim, dict) and execution_event:
+            test_hook = getattr(app.state, "driver_fence_test_hook", None)
+            if test_hook is not None:
+                await test_hook("control_pre_execute", driver_claim["dispatch_id"])
+            if not await _driver_claim_action(conversation_id, driver_claim, "validate"):
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "stale_driver_dispatch",
+                        "detail": "The driver dispatch is no longer authoritative.",
+                    },
+                )
+            owner = asyncio.current_task()
+            control_heartbeat = asyncio.create_task(
+                _heartbeat_driver_claim(
+                    conversation_id,
+                    driver_claim,
+                    owner,
+                    control_fence_lost,
+                ),
+                name=f"driver-control-heartbeat-{conversation_id}",
+            )
+            if owner is not None:
+                owner.add_done_callback(lambda _task: control_heartbeat.cancel())
+
+        async def _finish_driver_control(response: Response) -> Response:
+            """Settle a fenced control claim after its handler reaches a terminal response."""
+            if control_heartbeat is None or not isinstance(driver_claim, dict):
+                return response
+            if response.status_code < 400 and driver_control_terminal is not None:
+                # Native interrupt injection is acceptance, not terminal proof.
+                # Only the exact interrupted turn's status callback resolves
+                # this future; shielding keeps its owner alive if HTTP drops.
+                await asyncio.shield(driver_control_terminal[1])
+            completion = asyncio.create_task(
+                _complete_driver_claim(
+                    conversation_id,
+                    driver_claim,
+                    succeeded=response.status_code < 400,
+                ),
+                name=f"driver-control-complete-{conversation_id}",
+            )
+            _background_tasks.add(completion)
+            completion.add_done_callback(_background_tasks.discard)
+            try:
+                completed = await asyncio.shield(completion)
+            finally:
+                control_heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await control_heartbeat
+            if not completed or control_fence_lost.is_set():
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "stale_driver_dispatch",
+                        "detail": (
+                            "The driver dispatch lost authority before terminal acknowledgement."
+                        ),
+                    },
+                )
+            return response
+
+        async def _poison_driver_control(response: Response) -> Response:
+            """Retain an executing claim when control side-effect outcome is uncertain."""
+            if control_heartbeat is not None:
+                control_heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await control_heartbeat
+            return response
+
         if body_type == "interrupt":
             _harness = _session_harness_name(conversation_id)
             if _harness == "claude-native":
-                return await _handle_claude_native_interrupt(conversation_id)
+                return await _finish_driver_control(
+                    await _handle_claude_native_interrupt(conversation_id)
+                )
             if _harness == "codex-native":
-                return await _handle_codex_native_interrupt(conversation_id)
+                return await _finish_driver_control(
+                    await _handle_codex_native_interrupt(conversation_id)
+                )
             if _harness == "pi-native":
-                return await _handle_pi_native_interrupt(conversation_id)
+                return await _finish_driver_control(
+                    await _handle_pi_native_interrupt(conversation_id)
+                )
             if _harness == "cursor-native":
-                return await _handle_cursor_native_interrupt(conversation_id)
+                return await _finish_driver_control(
+                    await _handle_cursor_native_interrupt(conversation_id)
+                )
             if _harness == "goose-native":
-                return await _handle_goose_native_interrupt(conversation_id)
+                return await _finish_driver_control(
+                    await _handle_goose_native_interrupt(conversation_id)
+                )
             if _harness == "kiro-native":
-                return await _handle_kiro_native_interrupt(conversation_id)
+                return await _finish_driver_control(
+                    await _handle_kiro_native_interrupt(conversation_id)
+                )
             if _harness == "hermes-native":
-                return await _handle_hermes_native_interrupt(conversation_id)
+                return await _finish_driver_control(
+                    await _handle_hermes_native_interrupt(conversation_id)
+                )
             if _harness == "qwen-native":
-                return await _handle_qwen_native_interrupt(conversation_id)
+                return await _finish_driver_control(
+                    await _handle_qwen_native_interrupt(conversation_id)
+                )
             if _harness == "kimi-native":
-                return await _handle_kimi_native_interrupt(conversation_id)
+                return await _finish_driver_control(
+                    await _handle_kimi_native_interrupt(conversation_id)
+                )
             await _cancel_inprocess_turn(conversation_id)
-            return Response(status_code=204)
+            return await _finish_driver_control(Response(status_code=204))
 
         if body_type == "external_session_status":
             data = body.get("data") if isinstance(body, dict) else None
@@ -7606,6 +8066,16 @@ def create_runner_app(
                     active_model_turn = _model_credential_turns.get(conversation_id)
                     if active_model_turn is not None and active_model_turn[0] == forwarded_turn_id:
                         _model_credential_turns.pop(conversation_id, None)
+                driver_terminal = _driver_terminal_turns.get(conversation_id)
+                if driver_terminal is not None:
+                    expected_turn_id, terminal_future = driver_terminal
+                    turn_matches = (
+                        isinstance(expected_turn_id, str)
+                        and bool(expected_turn_id)
+                        and forwarded_turn_id == expected_turn_id
+                    )
+                    if turn_matches and not terminal_future.done():
+                        terminal_future.set_result(status == "idle")
                 # Rebuild a lost / never-registered work entry from the snapshot
                 # first, so a reconnect-wiped map or a sys_session_create child
                 # still wakes the parent instead of being dropped.
@@ -7635,50 +8105,34 @@ def create_runner_app(
             return Response(status_code=204)
 
         if body_type == "stop_session":
-            _harness = _session_harness_name(conversation_id)
-            if _harness == "claude-native":
-                return await _handle_claude_native_stop(conversation_id)
-            if _harness == "codex-native":
-                return await _handle_codex_native_interrupt(conversation_id)
-            if _harness == "pi-native":
-                return await _handle_pi_native_interrupt(conversation_id)
-            if _harness == "cursor-native":
-                return await _handle_cursor_native_stop(conversation_id)
-            if _harness == "goose-native":
-                return await _handle_goose_native_stop(conversation_id)
-            if _harness == "kiro-native":
-                return await _handle_kiro_native_stop(conversation_id)
-            if _harness == "hermes-native":
-                return await _handle_hermes_native_stop(conversation_id)
-            if _harness == "qwen-native":
-                return await _handle_qwen_native_stop(conversation_id)
-            if _harness == "kimi-native":
-                return await _handle_kimi_native_stop(conversation_id)
-            await _cancel_inprocess_turn(conversation_id)
-            return Response(status_code=204)
+            return await _finish_driver_control(await _stop_session_execution(conversation_id))
 
         if body_type == "effort_change":
             harness = _session_harness_name(conversation_id)
             if harness in ("claude-native", "codex-native"):
                 effort = body.get("effort") if isinstance(body, dict) else None
                 if effort is not None and not isinstance(effort, str):
-                    return JSONResponse(
-                        status_code=400,
-                        content={
-                            "error": "invalid_input",
-                            "detail": "Body 'effort' must be a string or null",
-                        },
+                    return await _finish_driver_control(
+                        JSONResponse(
+                            status_code=400,
+                            content={
+                                "error": "invalid_input",
+                                "detail": "Body 'effort' must be a string or null",
+                            },
+                        )
                     )
                 if harness == "codex-native":
-                    return await _handle_codex_native_settings_update(
+                    response = await _handle_codex_native_settings_update(
                         conversation_id,
                         {"effort": effort},
                     )
-                return await _handle_claude_native_effort_change(
-                    conversation_id,
-                    effort,
-                )
-            return Response(status_code=204)
+                else:
+                    response = await _handle_claude_native_effort_change(
+                        conversation_id,
+                        effort,
+                    )
+                return await _finish_driver_control(response)
+            return await _finish_driver_control(Response(status_code=204))
 
         if body_type == "model_change":
             harness = _session_harness_name(conversation_id)
@@ -7757,24 +8211,38 @@ def create_runner_app(
             session_harness_name=_session_harness_name,
         )
         if codex_goal_response is not None:
-            return codex_goal_response
+            return await _finish_driver_control(codex_goal_response)
 
         if body_type == "compact":
             if _session_harness_name(conversation_id) == "claude-native":
-                return await _handle_claude_native_compact(conversation_id)
+                return await _finish_driver_control(
+                    await _handle_claude_native_compact(conversation_id)
+                )
             if _session_harness_name(conversation_id) == "codex-native":
-                return await _handle_codex_native_compact(conversation_id)
+                return await _finish_driver_control(
+                    await _handle_codex_native_compact(conversation_id)
+                )
             if _session_harness_name(conversation_id) == "opencode-native":
-                return await _handle_opencode_native_compact(conversation_id)
+                return await _finish_driver_control(
+                    await _handle_opencode_native_compact(conversation_id)
+                )
             if _session_harness_name(conversation_id) == "cursor-native":
-                return await _handle_cursor_native_compact(conversation_id)
+                return await _finish_driver_control(
+                    await _handle_cursor_native_compact(conversation_id)
+                )
             if _session_harness_name(conversation_id) == "pi-native":
-                return await _handle_pi_native_compact(conversation_id)
+                return await _finish_driver_control(
+                    await _handle_pi_native_compact(conversation_id)
+                )
             if _session_harness_name(conversation_id) == "hermes-native":
-                return await _handle_hermes_native_compact(conversation_id)
+                return await _finish_driver_control(
+                    await _handle_hermes_native_compact(conversation_id)
+                )
             if _session_harness_name(conversation_id) == "qwen-native":
-                return await _handle_qwen_native_compact(conversation_id)
-            return Response(status_code=204)
+                return await _finish_driver_control(
+                    await _handle_qwen_native_compact(conversation_id)
+                )
+            return await _finish_driver_control(Response(status_code=204))
 
         if body_type == "clear":
             if _session_harness_name(conversation_id) == "opencode-native":
@@ -7844,20 +8312,24 @@ def create_runner_app(
         try:
             harness_client = await process_manager.get_client(conversation_id, "any")
         except NoLiveHarnessError:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "error": "no_live_harness",
-                    "detail": "no harness subprocess is running for this conversation",
-                },
+            return await _finish_driver_control(
+                JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "no_live_harness",
+                        "detail": "no harness subprocess is running for this conversation",
+                    },
+                )
             )
         except RuntimeError as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "no_harness",
-                    "detail": _client_safe_error_detail(exc, context="harness lookup"),
-                },
+            return await _finish_driver_control(
+                JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "no_harness",
+                        "detail": _client_safe_error_detail(exc, context="harness lookup"),
+                    },
+                )
             )
         try:
             resp = await harness_client.post(
@@ -7866,15 +8338,17 @@ def create_runner_app(
                 timeout=30.0,
             )
         except Exception as exc:  # noqa: BLE001
-            return JSONResponse(
-                status_code=502,
-                content={
-                    "error": "harness_forward_failed",
-                    "detail": _client_safe_error_detail(exc, context="harness event forward"),
-                    "event_type": body_type,
-                },
+            return await _poison_driver_control(
+                JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": "harness_forward_failed",
+                        "detail": _client_safe_error_detail(exc, context="harness event forward"),
+                        "event_type": body_type,
+                    },
+                )
             )
-        return _forward_harness_response(resp)
+        return await _finish_driver_control(_forward_harness_response(resp))
 
     async def _resolve_conversation_id(response_id: str) -> str | None:
         return _resp_to_conv.get(response_id)

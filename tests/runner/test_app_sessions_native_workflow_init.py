@@ -286,7 +286,11 @@ class _HistoryFileServerClient(_FakeFileServerClient):
         }
 
     async def get(self, url: str, **kwargs: Any) -> Any:
-        if self._fail_file_fetch and not url.endswith("/items"):
+        if (
+            self._fail_file_fetch
+            and not url.endswith("/items")
+            and not url.endswith("/driver-dispatch/lease-state")
+        ):
             self.get_calls.append(url)
             raise httpx.ConnectError("file resource endpoint unreachable")
         response = await super().get(url, **kwargs)

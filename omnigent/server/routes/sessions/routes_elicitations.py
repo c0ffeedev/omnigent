@@ -10,6 +10,7 @@ from fastapi import (
     Request,
 )
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     pending_elicitations,
@@ -117,6 +118,13 @@ def register_elicitations_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
+        if getattr(conversation_store, "supports_driver_leases", False):
+            lease = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
+            if lease is not None:
+                raise OmnigentError(
+                    "Driver-managed sessions must resolve approvals through the fenced events endpoint.",
+                    code=ErrorCode.CONFLICT,
+                )
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
         await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
         # Apply any policy writes deferred by the relay tool-call ASK gate

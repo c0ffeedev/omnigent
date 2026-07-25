@@ -1515,6 +1515,7 @@ class SqlSessionDriverEvent(ConversationBase):
     previous_holder_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     generation: Mapped[int] = mapped_column(Integer, nullable=False)
     input_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
 
     __table_args__ = (
@@ -1545,6 +1546,12 @@ class SqlSessionDriverDispatch(ConversationBase):
     actor_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
     generation: Mapped[int] = mapped_column(Integer, nullable=False)
     input_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    event_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    effect_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    consumer_token: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    consumer_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     state: Mapped[str] = mapped_column(String(16), nullable=False)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     completed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -1553,7 +1560,11 @@ class SqlSessionDriverDispatch(ConversationBase):
     __table_args__ = (
         CheckConstraint("generation > 0", name="ck_session_driver_dispatches_generation_positive"),
         CheckConstraint(
-            "state IN ('running', 'completed', 'failed')",
+            "consumer_generation >= 0",
+            name="ck_session_driver_dispatches_consumer_generation_nonnegative",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'running', 'executing', 'completed', 'failed')",
             name="ck_session_driver_dispatches_state",
         ),
         CheckConstraint(
@@ -1561,7 +1572,12 @@ class SqlSessionDriverDispatch(ConversationBase):
             name="ck_session_driver_dispatches_claim_window",
         ),
         CheckConstraint(
-            "(state = 'running' AND completed_at IS NULL AND claim_expires_at IS NOT NULL) OR "
+            "(state = 'pending' AND consumer_token IS NULL AND consumer_generation = 0 "
+            "AND completed_at IS NULL AND claim_expires_at IS NULL) OR "
+            "(state = 'running' AND consumer_token IS NOT NULL AND consumer_generation > 0 "
+            "AND completed_at IS NULL AND claim_expires_at IS NOT NULL) OR "
+            "(state = 'executing' AND consumer_token IS NOT NULL AND consumer_generation > 0 "
+            "AND completed_at IS NULL AND claim_expires_at IS NOT NULL) OR "
             "(state IN ('completed', 'failed') AND completed_at IS NOT NULL "
             "AND claim_expires_at IS NULL)",
             name="ck_session_driver_dispatches_lifecycle",
@@ -1572,6 +1588,12 @@ class SqlSessionDriverDispatch(ConversationBase):
             "session_id",
             "state",
             "claim_expires_at",
+        ),
+        UniqueConstraint(
+            "workspace_id",
+            "session_id",
+            "source_id",
+            name="uq_session_driver_dispatches_source",
         ),
     )
 

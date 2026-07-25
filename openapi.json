@@ -1329,6 +1329,60 @@
         "title": "DriverLeaseAcquireRequest",
         "type": "object"
       },
+      "DriverLeaseConflictBody": {
+        "description": "Structured error payload for a driver lease conflict.",
+        "properties": {
+          "code": {
+            "const": "conflict",
+            "title": "Code",
+            "type": "string"
+          },
+          "details": {
+            "$ref": "#/components/schemas/DriverLeaseConflictDetails"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "details"
+        ],
+        "title": "DriverLeaseConflictBody",
+        "type": "object"
+      },
+      "DriverLeaseConflictDetails": {
+        "description": "Machine-readable state returned when driver fencing rejects a request.",
+        "properties": {
+          "driver_lease": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DriverLeaseResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "title": "DriverLeaseConflictDetails",
+        "type": "object"
+      },
+      "DriverLeaseConflictResponse": {
+        "description": "HTTP 409 response carrying the authoritative current driver lease.",
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/DriverLeaseConflictBody"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "DriverLeaseConflictResponse",
+        "type": "object"
+      },
       "DriverLeaseGenerationRequest": {
         "description": "Generation-fenced renew/release request.",
         "properties": {
@@ -4199,6 +4253,20 @@
             "description": "Decoded item payload, e.g. `{\"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": \"Hello\"}]}`. Heterogeneous and `type`-specific.",
             "title": "Data",
             "type": "object"
+          },
+          "driver_generation": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Lease fencing generation accepted with the input, or `None` for legacy lease-free sessions.",
+            "title": "Driver Generation"
           },
           "item_id": {
             "description": "Stable identifier of the conversation item just persisted, e.g. `\"item_abc123\"`.",
@@ -10476,6 +10544,16 @@
             },
             "description": "Successful Response"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriverLeaseConflictResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -10527,6 +10605,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriverLeaseConflictResponse"
+                }
+              }
+            },
+            "description": "Conflict"
           },
           "422": {
             "content": {
@@ -10580,6 +10668,16 @@
             },
             "description": "Successful Response"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriverLeaseConflictResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -10631,6 +10729,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriverLeaseConflictResponse"
+                }
+              }
+            },
+            "description": "Conflict"
           },
           "422": {
             "content": {
