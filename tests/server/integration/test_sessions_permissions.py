@@ -4671,7 +4671,9 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
         heartbeat_renewed.clear()
         clock[0] = 101
         assert await asyncio.to_thread(heartbeat_renewed.wait, 1)
+        heartbeat_renewed.clear()
         clock[0] = 400
+        assert await asyncio.to_thread(heartbeat_renewed.wait, 1)
         takeover_task = asyncio.create_task(
             auth_client.post(
                 f"/v1/sessions/{session_id}/driver/acquire",

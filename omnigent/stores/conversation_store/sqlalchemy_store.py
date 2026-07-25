@@ -2562,16 +2562,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 and dispatch.claim_expires_at is not None
                 and dispatch.claim_expires_at > now
             )
-            active_lease = (
+            matching_lease = (
                 lease is not None
                 and dispatch is not None
                 and lease.holder_user_id == dispatch.actor_user_id
                 and lease.generation == dispatch.generation
-                and lease.expires_at is not None
-                and lease.expires_at > now
-                and lease.released_at is None
             )
-            if not active_claim or not active_lease:
+            if not active_claim or not matching_lease:
                 raise DriverLeaseConflictError("driver dispatch is no longer active")
             if dispatch is not None:
                 dispatch.state = "executing"
@@ -2602,9 +2599,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 or dispatch.session_id != session_id
                 or lease.holder_user_id != dispatch.actor_user_id
                 or lease.generation != dispatch.generation
-                or lease.expires_at is None
-                or lease.expires_at <= now
-                or lease.released_at is not None
             ):
                 raise DriverLeaseConflictError("driver dispatch is no longer active")
             result = session.execute(

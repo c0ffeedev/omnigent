@@ -390,6 +390,40 @@ def test_expired_executing_dispatch_remains_fenced_until_terminal_confirmation(
     assert takeover.generation == 2
 
 
+def test_active_dispatch_outlives_base_driver_lease(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An accepted claim remains authoritative after its base lease expires."""
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    session_id = conversation_store.create_conversation().id
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 100)
+    conversation_store.acquire_driver_lease(session_id, ALICE, 5)
+    claim = _begin_claim(
+        conversation_store,
+        session_id,
+        ALICE,
+        1,
+        claim_ttl_seconds=10,
+    )
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 106)
+    conversation_store.validate_driver_event(
+        session_id,
+        claim.dispatch_id,
+        consumer_token=claim.consumer_token,
+        consumer_generation=claim.consumer_generation,
+    )
+    _renew_claim(conversation_store, session_id, claim, claim_ttl_seconds=10)
+    with pytest.raises(DriverLeaseConflictError, match="dispatch is in progress"):
+        conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
+
+    _complete_claim(conversation_store, session_id, claim, succeeded=True)
+    takeover = conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
+    assert takeover.generation == 2
+
+
 def test_dispatch_heartbeat_renews_before_boundary_and_expires_at_boundary(
     conversation_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
