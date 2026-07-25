@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import secrets
-import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Annotated, Any
 
@@ -723,24 +722,17 @@ def register_events_routes(
             if begin_driver_event is None:
                 raise RuntimeError("conversation store cannot atomically begin driver dispatches")
             def _begin() -> DriverDispatchClaim | str | None:
-                try:
-                    return begin_driver_event(
-                        session_id,
-                        driver_actor_user_id,
-                        body.driver_generation,
-                        body.type,
-                        source_id=body.source_id or uuid.uuid4().hex,
-                        payload=body.model_dump(exclude_none=True),
-                    )
-                except TypeError as exc:
-                    if "source_id" not in str(exc) and "payload" not in str(exc):
-                        raise
-                    return begin_driver_event(
-                        session_id,
-                        driver_actor_user_id,
-                        body.driver_generation,
-                        body.type,
-                    )
+                return begin_driver_event(
+                    session_id,
+                    driver_actor_user_id,
+                    body.driver_generation,
+                    body.type,
+                    source_id=body.source_id,
+                    payload=body.model_dump(
+                        exclude={"driver_generation", "source_id"},
+                        exclude_none=True,
+                    ),
+                )
 
             try:
                 acceptance = asyncio.create_task(asyncio.to_thread(_begin))

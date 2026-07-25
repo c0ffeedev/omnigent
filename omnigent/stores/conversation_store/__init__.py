@@ -399,7 +399,12 @@ class ConversationStore(ABC):
         payload: dict[str, Any] | None = None,
         claim_ttl_seconds: int = DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
     ) -> DriverDispatchClaim | str | None:
-        """Atomically validate, accept, and claim a human driver event."""
+        """Atomically validate, accept, and claim a human driver event.
+
+        Lease-protected events require ``source_id``. Its idempotency scope is
+        ``(workspace_id, session_id, source_id)``; retries must preserve the
+        actor, lease generation, event type, and canonical payload.
+        """
         raise NotImplementedError
 
     def renew_driver_event(

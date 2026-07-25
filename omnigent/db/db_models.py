@@ -1546,12 +1546,12 @@ class SqlSessionDriverDispatch(ConversationBase):
     actor_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
     generation: Mapped[int] = mapped_column(Integer, nullable=False)
     input_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    event_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
-    source_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    effect_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    consumer_token: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
-    consumer_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    event_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    effect_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    consumer_token: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    consumer_generation: Mapped[int] = mapped_column(Integer, nullable=False)
     state: Mapped[str] = mapped_column(String(16), nullable=False)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     completed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -1560,7 +1560,7 @@ class SqlSessionDriverDispatch(ConversationBase):
     __table_args__ = (
         CheckConstraint("generation > 0", name="ck_session_driver_dispatches_generation_positive"),
         CheckConstraint(
-            "consumer_generation IS NULL OR consumer_generation > 0",
+            "consumer_generation > 0",
             name="ck_session_driver_dispatches_consumer_generation_positive",
         ),
         CheckConstraint(
