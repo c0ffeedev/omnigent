@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Iterator
 
@@ -77,6 +78,20 @@ def test_driver_acquire_handoff_and_release_are_keyboard_operable(
         owner_control = owner.get_by_test_id("driver-control")
         expect(owner_control).to_contain_text("No active driver", timeout=15_000)
 
+        # The header and composer consume the same authoritative coordination
+        # cache. Pin their initial agreement before exercising mutations so a
+        # regression cannot leave one surface showing stale ownership.
+        owner.get_by_test_id("coordination-status-trigger").click()
+        owner_status = owner.get_by_test_id("coordination-status-popover")
+        expect(owner_status).to_contain_text("No active driver")
+        expect(
+            owner_status.get_by_test_id(f"coordination-participant-{ADMIN_EMAIL}")
+        ).to_be_visible()
+        expect(
+            owner_status.get_by_test_id(f"coordination-participant-{collaborator_email}")
+        ).to_be_visible()
+        owner.keyboard.press("Escape")
+
         take_control = owner.get_by_role("button", name="Take control")
         take_control.focus()
         with owner.expect_response(
@@ -88,6 +103,9 @@ def test_driver_acquire_handoff_and_release_are_keyboard_operable(
             owner.keyboard.press("Enter")
         assert acquire_response.value.status == 200
         expect(owner_control.get_by_role("status")).to_contain_text("You now have control")
+        expect(owner.get_by_test_id("coordination-status-trigger")).to_have_attribute(
+            "aria-label", re.compile(rf"{re.escape(ADMIN_EMAIL)} is driver")
+        )
 
         target = owner.get_by_role("combobox", name="Transfer control to")
         target.click()
@@ -114,6 +132,12 @@ def test_driver_acquire_handoff_and_release_are_keyboard_operable(
         )
         collaborator_control = collaborator.get_by_test_id("driver-control")
         expect(collaborator_control).to_contain_text("You have control", timeout=15_000)
+        for page in (owner, collaborator):
+            expect(page.get_by_test_id("coordination-status-trigger")).to_have_attribute(
+                "aria-label",
+                re.compile(rf"{re.escape(collaborator_email)} is driver"),
+                timeout=15_000,
+            )
 
         release = collaborator.get_by_role("button", name="Release control")
         release.focus()
@@ -134,6 +158,23 @@ def test_driver_acquire_handoff_and_release_are_keyboard_operable(
         assert release_response.value.status == 200
         expect(collaborator_control.get_by_role("status")).to_contain_text("Control released")
         expect(owner_control).to_contain_text("No active driver", timeout=15_000)
+        for page in (owner, collaborator):
+            expect(page.get_by_test_id("coordination-status-trigger")).to_have_attribute(
+                "aria-label", re.compile("no active driver"), timeout=15_000
+            )
+
+        # Lease mutations are also persisted as a server-authoritative audit
+        # trail. Opening the dialog after all three actions verifies the UI/API
+        # projection and latest-first ordering through the real store.
+        owner.get_by_role("button", name="Activity history").click()
+        activity = owner.get_by_role("dialog", name="Coordination activity")
+        rows = activity.get_by_role("list", name="Coordination activity").get_by_role("listitem")
+        expect(rows).to_have_count(3, timeout=15_000)
+        expect(rows.nth(0)).to_contain_text(f"{collaborator_email} released control")
+        expect(rows.nth(1)).to_contain_text(
+            f"{ADMIN_EMAIL} handed control to {collaborator_email}"
+        )
+        expect(rows.nth(2)).to_contain_text(f"{ADMIN_EMAIL} took control")
     finally:
         owner_context.close()
         collaborator_context.close()
