@@ -3278,6 +3278,13 @@ async def test_leased_runner_events_require_bound_runner_ingress(
     )
     assert bearer_only.status_code == 403, bearer_only.text
 
+    token_on_human_route = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=payload,
+        headers={**owner_headers, RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+    )
+    assert token_on_human_route.status_code == 403, token_on_human_route.text
+
     wrong_runner = await auth_client.post(
         f"/v1/runners/{runner_id}/sessions/{session_id}/events",
         json=payload,
@@ -3529,6 +3536,96 @@ async def test_expired_dispatch_takeover_after_acceptance_fences_resumed_request
     )
     try:
         await asyncio.wait_for(accepted.wait(), timeout=5)
+        clock[0] = 401
+        takeover = await auth_client.post(
+            f"/v1/sessions/{session_id}/driver/acquire",
+            json={"ttl_seconds": 30, "force": True},
+            headers={"X-Forwarded-Email": "bob@example.com"},
+        )
+        assert takeover.status_code == 200, takeover.text
+        assert takeover.json()["generation"] == 2
+        resume.set()
+        response = await asyncio.wait_for(event_task, timeout=5)
+        assert response.status_code == 409, response.text
+    finally:
+        resume.set()
+        await asyncio.gather(event_task, return_exceptions=True)
+        del auth_app.state.driver_fence_test_hook
+
+    assert forwarded == []
+    items = SqlAlchemyConversationStore(db_uri).list_items(session_id).data
+    assert not any(
+        item.type == "message"
+        and item.created_by == "alice@example.com"
+        and item.driver_generation == 1
+        for item in items
+    )
+
+
+async def test_takeover_after_pre_persist_renewal_rejects_stale_item(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persistence rechecks the generation atomically after its final renewal."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    forwarded: list[str] = []
+    renewed = asyncio.Event()
+    resume = asyncio.Event()
+    clock = [100]
+
+    class _Runner:
+        async def post(self, path: str, **_: Any) -> httpx.Response:
+            forwarded.append(path)
+            return httpx.Response(202, request=httpx.Request("POST", f"http://runner{path}"))
+
+    async def _runner(*_: Any, **__: Any) -> _Runner:
+        return _Runner()
+
+    async def _driver_barrier(point: str, _: str) -> None:
+        if point == "before_item_persistence_after_renewal":
+            renewed.set()
+            await asyncio.wait_for(resume.wait(), timeout=5)
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
+    monkeypatch.setattr(store_module, "now_epoch", lambda: clock[0])
+    auth_app.state.driver_fence_test_hook = _driver_barrier
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="alice@example.com",
+        target_user="bob@example.com",
+        level=LEVEL_MANAGE,
+    )
+    assert grant.status_code == 200
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert acquired.status_code == 200
+
+    event_task = asyncio.create_task(
+        auth_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "driver_generation": 1,
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "atomic fence"}],
+                },
+            },
+            headers={"X-Forwarded-Email": "alice@example.com"},
+        )
+    )
+    try:
+        await asyncio.wait_for(renewed.wait(), timeout=5)
         clock[0] = 401
         takeover = await auth_client.post(
             f"/v1/sessions/{session_id}/driver/acquire",
