@@ -467,6 +467,87 @@ def register_events_routes(
             raise await _driver_lease_conflict(exc, session_id) from exc
         return {"valid": True}
 
+    async def _require_bound_runner(request: Request, runner_id: str, session_id: str) -> Any:
+        tunnel_token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+        if not tunnel_token or token_bound_runner_id(tunnel_token) != runner_id:
+            raise OmnigentError("runner binding token is invalid", code=ErrorCode.UNAUTHORIZED)
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        if conv.runner_id != runner_id:
+            raise OmnigentError("runner is not bound to this session", code=ErrorCode.FORBIDDEN)
+        return conv
+
+    @router.get(
+        "/runner/sessions/{session_id}/driver-dispatch/lease-state",
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def driver_dispatch_lease_state(request: Request, session_id: str) -> dict[str, Any]:
+        """Tell a bound runner whether execution requires a fenced claim."""
+        tunnel_token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+        runner_id = token_bound_runner_id(tunnel_token) if tunnel_token else None
+        if runner_id is None:
+            raise OmnigentError("runner binding token is invalid", code=ErrorCode.UNAUTHORIZED)
+        await _require_bound_runner(request, runner_id, session_id)
+        lease = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
+        return {
+            "requires_driver_claim": lease is not None and lease.is_active(),
+            "generation": lease.generation if lease is not None and lease.is_active() else None,
+        }
+
+    @router.post(
+        "/runners/{runner_id}/sessions/{session_id}/driver-dispatch/heartbeat",
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def heartbeat_driver_dispatch(
+        request: Request,
+        runner_id: str,
+        session_id: str,
+        body: DriverDispatchValidationRequest,
+    ) -> dict[str, bool]:
+        """Renew the claim held by the runner's actual executing turn."""
+        await _require_bound_runner(request, runner_id, session_id)
+        try:
+            await asyncio.to_thread(
+                conversation_store.renew_driver_event,
+                session_id,
+                body.dispatch_id,
+                consumer_token=body.consumer_token,
+                consumer_generation=body.consumer_generation,
+            )
+        except DriverLeaseConflictError as exc:
+            raise await _driver_lease_conflict(exc, session_id) from exc
+        return {"valid": True}
+
+    @router.post(
+        "/runners/{runner_id}/sessions/{session_id}/driver-dispatch/complete",
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def complete_driver_dispatch(
+        request: Request,
+        runner_id: str,
+        session_id: str,
+        body: DriverDispatchValidationRequest,
+        succeeded: bool = True,
+    ) -> dict[str, bool]:
+        """Record terminal completion from the runner's executing turn."""
+        await _require_bound_runner(request, runner_id, session_id)
+        try:
+            await asyncio.to_thread(
+                conversation_store.complete_driver_event,
+                session_id,
+                body.dispatch_id,
+                consumer_token=body.consumer_token,
+                consumer_generation=body.consumer_generation,
+                succeeded=succeeded,
+            )
+        except DriverLeaseConflictError as exc:
+            raise await _driver_lease_conflict(exc, session_id) from exc
+        return {"completed": True}
+
     @router.post(
         "/runners/{runner_id}/sessions/{session_id}/events",
         include_in_schema=False,
@@ -602,19 +683,10 @@ def register_events_routes(
                 if conv is None:
                     raise _session_not_found()
             if _is_runner_originated_event(body):
-                get_driver_lease = getattr(conversation_store, "get_driver_lease", None)
-                lease = (
-                    await asyncio.to_thread(get_driver_lease, session_id)
-                    if get_driver_lease is not None
-                    else None
+                raise OmnigentError(
+                    "runner-originated events require dedicated runner ingress",
+                    code=ErrorCode.FORBIDDEN,
                 )
-                if lease is not None and lease.is_active() and (
-                    not tunnel_token or token_bound_runner_id(tunnel_token) != conv.runner_id
-                ):
-                    raise OmnigentError(
-                        "runner-originated events require runner authentication",
-                        code=ErrorCode.FORBIDDEN,
-                    )
         runner_actor = _validated_runner_actor(
             body.actor,
             tunnel_token=tunnel_token,
@@ -840,10 +912,18 @@ def register_events_routes(
             _start_driver_heartbeat()
             await _guard_driver_side_effect("after_claim")
 
-        async def _finish_driver_response(response: Any) -> Any:
+        async def _finish_driver_response(response: Any, *, defer_to_runner: bool = False) -> Any:
             """Finish durable dispatch state before FastAPI emits a success."""
-            if driver_dispatch_id is None:
+            if driver_dispatch_claim is None:
                 return response
+            if defer_to_runner:
+                assert driver_heartbeat_task is not None
+                driver_heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await driver_heartbeat_task
+                request.state.driver_dispatch = None
+                return response
+            assert driver_dispatch_id is not None
             assert driver_heartbeat_task is not None
             driver_heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1075,7 +1155,14 @@ def register_events_routes(
                 try:
                     interrupt_resp = await runner_client.post(
                         f"/v1/sessions/{session_id}/events",
-                        json={"type": "interrupt"},
+                        json={
+                            "type": "interrupt",
+                            **(
+                                {"driver_claim": dict(body._driver_claim)}
+                                if body._driver_claim is not None
+                                else {}
+                            ),
+                        },
                         timeout=5.0,
                     )
                     interrupt_delivered = interrupt_resp.status_code < 400
@@ -1111,7 +1198,11 @@ def register_events_routes(
             # of closing the dialog as if it succeeded.
             try:
                 await _guard_driver_side_effect("before_stop_dispatch")
-                stop_delivered = await _stop_session_via_runner(session_id, runner_router)
+                stop_delivered = await _stop_session_via_runner(
+                    session_id,
+                    runner_router,
+                    driver_claim=body._driver_claim,
+                )
             except Exception:
                 # Stop didn't land: the turn keeps running, so lift the
                 # fence or its remaining output is dropped forever.
@@ -1185,7 +1276,13 @@ def register_events_routes(
             # to the runner for runner-side (policy) elicitations.
             # The dedicated URL endpoint (``.../elicitations/{eid}/
             # resolve``) routes through the same helper.
-            await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
+            await _resolve_elicitation(
+                session_id,
+                body.data,
+                runner_router,
+                conversation_store,
+                driver_claim=body._driver_claim,
+            )
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
             await _guard_driver_side_effect("before_approval_policy_writes")
@@ -1251,7 +1348,14 @@ def register_events_routes(
             runner_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
-                {"type": _COMPACT_TYPE},
+                {
+                    "type": _COMPACT_TYPE,
+                    **(
+                        {"driver_claim": dict(body._driver_claim)}
+                        if body._driver_claim is not None
+                        else {}
+                    ),
+                },
             )
             if runner_result is not None and runner_result.status_code == 200:
                 return await _finish_driver_response({"queued": False})
@@ -1589,6 +1693,11 @@ def register_events_routes(
                         "type": "tool_result",
                         "call_id": body.data["call_id"],
                         "output": body.data["output"],
+                        **(
+                            {"driver_claim": dict(body._driver_claim)}
+                            if body._driver_claim is not None
+                            else {}
+                        ),
                     },
                     timeout=10.0,
                 )
@@ -1905,7 +2014,10 @@ def register_events_routes(
                 raise await _driver_lease_conflict(exc, session_id) from exc
             if pending_background_title is not None:
                 pending_background_title.schedule()
-            return await _finish_driver_response({"queued": True, "item_id": item_id})
+            return await _finish_driver_response(
+                {"queued": True, "item_id": item_id},
+                defer_to_runner=body._driver_claim is not None,
+            )
         try:
             dispatch = await _dispatch_session_event_to_runner(
                 session_id,
@@ -1937,7 +2049,10 @@ def register_events_routes(
         # stability) and relies on stableKey + FIFO instead.
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
-        return await _finish_driver_response(response)
+        return await _finish_driver_response(
+            response,
+            defer_to_runner=body._driver_claim is not None and body.type == "message",
+        )
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 

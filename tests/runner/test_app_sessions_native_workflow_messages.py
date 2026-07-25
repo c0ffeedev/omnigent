@@ -636,6 +636,8 @@ class _GatedFileServerClient:
     async def get(self, url: str, **kwargs: Any) -> Any:
         """Return a file response; park on the gated file's metadata GET."""
         del kwargs
+        if url.endswith("/driver-dispatch/lease-state"):
+            return _GatedFileServerClient._Resp(payload={"requires_driver_claim": False})
         self.get_calls.append(url)
         if url.endswith("/content"):
             return _GatedFileServerClient._Resp(body=b"png-bytes")
@@ -957,6 +959,15 @@ class _FakeServerClient:
     ) -> Any:
         del timeout
         params = params or {}
+        if url.endswith("/driver-dispatch/lease-state"):
+
+            class _LeaseResp:
+                status_code = 200
+
+                def json(self) -> dict[str, Any]:
+                    return {"requires_driver_claim": False}
+
+            return _LeaseResp()
         self.get_calls.append(dict(params))
 
         # Session snapshot GET (e.g. /v1/sessions/{id}, no /items suffix).

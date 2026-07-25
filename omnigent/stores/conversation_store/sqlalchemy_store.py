@@ -2554,7 +2554,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 dispatch is not None
                 and dispatch.consumer_token == consumer_token
                 and dispatch.consumer_generation == consumer_generation
-                and dispatch.state == "running"
+                and dispatch.state in {"running", "executing"}
                 and dispatch.claim_expires_at is not None
                 and dispatch.claim_expires_at > now
             )
@@ -2569,7 +2569,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             if not active_claim or not active_lease:
                 raise DriverLeaseConflictError("driver dispatch is no longer active")
-            dispatch.state = "executing"
+            if dispatch is not None:
+                dispatch.state = "executing"
 
     def renew_driver_event(
         self,

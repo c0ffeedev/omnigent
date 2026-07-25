@@ -2422,6 +2422,8 @@ async def _forward_approval_to_runner(
     session_id: str,
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
+    *,
+    driver_claim: dict[str, Any] | None = None,
 ) -> None:
     """
     Forward an approval verdict to the session's bound runner.
@@ -2442,14 +2444,19 @@ async def _forward_approval_to_runner(
         "action": "accept"}``.
     :param runner_router: Router used to resolve the bound runner, or
         ``None`` in in-process setups (forward skipped).
+    :param driver_claim: Optional durable consumer claim forwarded to
+        the runner for execution-time validation.
     """
     runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
         return
     try:
+        payload: dict[str, Any] = {"type": _APPROVAL_TYPE, "data": data}
+        if driver_claim is not None:
+            payload["driver_claim"] = dict(driver_claim)
         await runner_client.post(
             f"/v1/sessions/{session_id}/events",
-            json={"type": _APPROVAL_TYPE, "data": data},
+            json=payload,
             timeout=10.0,
         )
     except (httpx.HTTPError, ConnectionError):
@@ -4827,6 +4834,8 @@ async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> bool:
 async def _stop_session_via_runner_impl(
     session_id: str,
     runner_router: Any,
+    *,
+    driver_claim: dict[str, Any] | None = None,
 ) -> bool:
     """
     Forward a ``stop_session`` request to the bound runner, surfacing
@@ -4855,6 +4864,8 @@ async def _stop_session_via_runner_impl(
         ``"conv_abc123"``.
     :param runner_router: The session's ``RunnerRouter`` (may be
         ``None`` in tests / in-process setups).
+    :param driver_claim: Optional durable consumer claim forwarded to
+        the runner for execution-time validation.
     :returns: ``True`` if the stop was delivered to a runner (2xx),
         ``False`` if no runner client resolved (nothing forwarded).
     :raises OmnigentError: ``RUNNER_UNAVAILABLE`` (HTTP 503) if the
@@ -4871,9 +4882,12 @@ async def _stop_session_via_runner_impl(
     if runner_client is None:
         return False
     try:
+        payload: dict[str, Any] = {"type": _STOP_SESSION_TYPE}
+        if driver_claim is not None:
+            payload["driver_claim"] = dict(driver_claim)
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
-            json={"type": _STOP_SESSION_TYPE},
+            json=payload,
             timeout=5.0,
         )
     except (httpx.HTTPError, ConnectionError) as exc:

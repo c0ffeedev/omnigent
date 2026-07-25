@@ -37,8 +37,13 @@ class NullServerClient:
         :param kwargs: Extra keyword arguments (ignored).
         :returns: Stub 200 response with empty JSON body.
         """
-        del url, kwargs
-        return self._Response()
+        del kwargs
+        response = self._Response()
+        if url.endswith("/driver-dispatch/lease-state"):
+            response.json = lambda: {  # type: ignore[method-assign]
+                "requires_driver_claim": False
+            }
+        return response
 
     async def post(self, url: str, **kwargs: Any) -> _Response:
         """Return an empty 200 for any POST request.

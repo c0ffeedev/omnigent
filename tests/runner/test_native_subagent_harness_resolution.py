@@ -109,6 +109,8 @@ class _SubAgentSnapshotServer(NullServerClient):
 
     async def get(self, url: str, **kwargs: Any) -> Any:
         del kwargs
+        if url.endswith("/driver-dispatch/lease-state"):
+            return await super().get(url)
         # The bare session GET carries the snapshot the runner needs.
         if url.rstrip("/").endswith(CHILD_SESSION_ID):
             return self._Resp(

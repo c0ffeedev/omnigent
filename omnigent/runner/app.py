@@ -2204,6 +2204,7 @@ def create_runner_app(
     _interrupted_sessions: set[str] = set()
     app.state.interrupted_sessions = _interrupted_sessions
     _background_tasks: set[asyncio.Task[Any]] = set()
+    _driver_terminal_turns: dict[str, tuple[str | None, asyncio.Future[bool]]] = {}
     _subagent_wake_pending: set[str] = set()
 
     _session_histories = _session_histories_ref
@@ -6263,14 +6264,73 @@ def create_runner_app(
             _background_tasks.add(_notify_task)
             _notify_task.add_done_callback(_background_tasks.discard)
 
+    async def _driver_claim_action(
+        conversation_id: str,
+        claim: dict[str, Any],
+        action: str,
+        *,
+        succeeded: bool | None = None,
+    ) -> bool:
+        payload = {
+            "dispatch_id": claim["dispatch_id"],
+            "consumer_token": claim["consumer_token"],
+            "consumer_generation": claim["consumer_generation"],
+        }
+        path = (
+            f"/v1/runners/{claim['runner_id']}/sessions/{conversation_id}/driver-dispatch/{action}"
+        )
+        params = {"succeeded": succeeded} if succeeded is not None else None
+        try:
+            response = await server_client.post(path, json=payload, params=params, timeout=10.0)
+        except (httpx.HTTPError, ConnectionError, AttributeError, KeyError):
+            return False
+        return response.status_code < 400
+
+    async def _heartbeat_driver_claim(
+        conversation_id: str,
+        claim: dict[str, Any],
+        owner: asyncio.Task[Any] | None,
+    ) -> None:
+        while True:
+            await asyncio.sleep(5.0)
+            if not await _driver_claim_action(conversation_id, claim, "heartbeat"):
+                if owner is not None and not owner.done():
+                    owner.cancel("driver dispatch fence lost")
+                return
+
     async def _run_turn_bg(
         msg_body: dict[str, Any],
         conv: str,
         credential_turn_id: str | None,
     ) -> None:
         _subagent_wake_pending.discard(conv)
+        driver_claim = msg_body.pop("_driver_claim", None)
+        heartbeat_task: asyncio.Task[None] | None = None
+        native_terminal: asyncio.Future[bool] | None = None
+        succeeded = False
         try:
-            await _run_turn_bg_setup_and_stream(msg_body, conv, credential_turn_id)
+            if isinstance(driver_claim, dict):
+                test_hook = getattr(app.state, "driver_fence_test_hook", None)
+                if test_hook is not None:
+                    await test_hook("background_pre_execute", driver_claim["dispatch_id"])
+                if not await _driver_claim_action(conv, driver_claim, "validate"):
+                    _on_proxy_stream_end(
+                        conv,
+                        error={"message": "driver dispatch lost authority before execution"},
+                        credential_turn_id=credential_turn_id,
+                    )
+                    return
+                heartbeat_task = asyncio.create_task(
+                    _heartbeat_driver_claim(conv, driver_claim, asyncio.current_task()),
+                    name=f"driver-heartbeat-{conv}",
+                )
+                native_terminal = asyncio.get_running_loop().create_future()
+            succeeded = await _run_turn_bg_setup_and_stream(
+                msg_body,
+                conv,
+                credential_turn_id,
+                native_terminal=native_terminal,
+            )
         except asyncio.CancelledError as exc:
             _logger.error(
                 "turn cancelled for %s: %s",
@@ -6296,12 +6356,34 @@ def create_runner_app(
                 error={"message": f"turn setup failed: {exc}"},
                 credential_turn_id=credential_turn_id,
             )
+        finally:
+            if native_terminal is not None:
+                registered = _driver_terminal_turns.get(conv)
+                if registered is not None and registered[1] is native_terminal:
+                    _driver_terminal_turns.pop(conv, None)
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
+            if isinstance(driver_claim, dict):
+                completion = asyncio.create_task(
+                    _driver_claim_action(
+                        conv,
+                        driver_claim,
+                        "complete",
+                        succeeded=succeeded,
+                    )
+                )
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.shield(completion)
 
     async def _run_turn_bg_setup_and_stream(
         msg_body: dict[str, Any],
         conv: str,
         credential_turn_id: str | None,
-    ) -> None:
+        *,
+        native_terminal: asyncio.Future[bool] | None = None,
+    ) -> bool:
         _dispatched_agent_id = msg_body.get("agent_id")
         _prior_agent_id = _session_agent_ids.get(conv)
         if (
@@ -6592,6 +6674,11 @@ def create_runner_app(
                 await_notify=False,
             )
 
+        wait_for_native_terminal = native_terminal is not None and is_native_harness(harness_name)
+        if wait_for_native_terminal:
+            assert native_terminal is not None
+            _driver_terminal_turns[conv] = (ctx.turn_id, native_terminal)
+
         try:
             response = await _stream_message_to_harness(
                 harness_body,
@@ -6601,33 +6688,37 @@ def create_runner_app(
         finally:
             _session_init_envelopes.pop(conv, None)
         if isinstance(response, StreamingResponse):
-            await _drain_streaming_response(response, conv, ctx.turn_id)
-        else:
-            err_detail = "harness returned error response"
-            if hasattr(response, "body"):
-                with contextlib.suppress(
-                    UnicodeDecodeError,
-                    AttributeError,
-                ):
-                    err_detail = response.body.decode(
-                        "utf-8",
-                    )[:200]
-            _logger.error(
-                "turn bg error for %s: %s",
-                conv,
-                err_detail,
-            )
-            _on_proxy_stream_end(
-                conv,
-                error={"message": err_detail},
-                credential_turn_id=ctx.turn_id,
-            )
+            succeeded = await _drain_streaming_response(response, conv, ctx.turn_id)
+            if succeeded and wait_for_native_terminal:
+                assert native_terminal is not None
+                return await native_terminal
+            return succeeded
+        err_detail = "harness returned error response"
+        if hasattr(response, "body"):
+            with contextlib.suppress(
+                UnicodeDecodeError,
+                AttributeError,
+            ):
+                err_detail = response.body.decode(
+                    "utf-8",
+                )[:200]
+        _logger.error(
+            "turn bg error for %s: %s",
+            conv,
+            err_detail,
+        )
+        _on_proxy_stream_end(
+            conv,
+            error={"message": err_detail},
+            credential_turn_id=ctx.turn_id,
+        )
+        return False
 
     async def _drain_streaming_response(
         response: StreamingResponse,
         session_id: str,
         credential_turn_id: str | None,
-    ) -> None:
+    ) -> bool:
         try:
             async for _chunk in response.body_iterator:
                 pass
@@ -6658,6 +6749,8 @@ def create_runner_app(
                 },
                 credential_turn_id=credential_turn_id,
             )
+            return False
+        return True
 
     async def _stream_message_to_harness(
         body: dict[str, Any],
@@ -7353,6 +7446,17 @@ def create_runner_app(
             driver_claim = body.pop("driver_claim", None)
         else:
             driver_claim = None
+        execution_event = body_type in {
+            None,
+            "message",
+            "function_call_output",
+            "tool_result",
+            "approval",
+            "compact",
+            "interrupt",
+            "slash_command",
+            "stop_session",
+        }
         if driver_claim is not None:
             if not isinstance(driver_claim, dict):
                 return JSONResponse(
@@ -7376,35 +7480,65 @@ def create_runner_app(
                         "detail": "driver_claim is missing consumer fencing fields",
                     },
                 )
+            if stream:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_request",
+                        "detail": "driver-fenced turns do not support synchronous streaming",
+                    },
+                )
             test_hook = getattr(app.state, "driver_fence_test_hook", None)
             if test_hook is not None:
                 await test_hook("pre_execute", driver_claim["dispatch_id"])
-            try:
-                validation = await server_client.post(
-                    "/v1/runners/"
-                    f"{driver_claim['runner_id']}/sessions/{conversation_id}/"
-                    "driver-dispatch/validate",
-                    json={
-                        "dispatch_id": driver_claim["dispatch_id"],
-                        "consumer_token": driver_claim["consumer_token"],
-                        "consumer_generation": driver_claim["consumer_generation"],
-                    },
-                    timeout=10.0,
-                )
-            except httpx.HTTPError:
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": "driver_validation_unavailable",
-                        "detail": "Could not revalidate the driver dispatch.",
-                    },
-                )
-            if validation.status_code >= 400:
+            if not await _driver_claim_action(conversation_id, driver_claim, "validate"):
                 return JSONResponse(
                     status_code=409,
                     content={
                         "error": "stale_driver_dispatch",
                         "detail": "The driver dispatch is no longer authoritative.",
+                    },
+                )
+        elif execution_event:
+            try:
+                lease_state = await server_client.get(
+                    f"/v1/runner/sessions/{conversation_id}/driver-dispatch/lease-state",
+                    timeout=10.0,
+                )
+            except (httpx.HTTPError, ConnectionError, AttributeError):
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "driver_lease_state_unavailable",
+                        "detail": "Could not prove that this session permits unfenced execution.",
+                    },
+                )
+            if lease_state.status_code >= 400:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "driver_lease_state_unavailable",
+                        "detail": "Could not prove that this session permits unfenced execution.",
+                    },
+                )
+            try:
+                lease_payload = lease_state.json()
+            except (TypeError, ValueError):
+                lease_payload = None
+            if not isinstance(lease_payload, dict) or "requires_driver_claim" not in lease_payload:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "driver_lease_state_unavailable",
+                        "detail": "The lease-state response was invalid.",
+                    },
+                )
+            if lease_payload["requires_driver_claim"] is not False:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "missing_driver_claim",
+                        "detail": "An active driver lease requires a fenced dispatch claim.",
                     },
                 )
         _logger.info(
@@ -7428,6 +7562,8 @@ def create_runner_app(
                 )
             message_body = dict(body)
             message_body["conversation_id"] = conversation_id
+            if isinstance(driver_claim, dict):
+                message_body["_driver_claim"] = driver_claim
             try:
                 actor = validate_actor_context(message_body.get("actor"))
             except ValueError as exc:
@@ -7464,6 +7600,16 @@ def create_runner_app(
                     )
 
                 if conversation_id in _active_turns:
+                    if isinstance(driver_claim, dict):
+                        return JSONResponse(
+                            status_code=409,
+                            content={
+                                "error": "driver_turn_busy",
+                                "detail": (
+                                    "A fenced dispatch cannot be buffered into an active turn."
+                                ),
+                            },
+                        )
                     _native = _is_native_harness(conversation_id)
                     _awaiting_approval = pending_approvals.has_pending(conversation_id)
                     _can_forward = (
@@ -7664,6 +7810,17 @@ def create_runner_app(
                     active_model_turn = _model_credential_turns.get(conversation_id)
                     if active_model_turn is not None and active_model_turn[0] == forwarded_turn_id:
                         _model_credential_turns.pop(conversation_id, None)
+                driver_terminal = _driver_terminal_turns.get(conversation_id)
+                if driver_terminal is not None:
+                    expected_turn_id, terminal_future = driver_terminal
+                    turn_matches = (
+                        not expected_turn_id
+                        or not isinstance(forwarded_turn_id, str)
+                        or not forwarded_turn_id
+                        or forwarded_turn_id == expected_turn_id
+                    )
+                    if turn_matches and not terminal_future.done():
+                        terminal_future.set_result(status == "idle")
                 # Rebuild a lost / never-registered work entry from the snapshot
                 # first, so a reconnect-wiped map or a sys_session_create child
                 # still wakes the parent instead of being dropped.
