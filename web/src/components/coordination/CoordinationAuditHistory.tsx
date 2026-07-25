@@ -11,6 +11,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { fetchCoordinationAuditPage, type CoordinationAuditRecord } from "@/lib/coordinationApi";
+import { coordinationAuditQueryKey } from "@/lib/coordinationState";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { ApiError } from "@/lib/sessionsApi";
 import { cn } from "@/lib/utils";
@@ -135,7 +136,9 @@ export interface CoordinationAuditHistoryProps {
 /** Paginated, read-only projection of server-persisted coordination events. */
 export function CoordinationAuditHistory({ sessionId, className }: CoordinationAuditHistoryProps) {
   const query = useInfiniteQuery({
-    queryKey: ["coordination", sessionId, "audit-history"],
+    // Keep the infinite-page shape distinct from the flat compatibility query
+    // while sharing a prefix so lease mutations can invalidate both.
+    queryKey: [...coordinationAuditQueryKey(sessionId), "history"],
     queryFn: ({ pageParam, signal }) =>
       fetchCoordinationAuditPage(sessionId, {
         cursor: pageParam,

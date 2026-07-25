@@ -38,6 +38,7 @@ vi.mock("@/lib/identity", () => ({
 }));
 
 import { DriverLeaseConflictError, type DriverLease } from "@/lib/coordinationApi";
+import { coordinationAuditQueryKey } from "@/lib/coordinationState";
 import { useCoordination } from "./useCoordination";
 
 const currentLease: DriverLease = {
@@ -106,6 +107,27 @@ describe("useCoordination", () => {
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
 
+    unmount();
+  });
+
+  it("invalidates persisted audit history after a successful lease action", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const invalidateQueries = vi.spyOn(client, "invalidateQueries");
+    renewDriverLeaseMock.mockResolvedValueOnce({ ...currentLease, renewedAt: 20 });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+    const { result, unmount } = renderHook(() => useCoordination("sess-1"), { wrapper });
+
+    await waitFor(() => expect(result.current.connectionState).toBe("connected"));
+    await act(async () => {
+      await result.current.renew({ generation: currentLease.generation });
+    });
+
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: coordinationAuditQueryKey("sess-1"),
+    });
     unmount();
   });
 
