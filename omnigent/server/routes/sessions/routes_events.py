@@ -682,11 +682,15 @@ def register_events_routes(
                 conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
                 if conv is None:
                     raise _session_not_found()
-            if _is_runner_originated_event(body):
-                raise OmnigentError(
-                    "runner-originated events require dedicated runner ingress",
-                    code=ErrorCode.FORBIDDEN,
-                )
+            if _is_runner_originated_event(body) and getattr(
+                conversation_store, "supports_driver_leases", False
+            ):
+                lease = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
+                if lease is not None and lease.is_active():
+                    raise OmnigentError(
+                        "runner-originated events require dedicated runner ingress",
+                        code=ErrorCode.FORBIDDEN,
+                    )
         runner_actor = _validated_runner_actor(
             body.actor,
             tunnel_token=tunnel_token,

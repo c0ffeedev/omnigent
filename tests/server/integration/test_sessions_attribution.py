@@ -240,6 +240,9 @@ class _CaptureRunnerClient:
             headers: dict[str, str] = {}
             text = ""
 
+            def raise_for_status(self) -> None:
+                pass
+
         return _Resp()
 
     async def get(self, *_: Any, **__: Any) -> Any:
