@@ -36,6 +36,7 @@ from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_OWNER, LEVEL_RE
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+from omnigent.stores.conversation_store import DriverDispatchClaim
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -3223,11 +3224,13 @@ async def test_driver_fenced_skill_dispatch_preserves_actor_and_generation(
     conversation = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conversation is not None
     claim = forwarded[0].pop("driver_claim")
+    assert claim["dispatch_id"]
     assert claim["source_id"] == "skill-dispatch-1"
     assert claim["driver_generation"] == 1
-    assert "consumer_token" not in claim
-    assert "consumer_generation" not in claim
-    assert all(len(claim[key]) == 32 for key in ("event_id", "effect_id"))
+    assert claim["consumer_generation"] == 1
+    assert all(
+        len(claim[key]) == 32 for key in ("dispatch_id", "event_id", "effect_id", "consumer_token")
+    )
     assert forwarded == [
         {
             "type": "message",
@@ -3331,6 +3334,57 @@ async def test_leased_runner_events_require_bound_runner_ingress(
         headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
     )
     assert forged_input.status_code == 403, forged_input.text
+
+
+async def test_bound_runner_revalidates_consumer_claim_before_execution(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The hidden runner endpoint rejects stale or unauthenticated claims."""
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    binding_token = "runner-validation-token"
+    runner_id = token_bound_runner_id(binding_token)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.replace_runner_id(session_id, runner_id)
+    store.acquire_driver_lease(session_id, "alice@example.com", 30)
+    claim = store.begin_driver_event(
+        session_id,
+        "alice@example.com",
+        1,
+        "message",
+        source_id="runner-validation",
+        payload={"type": "message", "data": {"role": "user", "content": []}},
+    )
+    assert isinstance(claim, DriverDispatchClaim)
+    path = f"/v1/runners/{runner_id}/sessions/{session_id}/driver-dispatch/validate"
+    body = {
+        "dispatch_id": claim.dispatch_id,
+        "consumer_token": claim.consumer_token,
+        "consumer_generation": claim.consumer_generation,
+    }
+
+    unauthenticated = await auth_client.post(path, json=body)
+    assert unauthenticated.status_code == 401
+    valid = await auth_client.post(
+        path,
+        json=body,
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+    )
+    assert valid.status_code == 200, valid.text
+    stale = await auth_client.post(
+        path,
+        json={**body, "consumer_token": "0" * 32},
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+    )
+    assert stale.status_code == 409, stale.text
+    store.complete_driver_event(
+        session_id,
+        claim.dispatch_id,
+        consumer_token=claim.consumer_token,
+        consumer_generation=claim.consumer_generation,
+        succeeded=True,
+    )
 
 
 async def test_lease_free_event_route_preserves_legacy_wire_shape(
@@ -3454,10 +3508,10 @@ async def test_driver_takeover_between_fail_fast_check_and_dispatch_rejects_stal
     )
     assert acquired.status_code == 200
 
-    original_begin = SqlAlchemyConversationStore.begin_driver_event
+    original_enqueue = SqlAlchemyConversationStore.enqueue_driver_event
     took_over = False
 
-    def _take_over_then_begin(
+    def _take_over_then_enqueue(
         store: SqlAlchemyConversationStore,
         event_session_id: str,
         actor_user_id: str,
@@ -3471,7 +3525,7 @@ async def test_driver_takeover_between_fail_fast_check_and_dispatch_rejects_stal
         if not took_over:
             took_over = True
             store.acquire_driver_lease(event_session_id, "bob@example.com", 30, force=True)
-        return original_begin(
+        return original_enqueue(
             store,
             event_session_id,
             actor_user_id,
@@ -3481,7 +3535,11 @@ async def test_driver_takeover_between_fail_fast_check_and_dispatch_rejects_stal
             payload=payload,
         )
 
-    monkeypatch.setattr(SqlAlchemyConversationStore, "begin_driver_event", _take_over_then_begin)
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore,
+        "enqueue_driver_event",
+        _take_over_then_enqueue,
+    )
     response = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
         json={
@@ -3530,7 +3588,7 @@ async def test_expired_dispatch_takeover_after_acceptance_fences_resumed_request
         return _Runner()
 
     async def _driver_barrier(point: str, _: str) -> None:
-        if point == "after_acceptance":
+        if point == "after_claim":
             accepted.set()
             await asyncio.wait_for(resume.wait(), timeout=5)
 
@@ -4088,7 +4146,7 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
     try:
         await asyncio.wait_for(runner_entered.wait(), timeout=5)
         heartbeat_renewed.clear()
-        clock[0] = 399
+        clock[0] = 101
         assert await asyncio.to_thread(heartbeat_renewed.wait, 1)
         clock[0] = 400
         takeover_task = asyncio.create_task(

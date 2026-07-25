@@ -1543,8 +1543,8 @@ class SqlSessionDriverDispatch(ConversationBase):
     event_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
     source_id: Mapped[str] = mapped_column(String(128), nullable=False)
     effect_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    consumer_token: Mapped[str] = mapped_column(Uuid16(), nullable=False)
-    consumer_generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    consumer_token: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    consumer_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     state: Mapped[str] = mapped_column(String(16), nullable=False)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     completed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -1553,11 +1553,11 @@ class SqlSessionDriverDispatch(ConversationBase):
     __table_args__ = (
         CheckConstraint("generation > 0", name="ck_session_driver_dispatches_generation_positive"),
         CheckConstraint(
-            "consumer_generation > 0",
-            name="ck_session_driver_dispatches_consumer_generation_positive",
+            "consumer_generation >= 0",
+            name="ck_session_driver_dispatches_consumer_generation_nonnegative",
         ),
         CheckConstraint(
-            "state IN ('running', 'completed', 'failed')",
+            "state IN ('pending', 'running', 'executing', 'completed', 'failed')",
             name="ck_session_driver_dispatches_state",
         ),
         CheckConstraint(
@@ -1565,7 +1565,12 @@ class SqlSessionDriverDispatch(ConversationBase):
             name="ck_session_driver_dispatches_claim_window",
         ),
         CheckConstraint(
-            "(state = 'running' AND completed_at IS NULL AND claim_expires_at IS NOT NULL) OR "
+            "(state = 'pending' AND consumer_token IS NULL AND consumer_generation = 0 "
+            "AND completed_at IS NULL AND claim_expires_at IS NULL) OR "
+            "(state = 'running' AND consumer_token IS NOT NULL AND consumer_generation > 0 "
+            "AND completed_at IS NULL AND claim_expires_at IS NOT NULL) OR "
+            "(state = 'executing' AND consumer_token IS NOT NULL AND consumer_generation > 0 "
+            "AND completed_at IS NULL AND claim_expires_at IS NOT NULL) OR "
             "(state IN ('completed', 'failed') AND completed_at IS NOT NULL "
             "AND claim_expires_at IS NULL)",
             name="ck_session_driver_dispatches_lifecycle",

@@ -16,7 +16,11 @@ from omnigent.db.db_models import (
     SqlSessionDriverEvent,
     workspace_scope,
 )
-from omnigent.stores.conversation_store import DriverDispatchClaim, DriverLeaseConflictError
+from omnigent.stores.conversation_store import (
+    DriverDispatchClaim,
+    DriverDispatchEnvelope,
+    DriverLeaseConflictError,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -44,6 +48,35 @@ def _begin_claim(
     )
     assert isinstance(claim, DriverDispatchClaim)
     return claim
+
+
+def _enqueue_claim(
+    store: SqlAlchemyConversationStore,
+    session_id: str,
+    actor_user_id: str,
+    generation: int,
+    *,
+    source_id: str = "test-event",
+    payload: dict[str, Any] | None = None,
+    claim_ttl_seconds: int = 30,
+) -> tuple[DriverDispatchEnvelope, DriverDispatchClaim]:
+    envelope = store.enqueue_driver_event(
+        session_id,
+        actor_user_id,
+        generation,
+        "message",
+        source_id=source_id,
+        payload=payload,
+    )
+    assert isinstance(envelope, DriverDispatchEnvelope)
+    claim = store.claim_driver_event(
+        session_id,
+        envelope.dispatch_id,
+        actor_user_id,
+        generation,
+        claim_ttl_seconds=claim_ttl_seconds,
+    )
+    return envelope, claim
 
 
 def _renew_claim(
@@ -1139,3 +1172,158 @@ def test_consumer_claim_recovery_rotates_fence_and_preserves_effect_identity(
         consumer_generation=recovered.consumer_generation,
         succeeded=True,
     )
+
+
+def test_outbox_enqueue_is_durable_before_consumer_claim(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Acceptance commits a payload-bearing pending row before any consumer owns it."""
+    session_id = conversation_store.create_conversation().id
+    conversation_store.acquire_driver_lease(session_id, ALICE, 30)
+    payload = {"type": "message", "data": {"text": "durable"}}
+
+    envelope = conversation_store.enqueue_driver_event(
+        session_id,
+        ALICE,
+        1,
+        "message",
+        source_id="durable-before-claim",
+        payload=payload,
+    )
+
+    assert isinstance(envelope, DriverDispatchEnvelope)
+    assert envelope.payload == payload
+    assert envelope.completed is False
+    with conversation_store._conv_session() as session:
+        row = session.get(SqlSessionDriverDispatch, (0, envelope.dispatch_id))
+        assert row is not None
+        assert row.state == "pending"
+        assert row.consumer_token is None
+        assert row.consumer_generation == 0
+        assert row.claim_expires_at is None
+
+
+def test_pending_outbox_fences_lease_transitions_until_accepting_lease_expires(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The enqueue/claim split cannot be overtaken while accepted work is pending."""
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    session_id = conversation_store.create_conversation().id
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 100)
+    conversation_store.acquire_driver_lease(session_id, ALICE, 5)
+    envelope = conversation_store.enqueue_driver_event(
+        session_id,
+        ALICE,
+        1,
+        "message",
+        source_id="pause-after-enqueue",
+        payload={"type": "message", "data": {"text": "accepted"}},
+    )
+    assert isinstance(envelope, DriverDispatchEnvelope)
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 101)
+    with pytest.raises(DriverLeaseConflictError, match="dispatch is in progress"):
+        conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
+    with pytest.raises(DriverLeaseConflictError, match="dispatch is in progress"):
+        conversation_store.release_driver_lease(session_id, ALICE, 1)
+    with pytest.raises(DriverLeaseConflictError, match="dispatch is in progress"):
+        conversation_store.handoff_driver_lease(session_id, ALICE, BOB, 1, 30)
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 105)
+    takeover = conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
+    assert takeover.generation == 2
+    with conversation_store._conv_session() as session:
+        row = session.get(SqlSessionDriverDispatch, (0, envelope.dispatch_id))
+        assert row is not None
+        assert row.state == "failed"
+        assert row.completed_at == 105
+    with pytest.raises(DriverLeaseConflictError, match="stale, expired, or not held"):
+        conversation_store.claim_driver_event(
+            session_id,
+            envelope.dispatch_id,
+            ALICE,
+            1,
+        )
+
+
+def test_claim_loads_canonical_payload_and_heartbeat_is_separate(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claim returns stored work while only an explicit heartbeat extends ownership."""
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    session_id = conversation_store.create_conversation().id
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 100)
+    conversation_store.acquire_driver_lease(session_id, ALICE, 60)
+    payload = {"type": "message", "data": {"text": "stored"}}
+    envelope, claim = _enqueue_claim(
+        conversation_store,
+        session_id,
+        ALICE,
+        1,
+        source_id="claim-payload",
+        payload=payload,
+        claim_ttl_seconds=10,
+    )
+
+    assert claim.dispatch_id == envelope.dispatch_id
+    assert claim.payload == payload
+    assert claim.claim_expires_at == 110
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 104)
+    conversation_store.validate_driver_event(
+        session_id,
+        claim.dispatch_id,
+        consumer_token=claim.consumer_token,
+        consumer_generation=claim.consumer_generation,
+    )
+    with conversation_store._conv_session() as session:
+        row = session.get(SqlSessionDriverDispatch, (0, claim.dispatch_id))
+        assert row is not None
+        assert row.claim_expires_at == 110
+
+    _renew_claim(conversation_store, session_id, claim, claim_ttl_seconds=10)
+    with conversation_store._conv_session() as session:
+        row = session.get(SqlSessionDriverDispatch, (0, claim.dispatch_id))
+        assert row is not None
+        assert row.claim_expires_at == 114
+        assert row.state == "executing"
+
+    _complete_claim(conversation_store, session_id, claim, succeeded=True)
+    with conversation_store._conv_session() as session:
+        row = session.get(SqlSessionDriverDispatch, (0, claim.dispatch_id))
+        assert row is not None
+        assert row.state == "completed"
+
+
+def test_stale_consumer_validation_fails_after_expiry_takeover(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delayed delivery cannot execute after its claim expires and generation advances."""
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    session_id = conversation_store.create_conversation().id
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 100)
+    conversation_store.acquire_driver_lease(session_id, ALICE, 5)
+    _, stale = _enqueue_claim(
+        conversation_store,
+        session_id,
+        ALICE,
+        1,
+        source_id="stale-delivery",
+        claim_ttl_seconds=5,
+    )
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 105)
+    takeover = conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
+    assert takeover.generation == 2
+    with pytest.raises(DriverLeaseConflictError, match="no longer active"):
+        conversation_store.validate_driver_event(
+            session_id,
+            stale.dispatch_id,
+            consumer_token=stale.consumer_token,
+            consumer_generation=stale.consumer_generation,
+        )
