@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
 import threading
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
@@ -4600,7 +4601,7 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
 
     runner_entered = asyncio.Event()
     runner_release = asyncio.Event()
-    heartbeat_renewed = threading.Event()
+    heartbeat_renewals: queue.Queue[int] = queue.Queue()
     forwarded: list[tuple[str, dict[str, Any]]] = []
     clock = [100]
 
@@ -4622,8 +4623,15 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
         dispatch_id: str,
         **kwargs: Any,
     ) -> None:
+        renewal_started_at = clock[0]
         original_renew(store, event_session_id, dispatch_id, **kwargs)
-        heartbeat_renewed.set()
+        heartbeat_renewals.put(renewal_started_at)
+
+    async def _wait_for_heartbeat_at(expected_time: int) -> None:
+        while True:
+            renewed_at = await asyncio.to_thread(heartbeat_renewals.get, True, 1)
+            if renewed_at >= expected_time:
+                return
 
     monkeypatch.setattr(store_module, "now_epoch", lambda: clock[0])
     monkeypatch.setattr(
@@ -4668,12 +4676,10 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
     takeover_task: asyncio.Task[httpx.Response] | None = None
     try:
         await asyncio.wait_for(runner_entered.wait(), timeout=5)
-        heartbeat_renewed.clear()
         clock[0] = 101
-        assert await asyncio.to_thread(heartbeat_renewed.wait, 1)
-        heartbeat_renewed.clear()
+        await _wait_for_heartbeat_at(101)
         clock[0] = 400
-        assert await asyncio.to_thread(heartbeat_renewed.wait, 1)
+        await _wait_for_heartbeat_at(400)
         takeover_task = asyncio.create_task(
             auth_client.post(
                 f"/v1/sessions/{session_id}/driver/acquire",
