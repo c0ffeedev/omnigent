@@ -16,7 +16,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ClockIcon } from "lucide-react";
 import { Label } from "@/components/scheduled/Label";
 import { Input } from "@/components/ui/input";
-import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
+import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   Select,
   SelectContent,
@@ -248,15 +248,16 @@ export function ScheduleFields({
                     onChange={(e) => handleTimeTextChange(e.target.value)}
                     onBlur={canonicalizeTimeText}
                   />
-                  <button
-                    type="button"
-                    aria-label="Open time picker"
-                    data-testid="schedule-time-picker-trigger"
-                    className="absolute top-1/2 right-2 flex size-4 -translate-y-1/2 items-center justify-center rounded-sm text-muted-foreground hover:text-foreground"
-                    onClick={() => handleTimePickerOpenChange(!timePickerOpen)}
-                  >
-                    <ClockIcon className="size-3.5" />
-                  </button>
+                  <PopoverTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label="Open time picker"
+                      data-testid="schedule-time-picker-trigger"
+                      className="absolute top-1/2 right-2 flex size-4 -translate-y-1/2 items-center justify-center rounded-sm text-muted-foreground hover:text-foreground"
+                    >
+                      <ClockIcon className="size-3.5" />
+                    </button>
+                  </PopoverTrigger>
                 </div>
               </PopoverAnchor>
               <PopoverContent

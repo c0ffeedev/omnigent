@@ -164,14 +164,16 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     page.get_by_test_id("task-name-input").click()
     expect(time_input).to_have_value("09:37 AM")
     page.get_by_test_id("schedule-time-picker-trigger").click()
+    expect(page.get_by_test_id("schedule-time-picker")).to_be_visible()
     minute_column = page.get_by_test_id("schedule-minute-column")
     expect(minute_column.locator('[data-testid^="schedule-minute-"]')).to_have_count(
         60,
         timeout=30_000,
     )
-    expect(page.get_by_test_id("schedule-minute-37")).to_be_visible()
-    page.get_by_test_id("schedule-minute-37").click(force=True)
-    expect(time_input).to_have_value("09:37 AM")
+    minute_38 = page.get_by_test_id("schedule-minute-38")
+    expect(minute_38).to_be_visible()
+    minute_38.click()
+    expect(time_input).to_have_value("09:38 AM")
     # Picking one column intentionally leaves the three-column picker open so
     # the hour, minute, and period can be adjusted together. Click another form
     # field to dismiss only the popover; Escape can also propagate to the parent
@@ -186,7 +188,7 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     created_row = _row_by_name(page, "Typed time daily")
     expect(created_row).to_be_visible(timeout=30_000)
     expect(created_row.get_by_test_id("task-schedule-line")).to_have_text(
-        "Every day at 9:37 AM",
+        "Every day at 9:38 AM",
         timeout=30_000,
     )
 
