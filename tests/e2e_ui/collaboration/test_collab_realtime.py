@@ -121,28 +121,27 @@ def test_two_browser_contexts_sync_message_realtime(
         collab_ctx.close()
 
 
-def test_presence_circles_track_other_viewers(
+def test_coordination_status_tracks_present_viewers(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Each viewer sees the OTHER user's presence circle; leaves clear it.
+    """Each viewer sees the shared participant list; leaves clear it.
 
     Two authenticated contexts (Alice, Bob — granted edit by the
     ``"local"`` owner) open the same session. Presence rides the same
     ``GET /v1/sessions/{id}/stream`` SSE the message sync uses: opening
     the page registers the viewer server-side, the join broadcasts a
-    full-state ``session.presence`` event, and the header renders
-    ``data-testid="presence-avatar-<email>"`` circles for everyone but
-    the viewer themself.
+    full-state ``session.presence`` event, and the coordination status
+    popover renders the authoritative participant list.
 
     A failure means one of:
 
     - The stream route stopped registering viewers (presence.connect
       wiring) or the snapshot-on-connect stopped carrying the list.
-    - The SPA's ``session_presence`` handling or the self-filter in
-      ``PresenceAvatars`` regressed (e.g. showing your own circle).
+    - The SPA's ``session_presence`` handling stopped updating the shared
+      coordination cache consumed by the status popover.
     - The leave path regressed: closing Bob's context must clear his
-      circle for Alice once the server's ~15s leave-grace window (which
+      participant row for Alice once the server's ~15s leave-grace window (which
       absorbs reconnect churn) expires.
 
     No LLM turn is involved — presence is pure connection lifecycle.
@@ -170,36 +169,27 @@ def test_presence_circles_track_other_viewers(
         alice = alice_ctx.new_page()
         bob = bob_ctx.new_page()
         alice.goto(f"{base_url}/c/{session_id}")
+        expect(alice.get_by_placeholder("Ask the agent anything…")).to_be_visible()
         bob.goto(f"{base_url}/c/{session_id}")
 
-        # Each sees the OTHER's circle. 15s covers page boot + stream
-        # bind + the join broadcast round-trip on a cold server.
-        expect(alice.get_by_test_id(f"presence-avatar-{bob_email}")).to_be_visible(timeout=15_000)
-        expect(bob.get_by_test_id(f"presence-avatar-{alice_email}")).to_be_visible(timeout=15_000)
+        # Each sees both active participants in the status popover. 15s
+        # covers page boot + stream bind + the join broadcast round-trip.
+        for page in (alice, bob):
+            page.get_by_test_id("coordination-status-trigger").click()
+            expect(page.get_by_test_id(f"coordination-participant-{alice_email}")).to_be_visible(
+                timeout=15_000
+            )
+            expect(page.get_by_test_id(f"coordination-participant-{bob_email}")).to_be_visible(
+                timeout=15_000
+            )
 
-        # Self-filter: your own circle never renders in your own header.
-        # Count=0 proves absence from the DOM, not just invisibility.
-        expect(alice.get_by_test_id(f"presence-avatar-{alice_email}")).to_have_count(0)
-        expect(bob.get_by_test_id(f"presence-avatar-{bob_email}")).to_have_count(0)
-
-        # Hovering a circle shows the viewer's name IN THE VIEWPORT.
-        # The in-viewport check is load-bearing: when the trigger ref is
-        # dropped (React 18 + a non-forwardRef component under
-        # TooltipTrigger asChild), Radix still mounts the tooltip with
-        # the right text but anchors it at the page origin, off-screen —
-        # a DOM-presence assertion passes while users see nothing.
-        alice.get_by_test_id(f"presence-avatar-{bob_email}").hover()
-        name_tooltip = alice.locator("[data-slot=tooltip-content]", has_text=bob_email)
-        expect(name_tooltip).to_be_visible(timeout=5_000)
-        expect(name_tooltip).to_be_in_viewport()
-
-        # Bob leaves. His circle must clear for Alice only after the
+        # Bob leaves. His participant row must clear for Alice only after the
         # server's leave-grace window expires (the spawned test server runs
         # with _LEAVE_GRACE_S patched to 1s; see live_server. Prod is 15s to
         # absorb ingress reconnect churn) — 15s bounds grace + broadcast +
         # render without masking a true ghost-viewer stall.
         bob_ctx.close()
-        expect(alice.get_by_test_id(f"presence-avatar-{bob_email}")).to_have_count(
+        expect(alice.get_by_test_id(f"coordination-participant-{bob_email}")).to_have_count(
             0, timeout=15_000
         )
     finally:
@@ -217,7 +207,7 @@ def test_presence_idle_greys_backgrounded_viewer(
     ``visibilitychange`` dispatched — the SPA's presence tracker starts
     its 30s debounce, then reconnects the session stream with
     ``?idle=true``; the server flips Bob's aggregate and broadcasts, and
-    Alice's header dims his circle (the ``opacity-40`` class). Restoring
+    Alice's coordination popover dims his row (the ``opacity-40`` class). Restoring
     visibility must un-grey him promptly (the active flip skips the
     debounce and reconnects immediately).
 
@@ -229,7 +219,7 @@ def test_presence_idle_greys_backgrounded_viewer(
     A failure means one of: the stream URL stopped carrying ``idle``,
     the per-attempt reconnect machinery regressed (no flip ever reaches
     the server), the registry stopped broadcasting aggregate changes,
-    or PresenceAvatars stopped dimming idle viewers.
+    or the coordination status stopped dimming idle viewers.
 
     :param browser: Playwright session-scoped browser.
     :param seeded_session: ``(base_url, session_id)`` for a runner-bound
@@ -252,13 +242,15 @@ def test_presence_idle_greys_backgrounded_viewer(
         alice = alice_ctx.new_page()
         bob = bob_ctx.new_page()
         alice.goto(f"{base_url}/c/{session_id}")
+        expect(alice.get_by_placeholder("Ask the agent anything…")).to_be_visible()
         bob.goto(f"{base_url}/c/{session_id}")
 
-        bob_circle = alice.get_by_test_id(f"presence-avatar-{bob_email}")
-        expect(bob_circle).to_be_visible(timeout=15_000)
-        # Active to start: a dimmed circle here means the connect-time
+        alice.get_by_test_id("coordination-status-trigger").click()
+        bob_row = alice.get_by_test_id(f"coordination-participant-{bob_email}")
+        expect(bob_row).to_be_visible(timeout=15_000)
+        # Active to start: a dimmed row here means the connect-time
         # idle computation invented an idle state for a visible tab.
-        expect(bob_circle).not_to_have_class(re.compile(r"opacity-40"))
+        expect(bob_row).not_to_have_class(re.compile(r"opacity-40"))
 
         # Background Bob's tab. Playwright can't truly background a
         # headless page, so shadow the document.hidden getter and fire
@@ -277,7 +269,7 @@ def test_presence_idle_greys_backgrounded_viewer(
         # masking a stall. (An instant grey would ALSO be a bug — it
         # would mean alt-tabs flicker — but that direction is pinned by
         # the tracker unit tests, not re-asserted here.)
-        expect(bob_circle).to_have_class(re.compile(r"opacity-40"), timeout=60_000)
+        expect(bob_row).to_have_class(re.compile(r"opacity-40"), timeout=60_000)
 
         # Restore visibility: un-greying skips the debounce, so it must
         # land within one reconnect round trip.
@@ -288,7 +280,7 @@ def test_presence_idle_greys_backgrounded_viewer(
             "  document.dispatchEvent(new Event('visibilitychange'));"
             "}"
         )
-        expect(bob_circle).not_to_have_class(re.compile(r"opacity-40"), timeout=15_000)
+        expect(bob_row).not_to_have_class(re.compile(r"opacity-40"), timeout=15_000)
     finally:
         alice_ctx.close()
         bob_ctx.close()

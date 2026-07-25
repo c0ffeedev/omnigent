@@ -93,6 +93,23 @@ describe("CoordinationStatusPopover", () => {
     expect(screen.getByText(/Lease active/)).toBeVisible();
   });
 
+  it("dims participants reported idle by the session stream", () => {
+    mockUseCoordination.mockReturnValue(
+      coordinationResult({
+        presence: { ...liveSnapshot.presence!, idleUserIds: ["bob@example.com"] },
+      }),
+    );
+    render(<CoordinationStatusPopover sessionId="sess-1" />);
+    openStatus();
+
+    expect(screen.getByTestId("coordination-participant-bob@example.com")).toHaveClass(
+      "opacity-40",
+    );
+    expect(screen.getByTestId("coordination-participant-alice@example.com")).not.toHaveClass(
+      "opacity-40",
+    );
+  });
+
   it("renders initial loading without claiming presence is current", () => {
     mockUseCoordination.mockReturnValue(
       coordinationResult({

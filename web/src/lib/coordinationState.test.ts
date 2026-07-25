@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import type { DriverLease } from "./coordinationApi";
 import {
   applyDriverLeaseToCoordinationCache,
+  applyPresenceToCoordinationCache,
   coordinationQueryKey,
   mergeCoordinationSnapshot,
   mergeDriverLease,
@@ -64,6 +65,48 @@ describe("mergeCoordinationSnapshot", () => {
       mergeCoordinationSnapshot({ driverLease: lease, presence }, { driverLease: null, presence }),
     ).toEqual({ driverLease: lease, presence });
   });
+
+  it("preserves SSE idle state across a delayed REST presence snapshot", () => {
+    expect(
+      mergeCoordinationSnapshot(
+        {
+          driverLease: lease,
+          presence: {
+            ...presence,
+            idleUserIds: ["alice@example.com"],
+            source: "session-stream",
+          },
+        },
+        {
+          driverLease: lease,
+          presence: { ...presence, activeUserIds: ["stale@example.com"] },
+        },
+      ),
+    ).toEqual({
+      driverLease: lease,
+      presence: {
+        ...presence,
+        idleUserIds: ["alice@example.com"],
+        source: "session-stream",
+      },
+    });
+  });
+
+  it("accepts a newer full-state SSE presence snapshot", () => {
+    const currentPresence = { ...presence, source: "session-stream" as const };
+    const incomingPresence = {
+      ...currentPresence,
+      activeUserIds: ["bob@example.com"],
+      idleUserIds: ["bob@example.com"],
+    };
+
+    expect(
+      mergeCoordinationSnapshot(
+        { driverLease: lease, presence: currentPresence },
+        { driverLease: lease, presence: incomingPresence },
+      ),
+    ).toEqual({ driverLease: lease, presence: incomingPresence });
+  });
 });
 
 describe("applyDriverLeaseToCoordinationCache", () => {
@@ -76,6 +119,36 @@ describe("applyDriverLeaseToCoordinationCache", () => {
     expect(queryClient.getQueryData(coordinationQueryKey("sess-1"))).toEqual({
       driverLease: null,
       presence,
+    });
+  });
+});
+
+describe("applyPresenceToCoordinationCache", () => {
+  it("treats the SSE viewer list as authoritative while preserving lease state", () => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(coordinationQueryKey("sess-1"), {
+      driverLease: lease,
+      presence: {
+        ...presence,
+        activeUserIds: ["alice@example.com", "stale@example.com"],
+        entries: [...presence.entries, { userId: "stale@example.com", lastSeen: 9, expiresAt: 69 }],
+      },
+    });
+
+    applyPresenceToCoordinationCache(queryClient, "sess-1", [
+      { userId: "alice@example.com", idle: true },
+      { userId: "bob@example.com", idle: false },
+    ]);
+
+    expect(queryClient.getQueryData(coordinationQueryKey("sess-1"))).toEqual({
+      driverLease: lease,
+      presence: {
+        sessionId: "sess-1",
+        activeUserIds: ["alice@example.com", "bob@example.com"],
+        entries: presence.entries,
+        idleUserIds: ["alice@example.com"],
+        source: "session-stream",
+      },
     });
   });
 });

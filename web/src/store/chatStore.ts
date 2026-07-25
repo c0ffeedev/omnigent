@@ -105,7 +105,10 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
 import { isCodexNativeModel } from "@/lib/codexNativeModels";
 import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
-import { applyDriverLeaseToCoordinationCache } from "@/lib/coordinationState";
+import {
+  applyDriverLeaseToCoordinationCache,
+  applyPresenceToCoordinationCache,
+} from "@/lib/coordinationState";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
 
@@ -4200,6 +4203,9 @@ export function handleSessionEvent(event: StreamEvent): void {
       useChatStore.setState((s) =>
         s.conversationId === event.conversationId ? { viewers: event.viewers } : {},
       );
+      if (queryClient && useChatStore.getState().conversationId === event.conversationId) {
+        applyPresenceToCoordinationCache(queryClient, event.conversationId, event.viewers);
+      }
       return;
     case "session_driver_lease":
       if (queryClient) {

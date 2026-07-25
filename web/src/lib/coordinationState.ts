@@ -2,9 +2,14 @@ import type { QueryClient } from "@tanstack/react-query";
 
 import type { CoordinationPresence, DriverLease } from "./coordinationApi";
 
+export interface LiveCoordinationPresence extends CoordinationPresence {
+  idleUserIds?: string[];
+  source?: "session-stream";
+}
+
 export interface CoordinationSnapshot {
   driverLease: DriverLease | null;
-  presence: CoordinationPresence | null;
+  presence: LiveCoordinationPresence | null;
 }
 
 export function coordinationQueryKey(sessionId: string): readonly unknown[] {
@@ -40,9 +45,30 @@ export function mergeCoordinationSnapshot(
   current: CoordinationSnapshot | undefined,
   incoming: CoordinationSnapshot,
 ): CoordinationSnapshot {
+  if (
+    current?.presence?.source === "session-stream" &&
+    incoming.presence?.source !== "session-stream"
+  ) {
+    return {
+      driverLease: mergeDriverLease(current.driverLease, incoming.driverLease),
+      presence: current.presence,
+    };
+  }
+  const idleUserIds =
+    incoming.presence?.idleUserIds ??
+    current?.presence?.idleUserIds?.filter((userId) =>
+      incoming.presence?.activeUserIds.includes(userId),
+    );
+  const presence =
+    incoming.presence === null
+      ? null
+      : idleUserIds === undefined
+        ? incoming.presence
+        : { ...incoming.presence, idleUserIds };
+
   return {
     driverLease: mergeDriverLease(current?.driverLease, incoming.driverLease),
-    presence: incoming.presence,
+    presence,
   };
 }
 
@@ -61,4 +87,25 @@ export function applyDriverLeaseToCoordinationCache(
     }),
   );
   void queryClient.invalidateQueries({ queryKey: coordinationAuditQueryKey(sessionId) });
+}
+
+export function applyPresenceToCoordinationCache(
+  queryClient: QueryClient,
+  sessionId: string,
+  viewers: Array<{ userId: string; idle: boolean }>,
+): void {
+  queryClient.setQueryData<CoordinationSnapshot>(coordinationQueryKey(sessionId), (current) => {
+    const activeUserIds = viewers.map((viewer) => viewer.userId);
+    const activeUsers = new Set(activeUserIds);
+    return {
+      driverLease: current?.driverLease ?? null,
+      presence: {
+        sessionId,
+        activeUserIds,
+        entries: current?.presence?.entries.filter((entry) => activeUsers.has(entry.userId)) ?? [],
+        idleUserIds: viewers.filter((viewer) => viewer.idle).map((viewer) => viewer.userId),
+        source: "session-stream",
+      },
+    };
+  });
 }

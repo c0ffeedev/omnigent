@@ -156,6 +156,7 @@ export function CoordinationStatusPopover({ sessionId }: CoordinationStatusPopov
   const descriptionId = useId();
   const coordination = useCoordination(sessionId);
   const participantIds = coordination.presence?.activeUserIds ?? [];
+  const idleUserIds = new Set(coordination.presence?.idleUserIds ?? []);
   const hasSnapshot = coordination.presence !== null || coordination.driverLease !== null;
   const displayState = displayStateFor({
     connectionState: coordination.connectionState,
@@ -294,14 +295,17 @@ export function CoordinationStatusPopover({ sessionId }: CoordinationStatusPopov
                   >
                     {participantIds.map((userId) => {
                       const isDriver = userId === currentDriverUserId;
+                      const isIdle = idleUserIds.has(userId);
                       return (
                         <li
                           key={userId}
                           data-testid={`coordination-participant-${userId}`}
                           data-driver={isDriver ? "true" : "false"}
+                          data-idle={isIdle ? "true" : "false"}
                           className={cn(
                             "flex min-w-0 items-center gap-2 rounded-md px-2 py-1.5",
                             isDriver && "bg-primary/8 text-foreground ring-1 ring-primary/20",
+                            isIdle && "opacity-40",
                           )}
                         >
                           <ParticipantAvatar userId={userId} />

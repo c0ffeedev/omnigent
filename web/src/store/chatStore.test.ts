@@ -45,6 +45,7 @@ import type {
 import type { TerminalInfo } from "@/hooks/useTerminals";
 import { terminalsQueryKey } from "@/hooks/useTerminals";
 import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSessions";
+import { coordinationQueryKey } from "@/lib/coordinationState";
 import {
   consumePendingInitialPrompt,
   handleSessionEvent,
@@ -3110,6 +3111,16 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         { userId: "alice@example.com", joinedAt: "2026-06-10T17:00:00Z", idle: false },
         { userId: "bob@example.com", idle: true },
       ]);
+      expect(client.getQueryData(coordinationQueryKey("conv_abc"))).toEqual({
+        driverLease: null,
+        presence: {
+          sessionId: "conv_abc",
+          activeUserIds: ["alice@example.com", "bob@example.com"],
+          entries: [],
+          idleUserIds: ["bob@example.com"],
+          source: "session-stream",
+        },
+      });
     });
 
     it("ignores a presence frame from a switched-away conversation", () => {
