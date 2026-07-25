@@ -988,6 +988,32 @@ Request body matches `SessionEventInput`:
     409. Failed or claim-expired dispatches retry in place with the same
     event/effect ids and a newly fenced consumer claim.
 
+**Driver-fencing guarantees.** For lease-protected input, acceptance linearizes
+when one database transaction, while holding the session's driver lock, commits
+both the `input_accepted` audit event and its pending outbox dispatch. Nothing
+has been dispatched at that point. The server then claims that durable row and
+revalidates the current lease plus consumer token/generation immediately before
+each local side effect. A bound runner performs the same revalidation before it
+executes the forwarded effect. Lease takeover, claim expiry, or consumer
+replacement therefore makes a paused stale request fail with 409 before it can
+persist, enqueue, interrupt, approve, or execute work; stale heartbeats and
+completion attempts are fenced compare-and-swap failures and cannot mutate the
+new owner's state.
+
+Clients must retain the same `source_id` across ambiguous responses and retries.
+An exact retry reuses the original audit event, dispatch, and effect identity;
+it never creates a second durable acceptance or replays a completed effect.
+Incompatible reuse fails with 409. If the server crashes after acceptance but
+before claiming, the pending row remains durable and blocks ownership changes
+until its accepting lease expires. If it crashes with claimed work, the bounded
+claim expires; the next valid retry reclaims the same row and effect identity
+with a higher consumer generation, permanently fencing the old worker.
+
+Sessions with no driver-lease row retain the legacy behavior: callers may omit
+both `driver_generation` and `source_id`, and no outbox or consumer fence is
+introduced. Once a lease row exists, release or expiry does not restore this
+fallback; a new active lease and its current generation are required.
+
 202 Accepted
 {"queued": true}                            # regular queued item events
 {"queued": false}                           # "interrupt" and status/control bypasses
