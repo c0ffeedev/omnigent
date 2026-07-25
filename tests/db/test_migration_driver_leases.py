@@ -14,13 +14,14 @@ from omnigent.db.utils import _build_alembic_config
 
 _PRIOR_REVISION = "g6b7c8d9e0f1"
 _THIS_REVISION = "a6b7c8d9e0f1"
+_MERGE_HEAD_REVISION = "c4d5e6f7a8b9"
 
 
 def test_driver_lease_migration_is_the_single_head(tmp_path: Path) -> None:
-    """The lease migration extends current main instead of creating a branch."""
+    """The merged migration graph exposes exactly one combined head."""
     uri = f"sqlite:///{tmp_path / 'heads.db'}"
     script = ScriptDirectory.from_config(_build_alembic_config(uri))
-    assert script.get_heads() == [_THIS_REVISION]
+    assert script.get_heads() == [_MERGE_HEAD_REVISION]
 
 
 def _migrate(engine: sa.Engine, uri: str, revision: str, *, downgrade: bool = False) -> None:
