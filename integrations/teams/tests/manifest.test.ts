@@ -24,7 +24,11 @@ describe("Teams app manifest", () => {
       expect(capability.scopes).toEqual(["personal"]);
     }
     expect(manifest.validDomains).toEqual(["${{BOT_DOMAIN}}"]);
+    expect(manifest.permissions).toEqual(["identity"]);
     expect(manifest).not.toHaveProperty("authorization");
-    expect(manifest).not.toHaveProperty("webApplicationInfo");
+    expect(manifest.webApplicationInfo).toEqual({
+      id: "${{BOT_APP_ID}}",
+      resource: "api://${{BOT_DOMAIN}}/${{BOT_APP_ID}}",
+    });
   });
 });

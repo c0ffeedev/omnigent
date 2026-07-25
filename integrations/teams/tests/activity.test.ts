@@ -247,7 +247,7 @@ describe("handlePersonalMessage", () => {
       send,
     );
 
-    expect(send).toHaveBeenCalledWith(expect.stringContaining("only `help`"));
+    expect(send).toHaveBeenCalledWith(expect.stringContaining("Unknown command"));
     dedupe.close();
   });
 });

@@ -33,8 +33,8 @@ export interface RejectedActivity {
 export type ActivityValidation = ValidatedActivity | RejectedActivity;
 export type MessageResult = "sent" | "duplicate" | "rejected";
 
-export const HELP_TEXT = "Omnigent Teams currently supports only `help`. Account linking and Omnigent sessions are not enabled in this transport slice.";
-export const UNSUPPORTED_TEXT = "This Teams integration currently supports only `help`; it did not create or modify an Omnigent session.";
+export const HELP_TEXT = "Commands: `connect` links your Omnigent account, `status` shows connection health, `logout` disconnects it, and `help` shows this message.";
+export const UNSUPPORTED_TEXT = "Unknown command. Send `help` for the supported Teams commands.";
 
 export class DeliveryInProgressError extends Error {
   constructor() {
@@ -159,18 +159,22 @@ export async function handlePersonalMessage(
   constraints: ActivityConstraints,
   dedupe: ActivityDedupeStore,
   send: (message: string) => Promise<unknown>,
+  respond?: (activity: ValidatedActivity, command: string | undefined) => Promise<string>,
 ): Promise<MessageResult> {
   const validated = validateActivity(activity, constraints);
   if (!validated.ok) return "rejected";
 
   const activityRecord = object(activity);
   const normalizedText = string(activityRecord?.text)?.toLowerCase();
-  const response = normalizedText === "help" ? HELP_TEXT : UNSUPPORTED_TEXT;
   const principalKey = dedupeKey(validated);
   const legacyKey = legacyDedupeKey(validated);
   const key = dedupe.get(legacyKey) ? legacyKey : principalKey;
   const owner = randomUUID();
-  const claim = dedupe.claim(key, { kind: "teams_reply", payload: response }, owner);
+  const claim = dedupe.claim(
+    key,
+    { kind: "teams_command", payload: normalizedText ?? "" },
+    owner,
+  );
   if (claim.status === "delivered") return "duplicate";
   if (claim.status === "busy") throw new DeliveryInProgressError();
 
@@ -184,7 +188,10 @@ export async function handlePersonalMessage(
   renewal.unref();
   let sent = false;
   try {
-    const result = await send(claim.operation.payload);
+    const response = respond
+      ? await respond(validated, normalizedText)
+      : normalizedText === "help" ? HELP_TEXT : UNSUPPORTED_TEXT;
+    const result = await send(response);
     sent = true;
     dedupe.complete(key, owner, deliveryReceipt(result));
     return "sent";

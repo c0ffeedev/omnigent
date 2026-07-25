@@ -487,6 +487,7 @@ def test_full_device_flow(app: TestClient) -> None:
     assert r.status_code == 200, r.text
     new_refresh = r.json()["refresh_token"]
     assert new_refresh != refresh_token
+
     # Old refresh token is now dead (rotation) → revokes on reuse.
     r = app.post(
         "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh_token}
@@ -500,6 +501,51 @@ def test_full_device_flow(app: TestClient) -> None:
     assert r.status_code == 400
     # The access token from the revoked grant is rejected immediately.
     r = app.get("/v1/agents", headers=auth)
+    assert r.status_code in (401, 403)
+
+
+def test_revoke_with_previous_refresh_token_revokes_rotated_grant(app: TestClient) -> None:
+    """An ambiguous refresh client can clean up with its retained old token."""
+    r = app.post(
+        "/oauth/device/authorize",
+        json={"client_id": "teams", "scope": INTERACTIVE_DELEGATED_SCOPE},
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    _login_admin(app)
+    r = app.post(
+        "/oauth/device/approve",
+        data={"user_code": data["user_code"]},
+        headers={"Origin": "http://localhost:8000"},
+    )
+    assert r.status_code == 200, r.text
+    app.cookies.clear()
+
+    r = app.post(
+        "/oauth/token",
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": data["device_code"],
+        },
+    )
+    assert r.status_code == 200, r.text
+    original_refresh = r.json()["refresh_token"]
+    access_token = r.json()["access_token"]
+    r = app.post(
+        "/oauth/token",
+        data={"grant_type": "refresh_token", "refresh_token": original_refresh},
+    )
+    assert r.status_code == 200, r.text
+    rotated_refresh = r.json()["refresh_token"]
+
+    r = app.post("/oauth/revoke", data={"refresh_token": original_refresh})
+    assert r.status_code == 200 and r.json() == {"revoked": True}
+    r = app.post(
+        "/oauth/token",
+        data={"grant_type": "refresh_token", "refresh_token": rotated_refresh},
+    )
+    assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
+    r = app.get("/v1/agents", headers={"Authorization": f"Bearer {access_token}"})
     assert r.status_code in (401, 403)
 
 

@@ -1,13 +1,52 @@
 import { App, type AppOptions } from "@microsoft/teams.apps";
 import { ConsoleLogger, type ILogger, type ILoggerOptions, type LogLevel } from "@microsoft/teams.common";
 
-import { handlePersonalMessage, validateActivity } from "./activity.js";
+import {
+  HELP_TEXT,
+  UNSUPPORTED_TEXT,
+  handlePersonalMessage,
+  validateActivity,
+  type ValidatedActivity,
+} from "./activity.js";
 import type { TeamsConfig } from "./config.js";
 import { ActivityDedupeStore } from "./dedupe.js";
+import { EntraJwtValidator } from "./identity.js";
+import type { GrantLifecycle } from "./lifecycle.js";
 
 export type TeamsAppOptions = Pick<AppOptions<never>, "client" | "cloud" | "httpServerAdapter" | "logger">;
 
-class RedactingLogger implements ILogger {
+export interface TeamsAppServices {
+  identityValidator: EntraJwtValidator;
+  lifecycle: GrantLifecycle;
+}
+
+export async function respondToPersonalCommand(
+  signin: (options: { connectionName: string }) => Promise<string | undefined>,
+  reply: (message: string) => Promise<unknown>,
+  validated: ValidatedActivity,
+  command: string | undefined,
+  config: Pick<TeamsConfig, "ssoConnectionName">,
+  services?: TeamsAppServices,
+): Promise<string> {
+  if (command === "help") return HELP_TEXT;
+  if (!services || !["connect", "status", "logout"].includes(command ?? "")) return UNSUPPORTED_TEXT;
+
+  const token = await signin({ connectionName: config.ssoConnectionName });
+  if (!token) return "Complete Microsoft sign-in, then send the command again.";
+  let principal;
+  try {
+    principal = await services.identityValidator.validate(token, validated);
+  } catch {
+    return "Microsoft sign-in could not be verified for this Teams account.";
+  }
+  if (command === "status") return services.lifecycle.status(principal);
+  if (command === "logout") return services.lifecycle.logout(principal);
+  const result = await services.lifecycle.connect(principal);
+  void result.completion.then((message) => reply(message)).catch(() => undefined);
+  return result.message;
+}
+
+export class RedactingLogger implements ILogger {
   readonly loggerOptions?: ILoggerOptions;
 
   constructor(
@@ -45,6 +84,7 @@ export function createTeamsApp(
   config: TeamsConfig,
   dedupe: ActivityDedupeStore,
   options: TeamsAppOptions = {},
+  services?: TeamsAppServices,
 ): App {
   const constraints = {
     botAppId: config.botAppId,
@@ -58,8 +98,12 @@ export function createTeamsApp(
     messagingEndpoint: "/api/messages",
     activity: { mentions: { stripText: true } },
     client: { timeout: 10_000 },
+    oauth: { defaultConnectionName: config.ssoConnectionName },
     ...sdkOptions,
-    logger: new RedactingLogger(logger ?? new ConsoleLogger("omnigent/teams"), [config.botClientSecret]),
+    logger: new RedactingLogger(
+      logger ?? new ConsoleLogger("omnigent/teams"),
+      [config.botClientSecret, config.omnigentDeviceClientSecret ?? ""].filter(Boolean),
+    ),
   });
 
   app.use(async ({ activity, next }) => {
@@ -70,9 +114,23 @@ export function createTeamsApp(
     return next();
   });
 
-  app.on("message", async ({ activity, reply }) => {
-    await handlePersonalMessage(activity, constraints, dedupe, (message) => reply(message));
+  app.on("message", async ({ activity, reply, signin }) => {
+    await handlePersonalMessage(
+      activity,
+      constraints,
+      dedupe,
+      (message) => reply(message),
+      (validated, command) => respondToPersonalCommand(signin, reply, validated, command, config, services),
+    );
   });
+
+  if (services) {
+    app.on("install.remove", async ({ activity }) => {
+      const validation = validateActivity(activity, constraints);
+      if (!validation.ok) return;
+      services.lifecycle.uninstall({ objectId: validation.senderId, tenantId: validation.tenantId });
+    });
+  }
 
   return app;
 }

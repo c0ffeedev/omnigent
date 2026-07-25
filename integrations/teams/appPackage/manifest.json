@@ -15,7 +15,7 @@
   },
   "description": {
     "short": "Use Omnigent from a personal Teams conversation.",
-    "full": "An authenticated personal-scope Microsoft Teams transport for Omnigent. This initial slice provides transport verification and help only."
+    "full": "An authenticated personal-scope Microsoft Teams transport with SSO-bound Omnigent account linking and delegated access."
   },
   "icons": {
     "outline": "outline.png",
@@ -42,5 +42,10 @@
       "supportsFiles": false
     }
   ],
-  "validDomains": ["${{BOT_DOMAIN}}"]
+  "permissions": ["identity"],
+  "validDomains": ["${{BOT_DOMAIN}}"],
+  "webApplicationInfo": {
+    "id": "${{BOT_APP_ID}}",
+    "resource": "api://${{BOT_DOMAIN}}/${{BOT_APP_ID}}"
+  }
 }

@@ -705,9 +705,12 @@ def create_device_auth_router(
         refresh_token = str(form.get("refresh_token") or "")
         grant = None
         if refresh_token:
-            grant = device_grant_store.get_by_refresh_hash(
-                hash_secret(refresh_token, cookie_secret)
-            )
+            refresh_hash = hash_secret(refresh_token, cookie_secret)
+            grant = device_grant_store.get_by_refresh_hash(refresh_hash)
+            if grant is None:
+                # A client may be revoking after an ambiguous refresh response.
+                # The presented token can be the immediately previous rotation.
+                grant = device_grant_store.get_by_prev_refresh_hash(refresh_hash)
         if grant is None:
             grant_id = _grant_id_from_bearer(request)
             if grant_id is not None:
