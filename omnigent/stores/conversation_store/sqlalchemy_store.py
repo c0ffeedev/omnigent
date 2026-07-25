@@ -2811,10 +2811,30 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: The persisted :class:`ConversationItem` list
             with store-assigned IDs and timestamps.
         """
-        now = now_epoch()
         persisted: list[ConversationItem] = []
+        driver_generations = {
+            item.driver_generation for item in items if item.driver_generation is not None
+        }
 
-        with self._conv_session() as session:
+        session_context = (
+            self._driver_session(conversation_id) if driver_generations else self._conv_session()
+        )
+        with session_context as session:
+            now = now_epoch()
+            if driver_generations:
+                # Share the lease-mutation fence so generation validation and
+                # item insertion commit as one linearized operation.
+                lease = self._locked_driver_lease(session, conversation_id)
+                if lease is not None and (
+                    len(driver_generations) != 1
+                    or lease.generation not in driver_generations
+                    or lease.expires_at is None
+                    or lease.expires_at <= now
+                    or lease.released_at is not None
+                ):
+                    raise DriverLeaseConflictError(
+                        "conversation item driver generation is no longer active"
+                    )
             # Lock the conversation row to serialize position writes.
             # On PostgreSQL this is a row-level FOR UPDATE lock; on
             # SQLite the database-level lock already serializes.

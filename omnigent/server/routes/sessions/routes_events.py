@@ -687,7 +687,9 @@ def register_events_routes(
                     ),
                 )
             except DriverLeaseConflictError as exc:
-                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+                raise await _driver_lease_conflict(exc, session_id) from exc
+            if test_hook is not None:
+                await test_hook(f"{point}_after_renewal", driver_dispatch_id)
 
         def _start_driver_heartbeat() -> None:
             nonlocal driver_heartbeat_task
@@ -1840,35 +1842,41 @@ def register_events_routes(
                     f"Session {session_id!r} has no agent; cannot run slash command",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            item_id = await _dispatch_skill_slash_command_to_runner(
+            try:
+                item_id = await _dispatch_skill_slash_command_to_runner(
+                    session_id,
+                    conv,
+                    body,
+                    conversation_store,
+                    runner_client,
+                    agent=_agent,
+                    has_mcp_servers=_has_mcp_servers,
+                    created_by=event_actor_user_id,
+                    side_effect_guard=_guard_driver_side_effect,
+                )
+            except DriverLeaseConflictError as exc:
+                raise await _driver_lease_conflict(exc, session_id) from exc
+            if pending_background_title is not None:
+                pending_background_title.schedule()
+            return await _finish_driver_response({"queued": True, "item_id": item_id})
+        try:
+            dispatch = await _dispatch_session_event_to_runner(
                 session_id,
                 conv,
                 body,
                 conversation_store,
                 runner_client,
-                agent=_agent,
+                agent_name=_agent.name if _agent else None,
+                file_store=file_store,
+                artifact_store=artifact_store,
                 has_mcp_servers=_has_mcp_servers,
                 created_by=event_actor_user_id,
+                runner_router=runner_router,
+                native_terminal_ready=native_terminal_ready,
                 side_effect_guard=_guard_driver_side_effect,
             )
-            if pending_background_title is not None:
-                pending_background_title.schedule()
-            return await _finish_driver_response({"queued": True, "item_id": item_id})
-        dispatch = await _dispatch_session_event_to_runner(
-            session_id,
-            conv,
-            body,
-            conversation_store,
-            runner_client,
-            agent_name=_agent.name if _agent else None,
-            file_store=file_store,
-            artifact_store=artifact_store,
-            has_mcp_servers=_has_mcp_servers,
-            created_by=event_actor_user_id,
-            runner_router=runner_router,
-            native_terminal_ready=native_terminal_ready,
-            side_effect_guard=_guard_driver_side_effect,
-        )
+        except DriverLeaseConflictError as exc:
+            raise await _driver_lease_conflict(exc, session_id) from exc
         if pending_background_title is not None:
             pending_background_title.schedule()
         response: dict[str, Any] = {"queued": True}
