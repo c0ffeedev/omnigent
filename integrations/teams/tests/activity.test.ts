@@ -4,7 +4,11 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { handlePersonalMessage, validateActivity } from "../src/activity.js";
+import {
+  DeliveryInProgressError,
+  handlePersonalMessage,
+  validateActivity,
+} from "../src/activity.js";
 import { ActivityDedupeStore } from "../src/dedupe.js";
 
 const appId = "11111111-1111-4111-8111-111111111111";
@@ -62,12 +66,35 @@ describe("validateActivity", () => {
     ["mismatched tenant fields", activity({ channelData: { tenant: { id: "33333333-3333-4333-8333-333333333333" } } })],
     ["group chat", activity({ conversation: { id: "conversation-1", conversationType: "groupChat", tenantId } })],
     ["team channel", activity({ conversation: { id: "conversation-1", conversationType: "channel", tenantId } })],
+    ["meeting scope", activity({ conversation: { id: "conversation-1", conversationType: "meeting", tenantId } })],
+    ["unknown scope", activity({ conversation: { id: "conversation-1", conversationType: "livestream", tenantId } })],
+    ["missing conversation scope", activity({ conversation: { id: "conversation-1", tenantId } })],
+    ["empty conversation scope", activity({ conversation: { id: "conversation-1", conversationType: "", tenantId } })],
     ["wrong recipient app", activity({ recipient: { id: "28:44444444-4444-4444-8444-444444444444" } })],
     ["unprefixed recipient app", activity({ recipient: { id: appId } })],
     ["non-Teams channel", activity({ channelId: "slack" })],
     ["whitespace-padded activity ID", activity({ id: " activity-1" })],
   ])("rejects %s", (_name, candidate) => {
     expect(validateActivity(candidate, constraints)).toMatchObject({ ok: false });
+  });
+
+  it.each<[string, unknown]>([
+    ["a string body", "not-an-activity"],
+    ["a null body", null],
+    ["a numeric body", 42],
+    ["a boolean body", true],
+    ["an array body", [activity()]],
+  ])("rejects %s as malformed", (_name, candidate) => {
+    expect(validateActivity(candidate, constraints)).toMatchObject({ ok: false, status: 400 });
+  });
+
+  it("classifies a scope violation as 403 and missing identity as 400", () => {
+    expect(validateActivity(
+      activity({ conversation: { id: "conversation-1", conversationType: "channel", tenantId } }),
+      constraints,
+    )).toMatchObject({ ok: false, status: 403 });
+    expect(validateActivity(activity({ from: { id: "sender-1" } }), constraints))
+      .toMatchObject({ ok: false, status: 400 });
   });
 });
 
@@ -179,6 +206,34 @@ describe("handlePersonalMessage", () => {
       state: "delivered",
     });
     restarted.close();
+  });
+
+  it("fences a simultaneous in-flight duplicate to one recorded operation", async () => {
+    const dedupe = store();
+    const constraints = { botAppId: appId, allowedTenantIds: new Set([tenantId]) };
+    let releaseSend: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { releaseSend = resolve; });
+    const send = vi.fn(async (_message: string) => {
+      await gate;
+      return { id: "reply-1" };
+    });
+
+    const first = handlePersonalMessage(activity(), constraints, dedupe, send);
+    await expect(handlePersonalMessage(activity(), constraints, dedupe, send))
+      .rejects.toBeInstanceOf(DeliveryInProgressError);
+
+    releaseSend();
+    await expect(first).resolves.toBe("sent");
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(dedupe.count()).toBe(1);
+    expect(dedupe.get({
+      activityId: "activity-1",
+      botAppId: appId,
+      conversationId: "conversation-1",
+      senderId: objectId,
+      tenantId,
+    })).toMatchObject({ receipt: "reply-1", state: "delivered" });
+    dedupe.close();
   });
 
   it("returns a bounded help-only response for unsupported commands without invoking Omnigent", async () => {
