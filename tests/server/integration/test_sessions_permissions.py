@@ -3482,6 +3482,11 @@ async def test_driver_fenced_skill_dispatch_preserves_actor_and_generation(
         ("approval", {"elicitation_id": "elicit_test", "action": "accept"}, "approval"),
         ("compact", {}, "compact"),
         (
+            "effort_change",
+            {"effort": "high"},
+            "effort_change",
+        ),
+        (
             "function_call_output",
             {"call_id": "call_test", "output": "done"},
             "tool_result",
@@ -3547,6 +3552,64 @@ async def test_driver_fenced_control_dispatch_propagates_claim(
     assert claim["driver_generation"] == 1
     assert claim["runner_id"] == token_bound_runner_id(binding_token)
     assert claim["consumer_generation"] == 1
+
+
+async def test_driver_fenced_effort_change_retry_does_not_replay(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed effort retry resolves from its durable source identity."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    forwarded: list[dict[str, Any]] = []
+
+    class _Runner:
+        async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+            forwarded.append(kwargs["json"])
+            return httpx.Response(
+                204,
+                request=httpx.Request("POST", f"http://runner{path}"),
+            )
+
+    async def _runner(*_: Any, **__: Any) -> _Runner:
+        return _Runner()
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    binding_token = "effort-retry-runner-token"
+    store.replace_runner_id(session_id, token_bound_runner_id(binding_token))
+    headers = {"X-Forwarded-Email": "alice@example.com"}
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers=headers,
+    )
+    assert acquired.status_code == 200, acquired.text
+    event = {
+        "type": "effort_change",
+        "driver_generation": 1,
+        "source_id": "effort-drop-1",
+        "data": {"effort": "high"},
+    }
+
+    accepted = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=event,
+        headers=headers,
+    )
+    assert accepted.status_code == 202, accepted.text
+    assert len(forwarded) == 1
+    completed_retry = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=event,
+        headers=headers,
+    )
+    assert completed_retry.status_code == 202, completed_retry.text
+    assert completed_retry.json()["duplicate"] is True
+    assert len(forwarded) == 1
 
 
 async def test_bound_runner_lease_state_is_explicit_and_authenticated(

@@ -86,6 +86,40 @@ class _UncertainControlHarnessClient:
         raise httpx.ReadTimeout("control outcome unknown")
 
 
+class _BlockingHarnessClient(_ScriptedHarnessClient):
+    """Keep a generic harness turn live until the runner interrupts it."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.stream_started = asyncio.Event()
+        self.interrupt_calls = 0
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        del method, url, json, timeout
+        owner = self
+
+        class _Stream:
+            status_code = 200
+
+            async def __aenter__(self) -> _Stream:
+                return self
+
+            async def __aexit__(self, *_args: Any) -> None:
+                return None
+
+            async def aiter_text(self) -> Any:
+                yield _sse({"type": "response.created", "response": {"id": "resp-generic"}})
+                owner.stream_started.set()
+                await asyncio.Event().wait()
+
+        return _Stream()
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if json.get("type") == "interrupt":
+            self.interrupt_calls += 1
+        return await super().post(url, json=json, timeout=timeout)
+
+
 @pytest.mark.asyncio
 async def test_runner_rejects_stale_driver_delivery_before_dispatch() -> None:
     """A server-rejected consumer claim never reaches runner execution state."""
@@ -278,6 +312,39 @@ async def test_driver_control_success_completes_terminal_claim() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "effort_change", "effort": "high"},
+    ],
+)
+async def test_driver_session_controls_complete_terminal_claim(
+    event: dict[str, Any],
+) -> None:
+    """Session-setting controls participate in the execution-time fence."""
+    server = _ValidationClient(200, 200, 200)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, object()),
+        server_client=cast(httpx.AsyncClient, server),
+    )
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        response = await client.post(
+            "/v1/sessions/session-1/events",
+            json={**event, "driver_claim": _control_claim()},
+        )
+
+    assert response.status_code == 204
+    assert [path.rsplit("/", 1)[-1] for path, _kwargs in server.posts] == [
+        "validate",
+        "validate",
+        "complete",
+    ]
+    assert server.posts[-1][1]["params"] == {"succeeded": True}
+
+
+@pytest.mark.asyncio
 async def test_driver_control_semantic_failure_completes_failed_claim() -> None:
     """A terminal harness error makes the control claim retryable as failed."""
     server = _ValidationClient(200, 200, 200)
@@ -430,9 +497,89 @@ async def test_driver_control_stale_takeover_stops_terminal_retry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_native_driver_claim_completes_only_after_forwarded_terminal_status() -> None:
-    """A native prompt injection is not terminal completion of its fenced turn."""
-    server = _ValidationClient(200, 200, 200)
+async def test_generic_interrupt_completes_after_turn_terminal_and_fences_retry() -> None:
+    """A generic interrupt settles its target turn before completing and cannot replay."""
+    server = _ValidationClient(*([200] * 20))
+    harness_client = _BlockingHarnessClient()
+    process_manager = _FakeProcessManager(harness_client)
+    spec = AgentSpec(
+        spec_version=1,
+        name="generic",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude"}),
+    )
+    resolver = await _spec_resolver_returning(spec)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, process_manager),
+        spec_resolver=resolver,
+        server_client=cast(httpx.AsyncClient, server),
+    )
+    app.state.driver_heartbeat_interval_seconds = 60.0
+    message_claim = {
+        **_control_claim(),
+        "dispatch_id": "9" * 32,
+        "event_id": "a" * 32,
+        "source_id": "source-generic-message",
+        "effect_id": "b" * 32,
+        "consumer_token": "c" * 32,
+    }
+    interrupt_claim = {
+        **_control_claim(),
+        "dispatch_id": "d" * 32,
+        "event_id": "e" * 32,
+        "effect_id": "f" * 32,
+        "consumer_token": "0" * 32,
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        accepted = await client.post(
+            "/v1/sessions/session-generic/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "agent-generic",
+                "persisted_item_id": "turn-generic",
+                "content": [{"type": "input_text", "text": "work"}],
+                "driver_claim": message_claim,
+            },
+        )
+        assert accepted.status_code == 202
+        await asyncio.wait_for(harness_client.stream_started.wait(), timeout=2.0)
+
+        interrupted = await client.post(
+            "/v1/sessions/session-generic/events",
+            json={"type": "interrupt", "driver_claim": interrupt_claim},
+        )
+        assert interrupted.status_code == 204, [
+            (path.rsplit("/", 1)[-1], kwargs.get("params")) for path, kwargs in server.posts
+        ]
+
+        # Simulate AP retrying the same envelope after the 204 was dropped.
+        server.status_codes = [409]
+        retry = await client.post(
+            "/v1/sessions/session-generic/events",
+            json={"type": "interrupt", "driver_claim": interrupt_claim},
+        )
+        assert retry.status_code == 409
+
+    completions = [
+        (kwargs["json"]["dispatch_id"], kwargs["params"])
+        for path, kwargs in server.posts
+        if path.endswith("/complete")
+    ]
+    assert completions == [
+        (message_claim["dispatch_id"], {"succeeded": False}),
+        (interrupt_claim["dispatch_id"], {"succeeded": True}),
+    ]
+    assert harness_client.interrupt_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_native_driver_claim_completes_only_after_forwarded_terminal_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native message and interrupt claims wait for the correlated turn terminal."""
+    server = _ValidationClient(*([200] * 20))
     stream_finished = asyncio.Event()
     harness_client = _ScriptedHarnessClient(
         [_sse({"type": "response.created", "response": {"id": "resp-native"}})],
@@ -460,6 +607,18 @@ async def test_native_driver_claim_completes_only_after_forwarded_terminal_statu
         "consumer_generation": 2,
         "runner_id": "runner-1",
     }
+    interrupt_claim = {
+        **_control_claim(),
+        "dispatch_id": "5" * 32,
+        "event_id": "6" * 32,
+        "effect_id": "7" * 32,
+        "consumer_token": "8" * 32,
+    }
+    interrupt_injections: list[None] = []
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.inject_interrupt",
+        lambda *_args, **_kwargs: interrupt_injections.append(None),
+    )
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
@@ -482,6 +641,24 @@ async def test_native_driver_claim_completes_only_after_forwarded_terminal_statu
             "validate",
         ]
 
+        interrupt_task = asyncio.create_task(
+            client.post(
+                "/v1/sessions/session-native/events",
+                json={"type": "interrupt", "driver_claim": interrupt_claim},
+            )
+        )
+        for _ in range(100):
+            if len(server.posts) >= 4:
+                break
+            await asyncio.sleep(0.01)
+        assert not interrupt_task.done()
+        assert [path.rsplit("/", 1)[-1] for path, _kwargs in server.posts] == [
+            "validate",
+            "validate",
+            "validate",
+            "validate",
+        ]
+
         for data in (
             {"status": "idle"},
             {"status": "idle", "turn_id": "turn-other"},
@@ -492,7 +669,7 @@ async def test_native_driver_claim_completes_only_after_forwarded_terminal_statu
             )
             assert unrelated.status_code == 204
             await asyncio.sleep(0)
-            assert len(server.posts) == 2
+            assert len(server.posts) == 4
 
         terminal = await client.post(
             "/v1/sessions/session-native/events",
@@ -507,16 +684,35 @@ async def test_native_driver_claim_completes_only_after_forwarded_terminal_statu
         )
         assert terminal.status_code == 204
         for _ in range(100):
-            if len(server.posts) >= 3:
+            if len(server.posts) >= 6:
                 break
             await asyncio.sleep(0.01)
+        interrupt = await asyncio.wait_for(interrupt_task, timeout=1.0)
+        assert interrupt.status_code == 204
+
+        # A retry after the terminal 204 was dropped is stale before reinjection.
+        server.status_codes = [409]
+        retry = await client.post(
+            "/v1/sessions/session-native/events",
+            json={"type": "interrupt", "driver_claim": interrupt_claim},
+        )
+        assert retry.status_code == 409
 
     assert [path.rsplit("/", 1)[-1] for path, _kwargs in server.posts] == [
         "validate",
         "validate",
+        "validate",
+        "validate",
         "complete",
+        "complete",
+        "validate",
     ]
-    assert server.posts[-1][1]["params"] == {"succeeded": True}
+    assert all(
+        kwargs["params"] == {"succeeded": True}
+        for path, kwargs in server.posts
+        if path.endswith("/complete")
+    )
+    assert len(interrupt_injections) == 1
 
 
 @pytest.mark.asyncio

@@ -131,6 +131,7 @@ def _requires_driver_fence(body: SessionEventInput) -> bool:
     if body.type == "function_call" and body.data.get("evaluate_policy"):
         return False
     return body.type in {
+        "effort_change",
         "function_call_output",
         _APPROVAL_TYPE,
         _COMPACT_TYPE,
@@ -732,6 +733,7 @@ def register_events_routes(
         # has no payload; approval's MCP-shape payload is validated
         # inside ``_dispatch_approval``).
         if body.type not in (
+            "effort_change",
             _INTERRUPT_TYPE,
             _APPROVAL_TYPE,
             _MCP_ELICITATION_TYPE,
@@ -1185,6 +1187,34 @@ def register_events_routes(
                 # The turn keeps running and nothing else lifts the fence —
                 # remove it so the turn's remaining output isn't dropped.
                 _interrupt_fenced_sessions.discard(session_id)
+            return await _finish_driver_response({"queued": False})
+        if body.type == "effort_change":
+            await _accept_driver_fence()
+            await _guard_driver_side_effect("before_effort_change_dispatch")
+            runner_client = await _get_runner_client(
+                session_id,
+                runner_router,
+            )
+            if runner_client is not None:
+                try:
+                    await runner_client.post(
+                        f"/v1/sessions/{session_id}/events",
+                        json={
+                            "type": "effort_change",
+                            "effort": body.data.get("effort"),
+                            **(
+                                {"driver_claim": dict(body._driver_claim)}
+                                if body._driver_claim is not None
+                                else {}
+                            ),
+                        },
+                        timeout=5.0,
+                    )
+                except (httpx.HTTPError, ConnectionError):
+                    _logger.exception(
+                        "Effort change forward failed for %r",
+                        session_id,
+                    )
             return await _finish_driver_response({"queued": False})
         if body.type == _STOP_SESSION_TYPE:
             # Terminating the whole session (not just the current turn)

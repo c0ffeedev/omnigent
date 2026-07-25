@@ -6413,14 +6413,24 @@ def create_runner_app(
                 credential_turn_id,
                 native_terminal=native_terminal,
             )
+            if native_terminal is not None and not native_terminal.done():
+                native_terminal.set_result(succeeded)
             complete_claim = True
         except asyncio.CancelledError as exc:
             registered = _driver_terminal_turns.get(conv)
-            external_execution_started = (
-                fence_lost.is_set()
-                and native_terminal is not None
+            owns_terminal = (
+                native_terminal is not None
                 and registered is not None
                 and registered[1] is native_terminal
+            )
+            if owns_terminal and not _is_native_harness(conv):
+                assert native_terminal is not None
+                if not native_terminal.done():
+                    native_terminal.set_result(False)
+                succeeded = False
+                complete_claim = True
+            external_execution_started = (
+                fence_lost.is_set() and owns_terminal and _is_native_harness(conv)
             )
             if external_execution_started:
                 assert native_terminal is not None
@@ -6791,9 +6801,10 @@ def create_runner_app(
             )
 
         wait_for_native_terminal = native_terminal is not None and is_native_harness(harness_name)
+        if native_terminal is not None:
+            _driver_terminal_turns[conv] = (ctx.turn_id, native_terminal)
         if wait_for_native_terminal:
             assert native_terminal is not None
-            _driver_terminal_turns[conv] = (ctx.turn_id, native_terminal)
 
         try:
             response = await _stream_message_to_harness(
@@ -7604,6 +7615,7 @@ def create_runner_app(
             "interrupt",
             "slash_command",
             "stop_session",
+            "effort_change",
         }
         if driver_claim is not None:
             if not isinstance(driver_claim, dict):
@@ -7888,6 +7900,11 @@ def create_runner_app(
 
         control_heartbeat: asyncio.Task[None] | None = None
         control_fence_lost = asyncio.Event()
+        driver_control_terminal = (
+            _driver_terminal_turns.get(conversation_id)
+            if isinstance(driver_claim, dict) and body_type == "interrupt"
+            else None
+        )
         if isinstance(driver_claim, dict) and execution_event:
             test_hook = getattr(app.state, "driver_fence_test_hook", None)
             if test_hook is not None:
@@ -7917,6 +7934,11 @@ def create_runner_app(
             """Settle a fenced control claim after its handler reaches a terminal response."""
             if control_heartbeat is None or not isinstance(driver_claim, dict):
                 return response
+            if response.status_code < 400 and driver_control_terminal is not None:
+                # Native interrupt injection is acceptance, not terminal proof.
+                # Only the exact interrupted turn's status callback resolves
+                # this future; shielding keeps its owner alive if HTTP drops.
+                await asyncio.shield(driver_control_terminal[1])
             completion = asyncio.create_task(
                 _complete_driver_claim(
                     conversation_id,
@@ -8090,23 +8112,27 @@ def create_runner_app(
             if harness in ("claude-native", "codex-native"):
                 effort = body.get("effort") if isinstance(body, dict) else None
                 if effort is not None and not isinstance(effort, str):
-                    return JSONResponse(
-                        status_code=400,
-                        content={
-                            "error": "invalid_input",
-                            "detail": "Body 'effort' must be a string or null",
-                        },
+                    return await _finish_driver_control(
+                        JSONResponse(
+                            status_code=400,
+                            content={
+                                "error": "invalid_input",
+                                "detail": "Body 'effort' must be a string or null",
+                            },
+                        )
                     )
                 if harness == "codex-native":
-                    return await _handle_codex_native_settings_update(
+                    response = await _handle_codex_native_settings_update(
                         conversation_id,
                         {"effort": effort},
                     )
-                return await _handle_claude_native_effort_change(
-                    conversation_id,
-                    effort,
-                )
-            return Response(status_code=204)
+                else:
+                    response = await _handle_claude_native_effort_change(
+                        conversation_id,
+                        effort,
+                    )
+                return await _finish_driver_control(response)
+            return await _finish_driver_control(Response(status_code=204))
 
         if body_type == "model_change":
             harness = _session_harness_name(conversation_id)
