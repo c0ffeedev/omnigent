@@ -1515,6 +1515,7 @@ class SqlSessionDriverEvent(ConversationBase):
     previous_holder_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     generation: Mapped[int] = mapped_column(Integer, nullable=False)
     input_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
 
     __table_args__ = (
@@ -1545,6 +1546,11 @@ class SqlSessionDriverDispatch(ConversationBase):
     actor_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
     generation: Mapped[int] = mapped_column(Integer, nullable=False)
     input_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    source_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    effect_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    consumer_token: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    consumer_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
     state: Mapped[str] = mapped_column(String(16), nullable=False)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     completed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -1552,6 +1558,10 @@ class SqlSessionDriverDispatch(ConversationBase):
 
     __table_args__ = (
         CheckConstraint("generation > 0", name="ck_session_driver_dispatches_generation_positive"),
+        CheckConstraint(
+            "consumer_generation IS NULL OR consumer_generation > 0",
+            name="ck_session_driver_dispatches_consumer_generation_positive",
+        ),
         CheckConstraint(
             "state IN ('running', 'completed', 'failed')",
             name="ck_session_driver_dispatches_state",
@@ -1572,6 +1582,12 @@ class SqlSessionDriverDispatch(ConversationBase):
             "session_id",
             "state",
             "claim_expires_at",
+        ),
+        UniqueConstraint(
+            "workspace_id",
+            "session_id",
+            "source_id",
+            name="uq_session_driver_dispatches_source",
         ),
     )
 

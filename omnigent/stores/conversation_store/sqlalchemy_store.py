@@ -103,6 +103,7 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     ConversationStore,
     CreatedSession,
+    DriverDispatchClaim,
     DriverLeaseConflictError,
     SessionConnectivity,
     SessionDriverLease,
@@ -2132,10 +2133,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         generation: int,
         created_at: int,
         input_type: str | None = None,
+        event_id: str | None = None,
+        source_id: str | None = None,
     ) -> None:
         session.add(
             SqlSessionDriverEvent(
-                id=uuid.uuid4().hex,
+                id=event_id or uuid.uuid4().hex,
                 session_id=session_id,
                 event_type=event_type,
                 actor_user_id=actor_user_id,
@@ -2143,6 +2146,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 previous_holder_user_id=previous_holder_user_id,
                 generation=generation,
                 input_type=input_type,
+                source_id=source_id,
                 created_at=created_at,
             )
         )
@@ -2284,8 +2288,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         generation: int | None,
         event_type: str,
         *,
+        source_id: str | None = None,
         claim_ttl_seconds: int = DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
-    ) -> str | None:
+    ) -> DriverDispatchClaim | str | None:
         """Validate, audit, and durably claim an event in one transaction."""
         if claim_ttl_seconds <= 0:
             raise ValueError("claim_ttl_seconds must be positive")
@@ -2307,8 +2312,56 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise DriverLeaseConflictError(
                     "driver lease is stale, expired, or not held by actor"
                 )
+            if source_id is not None:
+                existing = session.execute(
+                    select(SqlSessionDriverDispatch)
+                    .where(
+                        SqlSessionDriverDispatch.workspace_id == current_workspace_id(),
+                        SqlSessionDriverDispatch.session_id == session_id,
+                        SqlSessionDriverDispatch.source_id == source_id,
+                    )
+                    .with_for_update()
+                ).scalar_one_or_none()
+                if existing is not None:
+                    if (
+                        existing.actor_user_id != actor_user_id
+                        or existing.generation != row.generation
+                        or existing.input_type != event_type
+                        or existing.event_id is None
+                        or existing.effect_id is None
+                    ):
+                        raise DriverLeaseConflictError("driver event source identity was reused")
+                    if existing.state == "completed":
+                        raise DriverLeaseConflictError("driver event source was already completed")
+                    if (
+                        existing.state == "running"
+                        and existing.claim_expires_at is not None
+                        and existing.claim_expires_at > now
+                    ):
+                        raise DriverLeaseConflictError("driver dispatch is in progress")
+                    consumer_token = uuid.uuid4().hex
+                    consumer_generation = (existing.consumer_generation or 0) + 1
+                    existing.consumer_token = consumer_token
+                    existing.consumer_generation = consumer_generation
+                    existing.state = "running"
+                    existing.completed_at = None
+                    existing.claim_expires_at = now + claim_ttl_seconds
+                    return DriverDispatchClaim(
+                        dispatch_id=existing.id,
+                        event_id=existing.event_id,
+                        source_id=source_id,
+                        effect_id=existing.effect_id,
+                        driver_generation=existing.generation,
+                        consumer_token=consumer_token,
+                        consumer_generation=consumer_generation,
+                        claim_expires_at=now + claim_ttl_seconds,
+                    )
             self._reject_active_driver_dispatch(session, session_id)
             dispatch_id = uuid.uuid4().hex
+            event_id = uuid.uuid4().hex
+            effect_id = uuid.uuid4().hex if source_id is not None else None
+            consumer_token = uuid.uuid4().hex if source_id is not None else None
+            consumer_generation = 1 if source_id is not None else None
             self._record_driver_event(
                 session,
                 session_id=session_id,
@@ -2319,6 +2372,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 generation=row.generation,
                 input_type=event_type,
                 created_at=now,
+                event_id=event_id,
+                source_id=source_id,
             )
             session.add(
                 SqlSessionDriverDispatch(
@@ -2327,12 +2382,31 @@ class SqlAlchemyConversationStore(ConversationStore):
                     actor_user_id=actor_user_id,
                     generation=row.generation,
                     input_type=event_type,
+                    event_id=event_id,
+                    source_id=source_id,
+                    effect_id=effect_id,
+                    consumer_token=consumer_token,
+                    consumer_generation=consumer_generation,
                     state="running",
                     created_at=now,
                     completed_at=None,
                     claim_expires_at=now + claim_ttl_seconds,
                 )
             )
+            if source_id is not None:
+                assert effect_id is not None
+                assert consumer_token is not None
+                assert consumer_generation is not None
+                return DriverDispatchClaim(
+                    dispatch_id=dispatch_id,
+                    event_id=event_id,
+                    source_id=source_id,
+                    effect_id=effect_id,
+                    driver_generation=row.generation,
+                    consumer_token=consumer_token,
+                    consumer_generation=consumer_generation,
+                    claim_expires_at=now + claim_ttl_seconds,
+                )
             return dispatch_id
 
     def renew_driver_event(
@@ -2340,6 +2414,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         session_id: str,
         dispatch_id: str,
         *,
+        consumer_token: str | None = None,
+        consumer_generation: int | None = None,
         claim_ttl_seconds: int = DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
     ) -> None:
         """Extend an unexpired dispatch claim using its random fencing id."""
@@ -2356,6 +2432,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlSessionDriverDispatch.session_id == session_id,
                     SqlSessionDriverDispatch.state == "running",
                     SqlSessionDriverDispatch.claim_expires_at > now,
+                    or_(
+                        SqlSessionDriverDispatch.consumer_token.is_(None),
+                        and_(
+                            SqlSessionDriverDispatch.consumer_token == consumer_token,
+                            SqlSessionDriverDispatch.consumer_generation == consumer_generation,
+                        ),
+                    ),
                 )
                 .values(
                     claim_expires_at=case(
@@ -2375,6 +2458,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         session_id: str,
         dispatch_id: str,
         *,
+        consumer_token: str | None = None,
+        consumer_generation: int | None = None,
         succeeded: bool,
     ) -> None:
         """Finish a durable dispatch claim before the request completes."""
@@ -2388,6 +2473,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlSessionDriverDispatch.session_id == session_id,
                     SqlSessionDriverDispatch.state == "running",
                     SqlSessionDriverDispatch.claim_expires_at > now,
+                    or_(
+                        SqlSessionDriverDispatch.consumer_token.is_(None),
+                        and_(
+                            SqlSessionDriverDispatch.consumer_token == consumer_token,
+                            SqlSessionDriverDispatch.consumer_generation == consumer_generation,
+                        ),
+                    ),
                 )
                 .values(
                     state="completed" if succeeded else "failed",

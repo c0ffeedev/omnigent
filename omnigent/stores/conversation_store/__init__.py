@@ -249,6 +249,20 @@ class SessionDriverLease:
         )
 
 
+@dataclass(frozen=True)
+class DriverDispatchClaim:
+    """Durable identity and consumer fence for one accepted driver input."""
+
+    dispatch_id: str
+    event_id: str
+    source_id: str
+    effect_id: str
+    driver_generation: int
+    consumer_token: str
+    consumer_generation: int
+    claim_expires_at: int
+
+
 class DriverLeaseConflictError(Exception):
     """Raised when a lease mutation loses ownership or generation fencing."""
 
@@ -380,8 +394,9 @@ class ConversationStore(ABC):
         generation: int | None,
         event_type: str,
         *,
+        source_id: str | None = None,
         claim_ttl_seconds: int = DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
-    ) -> str | None:
+    ) -> DriverDispatchClaim | str | None:
         """Atomically validate, accept, and claim a human driver event."""
         raise NotImplementedError
 
@@ -390,6 +405,8 @@ class ConversationStore(ABC):
         session_id: str,
         dispatch_id: str,
         *,
+        consumer_token: str | None = None,
+        consumer_generation: int | None = None,
         claim_ttl_seconds: int = DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
     ) -> None:
         """Renew an unexpired durable dispatch claim."""
@@ -400,6 +417,8 @@ class ConversationStore(ABC):
         session_id: str,
         dispatch_id: str,
         *,
+        consumer_token: str | None = None,
+        consumer_generation: int | None = None,
         succeeded: bool,
     ) -> None:
         """Finish a claimed event, unblocking subsequent lease mutations."""
