@@ -1162,6 +1162,7 @@ def register_events_routes(
                 runner_router,
             )
             interrupt_delivered = False
+            runner_completion_deferred = False
             if runner_client is not None:
                 try:
                     interrupt_resp = await runner_client.post(
@@ -1177,17 +1178,27 @@ def register_events_routes(
                         timeout=5.0,
                     )
                     interrupt_delivered = interrupt_resp.status_code < 400
+                except asyncio.CancelledError:
+                    await _finish_driver_response(
+                        None,
+                        defer_to_runner=body._driver_claim is not None,
+                    )
+                    raise
                 except (httpx.HTTPError, ConnectionError):
                     # WSTunnelTransport raises bare ConnectionError on tunnel close.
+                    runner_completion_deferred = body._driver_claim is not None
                     _logger.exception(
                         "Interrupt forward failed for %r",
                         session_id,
                     )
-            if not interrupt_delivered:
+            if not interrupt_delivered and not runner_completion_deferred:
                 # The turn keeps running and nothing else lifts the fence —
                 # remove it so the turn's remaining output isn't dropped.
                 _interrupt_fenced_sessions.discard(session_id)
-            return await _finish_driver_response({"queued": False})
+            return await _finish_driver_response(
+                {"queued": False},
+                defer_to_runner=runner_completion_deferred,
+            )
         if body.type == "effort_change":
             await _accept_driver_fence()
             await _guard_driver_side_effect("before_effort_change_dispatch")
@@ -1195,6 +1206,7 @@ def register_events_routes(
                 session_id,
                 runner_router,
             )
+            runner_completion_deferred = False
             if runner_client is not None:
                 try:
                     await runner_client.post(
@@ -1210,12 +1222,22 @@ def register_events_routes(
                         },
                         timeout=5.0,
                     )
+                except asyncio.CancelledError:
+                    await _finish_driver_response(
+                        None,
+                        defer_to_runner=body._driver_claim is not None,
+                    )
+                    raise
                 except (httpx.HTTPError, ConnectionError):
+                    runner_completion_deferred = body._driver_claim is not None
                     _logger.exception(
                         "Effort change forward failed for %r",
                         session_id,
                     )
-            return await _finish_driver_response({"queued": False})
+            return await _finish_driver_response(
+                {"queued": False},
+                defer_to_runner=runner_completion_deferred,
+            )
         if body.type == _STOP_SESSION_TYPE:
             # Terminating the whole session (not just the current turn)
             # is a lifecycle action; require owner access on top of the

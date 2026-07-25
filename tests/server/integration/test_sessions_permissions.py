@@ -3612,6 +3612,128 @@ async def test_driver_fenced_effort_change_retry_does_not_replay(
     assert len(forwarded) == 1
 
 
+@pytest.mark.parametrize("transport_failure", ["timeout", "cancellation"])
+@pytest.mark.parametrize(
+    ("event_type", "event_data"),
+    [("effort_change", {"effort": "high"}), ("interrupt", {})],
+)
+async def test_driver_fenced_control_transport_loss_defers_completion_to_runner(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    transport_failure: str,
+    event_type: str,
+    event_data: dict[str, Any],
+) -> None:
+    """AP transport loss after runner acceptance cannot release control authority."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    forwarded: list[dict[str, Any]] = []
+    runner_accepted = asyncio.Event()
+
+    class _Runner:
+        async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+            forwarded.append(kwargs["json"])
+            runner_accepted.set()
+            request = httpx.Request("POST", f"http://runner{path}")
+            if transport_failure == "cancellation":
+                await asyncio.Future()
+            raise httpx.ReadTimeout("runner terminal response pending", request=request)
+
+    async def _runner(*_: Any, **__: Any) -> _Runner:
+        return _Runner()
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    binding_token = "control-transport-loss-runner-token"
+    runner_id = token_bound_runner_id(binding_token)
+    store.replace_runner_id(session_id, runner_id)
+    alice_headers = {"X-Forwarded-Email": "alice@example.com"}
+    bob_headers = {"X-Forwarded-Email": "bob@example.com"}
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers=alice_headers,
+    )
+    assert acquired.status_code == 200, acquired.text
+    event = {
+        "type": event_type,
+        "driver_generation": 1,
+        "source_id": f"{event_type}-transport-loss-1",
+        "data": event_data,
+    }
+
+    request_task = asyncio.create_task(
+        auth_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json=event,
+            headers=alice_headers,
+        )
+    )
+    await asyncio.wait_for(runner_accepted.wait(), timeout=1.0)
+    if transport_failure == "cancellation":
+        request_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+    else:
+        timed_out = await request_task
+        assert timed_out.status_code == 202, timed_out.text
+    assert runner_accepted.is_set()
+    assert len(forwarded) == 1
+    claim = forwarded[0]["driver_claim"]
+    claim_body = {
+        "dispatch_id": claim["dispatch_id"],
+        "consumer_token": claim["consumer_token"],
+        "consumer_generation": claim["consumer_generation"],
+    }
+    runner_headers = {RUNNER_TUNNEL_TOKEN_HEADER: binding_token}
+    heartbeat = await auth_client.post(
+        f"/v1/runners/{runner_id}/sessions/{session_id}/driver-dispatch/heartbeat",
+        json=claim_body,
+        headers=runner_headers,
+    )
+    assert heartbeat.status_code == 200, heartbeat.text
+
+    active_retry = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=event,
+        headers=alice_headers,
+    )
+    assert active_retry.status_code == 409, active_retry.text
+    assert len(forwarded) == 1
+    manage_grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="alice@example.com",
+        target_user="bob@example.com",
+        level=LEVEL_MANAGE,
+    )
+    assert manage_grant.status_code == 200, manage_grant.text
+    takeover = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30, "force": True},
+        headers=bob_headers,
+    )
+    assert takeover.status_code == 409, takeover.text
+
+    terminal = await auth_client.post(
+        f"/v1/runners/{runner_id}/sessions/{session_id}/driver-dispatch/complete",
+        json=claim_body,
+        headers=runner_headers,
+    )
+    assert terminal.status_code == 200, terminal.text
+    completed_retry = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=event,
+        headers=alice_headers,
+    )
+    assert completed_retry.status_code == 202, completed_retry.text
+    assert completed_retry.json()["duplicate"] is True
+    assert len(forwarded) == 1
+
+
 async def test_bound_runner_lease_state_is_explicit_and_authenticated(
     auth_client: httpx.AsyncClient,
     db_uri: str,
