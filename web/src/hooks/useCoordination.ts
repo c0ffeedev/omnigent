@@ -30,6 +30,7 @@ export type { CoordinationSnapshot } from "@/lib/coordinationState";
 
 export const COORDINATION_REFRESH_INTERVAL_MS = 20_000;
 const PUBLIC_DRIVER_USER_ID = "__public__";
+const AUTO_RENEW_QUERY_PREFIX = ["coordination-driver-auto-renew"] as const;
 
 export type CoordinationConnectionState =
   | "offline"
@@ -282,11 +283,60 @@ export function useCoordination(sessionId: string): UseCoordinationResult {
     onSuccess: handleLeaseSuccess,
     onError: handleLeaseError,
   });
+  const expectedDriverUserId = viewer.loaded ? (viewer.userId ?? PUBLIC_DRIVER_USER_ID) : null;
+
+  useEffect(() => {
+    const lease = query.data?.driverLease;
+    if (
+      lease?.active !== true ||
+      expectedDriverUserId === null ||
+      lease.holderUserId !== expectedDriverUserId
+    ) {
+      return;
+    }
+
+    const leaseStartedAt = lease.renewedAt ?? lease.acquiredAt;
+    if (lease.expiresAt === null || leaseStartedAt === null) return;
+    const leaseDurationSeconds = Math.round(lease.expiresAt - leaseStartedAt);
+    const remainingSeconds = lease.expiresAt - Date.now() / 1000;
+    if (leaseDurationSeconds <= 0 || remainingSeconds <= 0) return;
+
+    const renewAt = leaseStartedAt + leaseDurationSeconds / 2;
+    const delayMs = Math.max(0, (renewAt - Date.now() / 1000) * 1000);
+    const renewQueryKey = [
+      ...AUTO_RENEW_QUERY_PREFIX,
+      sessionId,
+      lease.generation,
+      lease.expiresAt,
+    ] as const;
+    const timer = window.setTimeout(() => {
+      void queryClient
+        .fetchQuery({
+          queryKey: renewQueryKey,
+          queryFn: async ({ signal }) => {
+            const renewed = await renewDriverLease(sessionId, {
+              generation: lease.generation,
+              ttlSeconds: leaseDurationSeconds,
+              signal,
+            });
+            settleLease(renewed);
+            return renewed;
+          },
+          retry: false,
+          staleTime: Number.POSITIVE_INFINITY,
+        })
+        .catch(() => {
+          queryClient.removeQueries({ queryKey: renewQueryKey, exact: true });
+          void queryClient.invalidateQueries({ queryKey: coordinationQueryKey(sessionId) });
+        });
+    }, delayMs);
+
+    return () => window.clearTimeout(timer);
+  }, [expectedDriverUserId, query.data?.driverLease, queryClient, sessionId, settleLease]);
 
   const driverLease = query.data?.driverLease ?? null;
   const currentDriverUserId =
     driverLease?.active === true ? (driverLease.holderUserId ?? null) : null;
-  const expectedDriverUserId = viewer.loaded ? (viewer.userId ?? PUBLIC_DRIVER_USER_ID) : null;
   const refreshError = refreshFailure?.error ?? null;
   const connectionState: CoordinationConnectionState =
     !isOnline || query.fetchStatus === "paused"

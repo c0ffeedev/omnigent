@@ -1813,6 +1813,42 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(eventBodies.map(textOf)).toEqual(["1", "2", "3"]);
   });
 
+  it("fences a driver-owned message with the cached lease generation and a source id", async () => {
+    useChatStore.setState({
+      conversationId: "conv_x",
+      abortController: new AbortController(),
+      status: "idle",
+    });
+    client.setQueryData(coordinationQueryKey("conv_x"), {
+      driverLease: {
+        sessionId: "conv_x",
+        holderUserId: "alice@example.com",
+        generation: 7,
+        acquiredAt: 100,
+        renewedAt: 100,
+        expiresAt: 1_000,
+        releasedAt: null,
+        active: true,
+      },
+      presence: null,
+    });
+
+    await useChatStore.getState().send("lease fenced", "agent_xyz");
+
+    const eventCall = fetchMock.mock.calls.find(
+      ([url, init]) =>
+        String(url) === "/v1/sessions/conv_x/events" &&
+        (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(eventCall).toBeDefined();
+    const body = JSON.parse((eventCall![1] as RequestInit).body as string) as Record<
+      string,
+      unknown
+    >;
+    expect(body.driver_generation).toBe(7);
+    expect(body.source_id).toMatch(/^web:[^:]+:message:pend_\d+$/);
+  });
+
   it("PATCHes sticky effort onto a brand-new session before binding the runner", async () => {
     seedSession("conv_new");
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {

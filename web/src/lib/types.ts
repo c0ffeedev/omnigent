@@ -159,14 +159,20 @@ export type SessionStatus = "idle" | "launching" | "running" | "waiting" | "fail
  *
  * Mirrors `omnigent.server.schemas.SessionEventInput`.
  */
-export type SessionEventInput =
+export type SessionEventInput = (
   | { type: "message"; data: { role: "user"; content: ContentBlock[] } }
   | { type: "function_call_output"; data: Record<string, unknown> }
   | { type: "approval"; data: Record<string, unknown> }
   | { type: "interrupt"; data?: Record<string, unknown> }
   | { type: "stop_session"; data?: Record<string, unknown> }
   | { type: "slash_command"; data: { kind: "skill"; name: string; arguments: string } }
-  | { type: string; data: Record<string, unknown> };
+  | { type: string; data: Record<string, unknown> }
+) & {
+  /** Active driver-lease fencing token, when this event can author/control a turn. */
+  driver_generation?: number;
+  /** Stable per-attempt id used by the server's durable driver-event outbox. */
+  source_id?: string;
+};
 
 /**
  * A session snapshot item.

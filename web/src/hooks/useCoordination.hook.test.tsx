@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
   acquireDriverLeaseMock,
@@ -41,13 +41,14 @@ import { DriverLeaseConflictError, type DriverLease } from "@/lib/coordinationAp
 import { coordinationAuditQueryKey } from "@/lib/coordinationState";
 import { useCoordination } from "./useCoordination";
 
+const leaseEpoch = Date.now() / 1000;
 const currentLease: DriverLease = {
   sessionId: "sess-1",
   holderUserId: "alice@example.com",
   generation: 3,
-  acquiredAt: 10,
-  renewedAt: 11,
-  expiresAt: 41,
+  acquiredAt: leaseEpoch,
+  renewedAt: leaseEpoch,
+  expiresAt: leaseEpoch + 3_600,
   releasedAt: null,
   active: true,
 };
@@ -79,6 +80,10 @@ beforeEach(() => {
   handoffDriverLeaseMock.mockReset();
   releaseDriverLeaseMock.mockReset();
   renewDriverLeaseMock.mockReset();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe("useCoordination", () => {
@@ -128,6 +133,56 @@ describe("useCoordination", () => {
     expect(invalidateQueries).toHaveBeenCalledWith({
       queryKey: coordinationAuditQueryKey("sess-1"),
     });
+    unmount();
+  });
+
+  it("renews the current user's lease halfway through its server-defined duration", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(20_000);
+    const lease = {
+      ...currentLease,
+      acquiredAt: 20,
+      renewedAt: 20,
+      expiresAt: 50,
+    };
+    getDriverLeaseMock.mockResolvedValueOnce(lease);
+    const renewedLease = {
+      ...lease,
+      renewedAt: 35,
+      expiresAt: 65,
+    };
+    let resolveRenewal!: (lease: DriverLease) => void;
+    renewDriverLeaseMock.mockImplementationOnce(
+      () => new Promise<DriverLease>((resolve) => (resolveRenewal = resolve)),
+    );
+    const { result, unmount } = renderHook(() => useCoordination("sess-1"), {
+      wrapper: makeWrapper(),
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current.driverLease).toEqual(lease);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(14_999);
+    });
+    expect(renewDriverLeaseMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(renewDriverLeaseMock).toHaveBeenCalledOnce();
+    expect(renewDriverLeaseMock).toHaveBeenCalledWith("sess-1", {
+      generation: lease.generation,
+      ttlSeconds: 30,
+      signal: expect.any(AbortSignal),
+    });
+    await act(async () => {
+      resolveRenewal(renewedLease);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current.driverLease?.expiresAt).toBe(65);
+
     unmount();
   });
 

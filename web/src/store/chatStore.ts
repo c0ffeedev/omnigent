@@ -65,7 +65,6 @@ import {
   getSessionSlim,
   fetchInitialHistoryWindow,
   fetchSessionItemsPage,
-  interrupt as interruptSession,
   openSessionStream,
   postEvent,
   type SessionItemsPage,
@@ -96,6 +95,7 @@ import type {
   PendingInput,
   SandboxStatus,
   Session,
+  SessionEventInput,
   SessionStatus,
   SkillSummary,
 } from "@/lib/types";
@@ -108,6 +108,8 @@ import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
 import {
   applyDriverLeaseToCoordinationCache,
   applyPresenceToCoordinationCache,
+  coordinationQueryKey,
+  type CoordinationSnapshot,
 } from "@/lib/coordinationState";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
@@ -681,6 +683,33 @@ export interface ChatState {
 }
 
 let queryClient: QueryClient | null = null;
+const driverSourceClientId =
+  typeof globalThis.crypto?.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+let driverSourceSequence = 0;
+
+function nextDriverSourceId(kind: string): string {
+  driverSourceSequence += 1;
+  return `web:${driverSourceClientId}:${kind}:${driverSourceSequence}`;
+}
+
+/** Attach the current authoritative lease token to turn-controlling events. */
+function postCoordinatedEvent(
+  sessionId: string,
+  event: SessionEventInput,
+  sourceId: string,
+): ReturnType<typeof postEvent> {
+  const lease = queryClient?.getQueryData<CoordinationSnapshot>(
+    coordinationQueryKey(sessionId),
+  )?.driverLease;
+  return postEvent(
+    sessionId,
+    lease?.active === true
+      ? { ...event, driver_generation: lease.generation, source_id: sourceId }
+      : event,
+  );
+}
 
 // Catalogs that resolved while their bind snapshot was still hydrating.
 const racedNativeModelOptions = new Map<string, NativeModelOption[]>();
@@ -1127,10 +1156,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ...fileBlocks,
           ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
         ];
-        await postEvent(conversationId, {
-          type: "message",
-          data: { role: "user", content },
-        });
+        await postCoordinatedEvent(
+          conversationId,
+          {
+            type: "message",
+            data: { role: "user", content },
+          },
+          `web:${driverSourceClientId}:queue:${head.queueId}`,
+        );
       })()
         .catch(() => {
           backgroundFlushCooldownUntil.set(
@@ -1256,13 +1289,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
         }));
       }
 
-      const postResult = await postEvent(sessionId, {
-        type: "message",
-        data: {
-          role: "user",
-          content: serverContent,
+      const postResult = await postCoordinatedEvent(
+        sessionId,
+        {
+          type: "message",
+          data: {
+            role: "user",
+            content: serverContent,
+          },
         },
-      });
+        `web:${driverSourceClientId}:message:${tempId}`,
+      );
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
@@ -1418,10 +1455,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Same wire shape the REPL sends (repl/_repl.py). The server resolves
       // the skill, persists a visible receipt + hidden `<skill>` meta
       // message, and forwards the meta to the runner.
-      const postResult = await postEvent(sessionId, {
-        type: "slash_command",
-        data: { kind: "skill", name, arguments: args },
-      });
+      const postResult = await postCoordinatedEvent(
+        sessionId,
+        {
+          type: "slash_command",
+          data: { kind: "skill", name, arguments: args },
+        },
+        nextDriverSourceId("slash-command"),
+      );
       if (postResult.denied) {
         // Denied commands publish no receipt, so nothing will pop the
         // optimistic echo — roll it back here alongside the status
@@ -1503,7 +1544,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // do NOT abort the local SSE stream — it remains open across
     // turns; switchTo or tab unload is the only thing that tears it
     // down.
-    void interruptSession(sessionId).catch(() => {
+    void postCoordinatedEvent(
+      sessionId,
+      { type: "interrupt", data: {} },
+      nextDriverSourceId("interrupt"),
+    ).catch(() => {
       // Interrupt is best-effort. A network failure here means the
       // user's cancel won't reach the server, but the local UI already
       // reflects the user's stop request below.
@@ -1721,7 +1766,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
   compact: async () => {
     const { conversationId } = get();
     if (!conversationId) return;
-    await postEvent(conversationId, { type: "compact", data: {} });
+    await postCoordinatedEvent(
+      conversationId,
+      { type: "compact", data: {} },
+      nextDriverSourceId("compact"),
+    );
   },
 
   refreshSessionState: async (conversationId) => {

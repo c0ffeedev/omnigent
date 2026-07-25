@@ -264,6 +264,24 @@ describe("DriverControl", () => {
     expect(usePermissionsMock).toHaveBeenCalledWith(null);
   });
 
+  it("keeps release visible when the current driver is the only participant", () => {
+    useCoordinationMock.mockReturnValue(
+      coordination({
+        presence: {
+          sessionId: "sess-1",
+          activeUserIds: ["alice@example.com"],
+          entries: [],
+        },
+        activeParticipantIds: ["alice@example.com"],
+        isCurrentUserDriver: true,
+      }),
+    );
+    render(<DriverControl sessionId="sess-1" permissionLevel={3} />);
+
+    expect(screen.getByText("You have control")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Release control" })).toBeInTheDocument();
+  });
+
   it("preserves an active lease whose holder identity is unavailable", () => {
     useCoordinationMock.mockReturnValue(
       coordination({

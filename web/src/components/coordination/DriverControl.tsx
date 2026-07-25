@@ -156,9 +156,7 @@ export function DriverControl({ sessionId, permissionLevel }: DriverControlProps
     }
   }, [actionPending, confirmation, confirmationIsCurrent]);
 
-  const hasCollaborationContext =
-    (activeParticipantIds?.length ?? 0) > 1 ||
-    (activeLease !== null && !coordination.isCurrentUserDriver);
+  const hasCollaborationContext = (activeParticipantIds?.length ?? 0) > 1 || activeLease !== null;
   if (!hasCollaborationContext && !coordination.error) return null;
 
   const refreshState = async () => {

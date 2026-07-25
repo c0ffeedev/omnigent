@@ -107,6 +107,21 @@ def test_driver_acquire_handoff_and_release_are_keyboard_operable(
             "aria-label", re.compile(rf"{re.escape(ADMIN_EMAIL)} is driver")
         )
 
+        owner_message = f"owner driver message {uuid.uuid4().hex}"
+        owner.get_by_placeholder("Ask the agent anything…").fill(owner_message)
+        with owner.expect_response(
+            lambda response: (
+                response.url.endswith(f"/v1/sessions/{session_id}/events")
+                and response.request.method == "POST"
+            )
+        ) as owner_message_response:
+            owner.get_by_role("button", name="Send", exact=True).click()
+        assert owner_message_response.value.status == 503
+        owner_event = owner_message_response.value.request.post_data_json
+        assert isinstance(owner_event, dict)
+        assert owner_event["driver_generation"] == 1
+        assert owner_event["source_id"].startswith("web:")
+
         target = owner.get_by_role("combobox", name="Transfer control to")
         target.click()
         owner.get_by_role("option", name=collaborator_email).click()
@@ -138,6 +153,36 @@ def test_driver_acquire_handoff_and_release_are_keyboard_operable(
                 re.compile(rf"{re.escape(collaborator_email)} is driver"),
                 timeout=15_000,
             )
+
+        collaborator_message = f"collaborator driver message {uuid.uuid4().hex}"
+        collaborator.get_by_placeholder("Ask the agent anything…").fill(collaborator_message)
+        with collaborator.expect_response(
+            lambda response: (
+                response.url.endswith(f"/v1/sessions/{session_id}/events")
+                and response.request.method == "POST"
+            )
+        ) as collaborator_message_response:
+            collaborator.get_by_role("button", name="Send", exact=True).click()
+        assert collaborator_message_response.value.status == 503
+        collaborator_event = collaborator_message_response.value.request.post_data_json
+        assert isinstance(collaborator_event, dict)
+        assert collaborator_event["driver_generation"] == 2
+        assert collaborator_event["source_id"].startswith("web:")
+
+        fenced_message = f"stale driver message {uuid.uuid4().hex}"
+        owner.get_by_placeholder("Ask the agent anything…").fill(fenced_message)
+        with owner.expect_response(
+            lambda response: (
+                response.url.endswith(f"/v1/sessions/{session_id}/events")
+                and response.request.method == "POST"
+            )
+        ) as fenced_message_response:
+            owner.get_by_role("button", name="Send", exact=True).click()
+        assert fenced_message_response.value.status == 409
+        fenced_event = fenced_message_response.value.request.post_data_json
+        assert isinstance(fenced_event, dict)
+        assert fenced_event["driver_generation"] == 2
+        assert fenced_event["source_id"].startswith("web:")
 
         release = collaborator.get_by_role("button", name="Release control")
         release.focus()
