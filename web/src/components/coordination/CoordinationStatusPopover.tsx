@@ -155,25 +155,21 @@ export function CoordinationStatusPopover({ sessionId }: CoordinationStatusPopov
   const titleId = useId();
   const descriptionId = useId();
   const coordination = useCoordination(sessionId);
-  const participantIds = coordination.activeParticipantIds;
-  const hasSnapshot = coordination.presence !== null || coordination.updatedAt !== null;
+  const participantIds = coordination.presence?.activeUserIds ?? [];
+  const hasSnapshot = coordination.presence !== null || coordination.driverLease !== null;
   const displayState = displayStateFor({
     connectionState: coordination.connectionState,
     hasSnapshot,
-    isLoading: coordination.isLoading,
-    isStale: coordination.isStale,
+    isLoading: coordination.connectionState === "connecting" && !hasSnapshot,
+    isStale: coordination.connectionState === "error" && hasSnapshot,
   });
   const status = STATUS_COPY[displayState];
   const isLastKnown = displayState !== "live";
-  const currentDriverUserId = coordination.currentDriverUserId;
+  const currentDriverUserId =
+    coordination.driverLease?.active === true
+      ? (coordination.driverLease.holderUserId ?? null)
+      : null;
   const leaseExpiry = formatTimestamp(coordination.driverLease?.expiresAt ?? null);
-  const lastUpdated =
-    coordination.updatedAt === null
-      ? null
-      : new Intl.DateTimeFormat(undefined, {
-          hour: "numeric",
-          minute: "2-digit",
-        }).format(new Date(coordination.updatedAt));
 
   return (
     <>
@@ -352,10 +348,7 @@ export function CoordinationStatusPopover({ sessionId }: CoordinationStatusPopov
               {isLastKnown && (
                 <div className="flex items-start gap-2 bg-muted/50 px-3 py-2.5 text-muted-foreground text-xs">
                   <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden />
-                  <span>
-                    Displayed participants and lease are last known, not current.
-                    {lastUpdated ? ` Last updated at ${lastUpdated}.` : ""}
-                  </span>
+                  <span>Displayed participants and lease are last known, not current.</span>
                 </div>
               )}
             </div>

@@ -39,24 +39,15 @@ function coordinationResult(
   return {
     ...liveSnapshot,
     connectionState: "connected",
-    isLoading: false,
-    isRefreshing: false,
-    isStale: false,
-    updatedAt: 1_785_000_005_000,
-    activeParticipantIds: liveSnapshot.presence?.activeUserIds ?? [],
-    participants: liveSnapshot.presence?.entries ?? [],
-    currentDriverUserId: liveSnapshot.driverLease?.holderUserId ?? null,
     isCurrentUserDriver: false,
-    isActionPending: false,
     error: null,
-    actionError: null,
     refresh: vi.fn().mockResolvedValue(undefined),
     acquire: vi.fn(),
     renew: vi.fn(),
     release: vi.fn(),
     handoff: vi.fn(),
     ...overrides,
-  };
+  } as ReturnType<typeof useCoordination>;
 }
 
 function openStatus(): void {
@@ -74,9 +65,6 @@ describe("CoordinationStatusPopover", () => {
       coordinationResult({
         presence: { sessionId: "sess-1", activeUserIds: [], entries: [] },
         driverLease: null,
-        activeParticipantIds: [],
-        participants: [],
-        currentDriverUserId: null,
       }),
     );
 
@@ -110,12 +98,7 @@ describe("CoordinationStatusPopover", () => {
       coordinationResult({
         presence: null,
         driverLease: null,
-        activeParticipantIds: [],
-        participants: [],
-        currentDriverUserId: null,
         connectionState: "connecting",
-        isLoading: true,
-        updatedAt: null,
       }),
     );
 
@@ -127,7 +110,9 @@ describe("CoordinationStatusPopover", () => {
   });
 
   it("labels cached data as last known when it is stale", () => {
-    mockUseCoordination.mockReturnValue(coordinationResult({ isStale: true }));
+    mockUseCoordination.mockReturnValue(
+      coordinationResult({ connectionState: "error", error: new Error("Refresh failed") }),
+    );
 
     render(<CoordinationStatusPopover sessionId="sess-1" />);
     expect(
@@ -143,9 +128,7 @@ describe("CoordinationStatusPopover", () => {
   });
 
   it("shows reconnecting while treating retained presence as last known", () => {
-    mockUseCoordination.mockReturnValue(
-      coordinationResult({ connectionState: "reconnecting", isRefreshing: true, isStale: true }),
-    );
+    mockUseCoordination.mockReturnValue(coordinationResult({ connectionState: "reconnecting" }));
 
     render(<CoordinationStatusPopover sessionId="sess-1" />);
     expect(screen.getByRole("status")).toHaveTextContent("Reconnecting to coordination updates");
@@ -155,9 +138,7 @@ describe("CoordinationStatusPopover", () => {
   });
 
   it("announces successful recovery without repeating participant changes", () => {
-    mockUseCoordination.mockReturnValue(
-      coordinationResult({ connectionState: "reconnecting", isRefreshing: true, isStale: true }),
-    );
+    mockUseCoordination.mockReturnValue(coordinationResult({ connectionState: "reconnecting" }));
     const { rerender } = render(<CoordinationStatusPopover sessionId="sess-1" />);
     expect(screen.getByRole("status")).toHaveTextContent("Reconnecting to coordination updates");
 
@@ -167,9 +148,7 @@ describe("CoordinationStatusPopover", () => {
   });
 
   it("distinguishes disconnected state and marks retained data as last known", () => {
-    mockUseCoordination.mockReturnValue(
-      coordinationResult({ connectionState: "offline", isStale: true }),
-    );
+    mockUseCoordination.mockReturnValue(coordinationResult({ connectionState: "offline" }));
 
     render(<CoordinationStatusPopover sessionId="sess-1" />);
     expect(screen.getByRole("status")).toHaveTextContent("Coordination updates disconnected");
@@ -184,12 +163,8 @@ describe("CoordinationStatusPopover", () => {
       coordinationResult({
         presence: null,
         driverLease: null,
-        activeParticipantIds: [],
-        participants: [],
-        currentDriverUserId: null,
         connectionState: "error",
         error: new Error("Service unavailable"),
-        updatedAt: null,
         refresh,
       }),
     );
