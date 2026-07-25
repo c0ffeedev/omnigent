@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import secrets
+import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Annotated, Any
 
@@ -102,7 +103,11 @@ from omnigent.session_lifecycle import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
-from omnigent.stores.conversation_store import DriverLeaseConflictError, SessionDriverLease
+from omnigent.stores.conversation_store import (
+    DriverDispatchClaim,
+    DriverLeaseConflictError,
+    SessionDriverLease,
+)
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
@@ -161,7 +166,7 @@ async def _driver_dispatch_lifecycle(request: Request) -> AsyncIterator[None]:
     finally:
         dispatch = getattr(request.state, "driver_dispatch", None)
         if dispatch is not None:
-            conversation_store, session_id, dispatch_id, heartbeat_task = dispatch
+            conversation_store, session_id, dispatch_id, claim, heartbeat_task = dispatch
             try:
                 heartbeat_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -171,6 +176,10 @@ async def _driver_dispatch_lifecycle(request: Request) -> AsyncIterator[None]:
                         conversation_store.complete_driver_event,
                         session_id,
                         dispatch_id,
+                        consumer_token=claim.consumer_token if claim is not None else None,
+                        consumer_generation=(
+                            claim.consumer_generation if claim is not None else None
+                        ),
                         succeeded=False,
                     )
                 )
@@ -189,6 +198,7 @@ async def _heartbeat_driver_dispatch(
     conversation_store: ConversationStore,
     session_id: str,
     dispatch_id: str,
+    claim: DriverDispatchClaim | None,
     owner_task: asyncio.Task[Any],
 ) -> None:
     """Renew a live request's bounded claim and stop it if fencing is lost."""
@@ -199,6 +209,8 @@ async def _heartbeat_driver_dispatch(
                 conversation_store.renew_driver_event,
                 session_id,
                 dispatch_id,
+                consumer_token=claim.consumer_token if claim is not None else None,
+                consumer_generation=claim.consumer_generation if claim is not None else None,
             )
     except asyncio.CancelledError:
         raise
@@ -591,6 +603,7 @@ def register_events_routes(
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
         driver_dispatch_id: str | None = None
+        driver_dispatch_claim: DriverDispatchClaim | None = None
         driver_heartbeat_task: asyncio.Task[None] | None = None
         driver_lease_active = False
 
@@ -611,6 +624,16 @@ def register_events_routes(
                     conversation_store.renew_driver_event,
                     session_id,
                     driver_dispatch_id,
+                    consumer_token=(
+                        driver_dispatch_claim.consumer_token
+                        if driver_dispatch_claim is not None
+                        else None
+                    ),
+                    consumer_generation=(
+                        driver_dispatch_claim.consumer_generation
+                        if driver_dispatch_claim is not None
+                        else None
+                    ),
                 )
             except DriverLeaseConflictError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
@@ -625,6 +648,7 @@ def register_events_routes(
                     conversation_store,
                     session_id,
                     driver_dispatch_id,
+                    driver_dispatch_claim,
                     owner_task,
                 )
             )
@@ -632,11 +656,12 @@ def register_events_routes(
                 conversation_store,
                 session_id,
                 driver_dispatch_id,
+                driver_dispatch_claim,
                 driver_heartbeat_task,
             )
 
         async def _accept_driver_fence() -> None:
-            nonlocal driver_dispatch_id
+            nonlocal driver_dispatch_claim, driver_dispatch_id
             if not driver_lease_active:
                 return
             if driver_dispatch_id is not None:
@@ -644,23 +669,44 @@ def register_events_routes(
             begin_driver_event = getattr(conversation_store, "begin_driver_event", None)
             if begin_driver_event is None:
                 raise RuntimeError("conversation store cannot atomically begin driver dispatches")
-            try:
-                acceptance = asyncio.create_task(
-                    asyncio.to_thread(
-                        begin_driver_event,
+            def _begin() -> DriverDispatchClaim | str | None:
+                try:
+                    return begin_driver_event(
+                        session_id,
+                        driver_actor_user_id,
+                        body.driver_generation,
+                        body.type,
+                        source_id=body.source_id or uuid.uuid4().hex,
+                    )
+                except TypeError as exc:
+                    if "source_id" not in str(exc):
+                        raise
+                    return begin_driver_event(
                         session_id,
                         driver_actor_user_id,
                         body.driver_generation,
                         body.type,
                     )
-                )
+
+            try:
+                acceptance = asyncio.create_task(asyncio.to_thread(_begin))
                 try:
-                    driver_dispatch_id = await asyncio.shield(acceptance)
+                    accepted_dispatch = await asyncio.shield(acceptance)
                 except asyncio.CancelledError:
                     current_task = asyncio.current_task()
                     if current_task is not None:
                         current_task.uncancel()
-                    driver_dispatch_id = await acceptance
+                    accepted_dispatch = await acceptance
+                    driver_dispatch_claim = (
+                        accepted_dispatch
+                        if isinstance(accepted_dispatch, DriverDispatchClaim)
+                        else None
+                    )
+                    driver_dispatch_id = (
+                        accepted_dispatch.dispatch_id
+                        if isinstance(accepted_dispatch, DriverDispatchClaim)
+                        else accepted_dispatch
+                    )
                     if driver_dispatch_id is not None:
                         _start_driver_heartbeat()
                     raise
@@ -670,8 +716,25 @@ def register_events_routes(
                 ) from exc
             except DriverLeaseConflictError as exc:
                 raise await _driver_lease_conflict(exc, session_id) from exc
+            driver_dispatch_claim = (
+                accepted_dispatch if isinstance(accepted_dispatch, DriverDispatchClaim) else None
+            )
+            driver_dispatch_id = (
+                accepted_dispatch.dispatch_id
+                if isinstance(accepted_dispatch, DriverDispatchClaim)
+                else accepted_dispatch
+            )
             if driver_dispatch_id is None:
                 raise RuntimeError("active driver lease disappeared before acceptance")
+            if driver_dispatch_claim is not None:
+                body._driver_claim = {
+                    "event_id": driver_dispatch_claim.event_id,
+                    "source_id": driver_dispatch_claim.source_id,
+                    "effect_id": driver_dispatch_claim.effect_id,
+                    "driver_generation": driver_dispatch_claim.driver_generation,
+                    "consumer_token": driver_dispatch_claim.consumer_token,
+                    "consumer_generation": driver_dispatch_claim.consumer_generation,
+                }
             _start_driver_heartbeat()
             await _guard_driver_side_effect("after_acceptance")
 
@@ -688,6 +751,16 @@ def register_events_routes(
                     conversation_store.complete_driver_event,
                     session_id,
                     driver_dispatch_id,
+                    consumer_token=(
+                        driver_dispatch_claim.consumer_token
+                        if driver_dispatch_claim is not None
+                        else None
+                    ),
+                    consumer_generation=(
+                        driver_dispatch_claim.consumer_generation
+                        if driver_dispatch_claim is not None
+                        else None
+                    ),
                     succeeded=True,
                 )
             )

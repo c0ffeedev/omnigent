@@ -3522,6 +3522,8 @@ async def _forward_event_to_runner(
     }
     if body.driver_generation is not None:
         runner_body["driver_generation"] = body.driver_generation
+    if body._driver_claim is not None:
+        runner_body["driver_claim"] = dict(body._driver_claim)
     if created_by is not None:
         runner_body["actor"] = _build_actor(created_by)
     # Forward request-supplied client-side tool schemas so non-native

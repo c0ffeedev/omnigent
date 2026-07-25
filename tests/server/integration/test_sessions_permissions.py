@@ -3363,6 +3363,7 @@ async def test_driver_fenced_skill_dispatch_preserves_actor_and_generation(
         json={
             "type": "slash_command",
             "driver_generation": 1,
+            "source_id": "skill-dispatch-1",
             "data": {"kind": "skill", "name": "review", "arguments": "this"},
         },
         headers=headers,
@@ -3376,6 +3377,11 @@ async def test_driver_fenced_skill_dispatch_preserves_actor_and_generation(
     assert {item.driver_generation for item in skill_items} == {1}
     conversation = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conversation is not None
+    claim = forwarded[0].pop("driver_claim")
+    assert claim["source_id"] == "skill-dispatch-1"
+    assert claim["driver_generation"] == 1
+    assert claim["consumer_generation"] == 1
+    assert all(len(claim[key]) == 32 for key in ("event_id", "effect_id", "consumer_token"))
     assert forwarded == [
         {
             "type": "message",

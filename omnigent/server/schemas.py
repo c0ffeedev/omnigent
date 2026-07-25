@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from typing import Annotated, Any, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, Strict, field_validator, model_validator
 
 from omnigent.entities import ConversationItem, ProjectResourceKind
 
@@ -1175,6 +1175,8 @@ class SessionEventInput(BaseModel):
         ge=1,
         exclude_if=lambda value: value is None,
     )
+    source_id: str | None = Field(default=None, min_length=1, max_length=128)
+    _driver_claim: dict[str, Any] | None = PrivateAttr(default=None)
 
 
 class SessionGitOptions(BaseModel):
@@ -1593,6 +1595,26 @@ class DriverLeaseResponse(BaseModel):
     expires_at: int | None = None
     released_at: int | None = None
     active: bool
+
+
+class DriverLeaseConflictDetails(BaseModel):
+    """Machine-readable state returned when driver fencing rejects a request."""
+
+    driver_lease: DriverLeaseResponse | None = None
+
+
+class DriverLeaseConflictBody(BaseModel):
+    """Structured error payload for a driver lease conflict."""
+
+    code: Literal["conflict"]
+    message: str
+    details: DriverLeaseConflictDetails
+
+
+class DriverLeaseConflictResponse(BaseModel):
+    """HTTP 409 response carrying the authoritative current driver lease."""
+
+    error: DriverLeaseConflictBody
 
 
 class DriverLeaseAcquireRequest(BaseModel):
@@ -3023,6 +3045,8 @@ class SessionInputConsumedPayload(BaseModel):
         e.g. ``"alice@example.com"``. ``None`` for agent/tool/system
         items and single-user mode. Mirrors
         :meth:`ConversationItem.to_api_dict` for live attribution.
+    :param driver_generation: Lease fencing generation accepted with the
+        input, or ``None`` for legacy lease-free sessions.
     :param cleared_pending_id: When this consumed message drains a
         :mod:`omnigent.runtime.pending_inputs` entry (a native-
         terminal web message round-tripping back from the transcript),
@@ -3038,6 +3062,7 @@ class SessionInputConsumedPayload(BaseModel):
     # (matches :class:`SessionEventInput.data`).
     data: dict[str, Any]
     created_by: str | None = None
+    driver_generation: int | None = Field(default=None, ge=1)
     cleared_pending_id: str | None = None
 
     model_config = ConfigDict(extra="ignore")
