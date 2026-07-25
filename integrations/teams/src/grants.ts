@@ -261,6 +261,7 @@ export class GrantStore {
 
   beginConnect(key: PrincipalKey, now = Date.now()): number {
     return this.database.transaction(() => {
+      this.queueRevocation(key, "relinked", now);
       const current = this.database.prepare(`
         SELECT generation FROM principal_connect_attempts
         WHERE bot_app_id = @botAppId AND tenant_id = @tenantId AND object_id = @objectId

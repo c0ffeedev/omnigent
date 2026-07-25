@@ -44,6 +44,7 @@ export class GrantLifecycle {
           ? "Omnigent account connected. You can now use `status` or `logout`."
           : "This Omnigent connection was cancelled or replaced. Send `connect` to retry.";
       }).catch(() => {
+        this.store.cancelConnect(key, connectGeneration);
         return "Omnigent account connection failed. Send `connect` to retry.";
       }),
       message: `Open ${pending.verificationUrl}${code} to connect your Omnigent account. This link expires soon.`,

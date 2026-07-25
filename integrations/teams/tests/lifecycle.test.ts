@@ -66,6 +66,33 @@ describe("GrantLifecycle", () => {
     test.store.close();
   });
 
+  it("keeps prior authority retired after a relink device flow fails", async () => {
+    const test = await fixture({
+      startLogin: vi.fn(async () => ({
+        poll: async () => { throw new Error("device flow failed"); },
+        userCode: "ABCD",
+        verificationUrl: "https://omnigent.example/activate",
+      })),
+    });
+    test.store.link(test.lifecycle.key(principal), tokens);
+
+    const pending = await test.lifecycle.connect(principal);
+    await expect(pending.completion).resolves.toContain("connection failed");
+    const otherStore = openStore(test.path);
+    expect(otherStore.active(test.lifecycle.key(principal))).toBeUndefined();
+    expect(otherStore.pendingRevocations()).toMatchObject([{ refreshToken: tokens.refreshToken }]);
+    expect(otherStore.completeConnect(test.lifecycle.key(principal), 1, {
+      ...tokens,
+      grantId: "late-grant",
+      refreshToken: "late-refresh",
+    })).toBeUndefined();
+    expect(otherStore.active(test.lifecycle.key(principal))).toBeUndefined();
+    expect(otherStore.pendingRevocations().map(({ refreshToken }) => refreshToken).sort())
+      .toEqual(["late-refresh", tokens.refreshToken].sort());
+    otherStore.close();
+    test.store.close();
+  });
+
   it("does not restore authority when another worker logs out before device approval", async () => {
     let finish!: (value: GrantTokens) => void;
     const test = await fixture({

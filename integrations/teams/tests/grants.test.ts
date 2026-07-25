@@ -70,31 +70,44 @@ describe("GrantStore", () => {
     fixture.store.close();
   });
 
-  it("persists connect fencing and revokes a completion cancelled before approval", async () => {
+  it("immediately retires the prior grant across stores and fences a cancelled relink", async () => {
     const fixture = await store();
-    const attempt = fixture.store.beginConnect(key, 1_000);
+    fixture.store.link(key, token, 1_000);
+    const attempt = fixture.store.beginConnect(key, 2_000);
     fixture.store.close();
 
     const reopened = new GrantStore(fixture.path, Buffer.alloc(32, 9), { maximumLifetimeDays: 30 });
-    expect(reopened.cancelConnect(key, attempt, 2_000)).toBe(true);
-    expect(reopened.completeConnect(key, attempt, token, 3_000)).toBeUndefined();
-    expect(reopened.active(key, 3_000)).toBeUndefined();
-    expect(reopened.pendingRevocations(3_000)).toMatchObject([{ refreshToken: token.refreshToken }]);
+    expect(reopened.active(key, 2_000)).toBeUndefined();
+    expect(reopened.pendingRevocations(2_000)).toMatchObject([{ refreshToken: token.refreshToken }]);
+
+    expect(reopened.cancelConnect(key, attempt, 3_000)).toBe(true);
+    expect(reopened.completeConnect(key, attempt, {
+      ...token,
+      grantId: "cancelled-grant",
+      refreshToken: "cancelled-refresh",
+    }, 4_000)).toBeUndefined();
+    expect(reopened.active(key, 4_000)).toBeUndefined();
+    expect(reopened.pendingRevocations(4_000).map(({ refreshToken }) => refreshToken).sort())
+      .toEqual(["cancelled-refresh", token.refreshToken].sort());
     reopened.close();
   });
 
   it("keeps the newest connect when device approvals complete out of order", async () => {
     const fixture = await store();
-    const older = fixture.store.beginConnect(key, 1_000);
+    fixture.store.link(key, token, 1_000);
+    const older = fixture.store.beginConnect(key, 2_000);
     const otherWorker = new GrantStore(fixture.path, Buffer.alloc(32, 9), { maximumLifetimeDays: 30 });
-    const newer = otherWorker.beginConnect(key, 2_000);
+    expect(otherWorker.active(key, 2_000)).toBeUndefined();
+    expect(otherWorker.pendingRevocations(2_000)).toMatchObject([{ refreshToken: token.refreshToken }]);
+    const newer = otherWorker.beginConnect(key, 3_000);
     const replacement = { ...token, grantId: "grant-2", refreshToken: "refresh-2" };
+    const stale = { ...token, grantId: "stale-grant", refreshToken: "stale-refresh" };
 
-    expect(otherWorker.completeConnect(key, newer, replacement, 3_000)).toMatchObject({ grantId: "grant-2" });
-    expect(fixture.store.completeConnect(key, older, token, 4_000)).toBeUndefined();
-    expect(otherWorker.active(key, 4_000)).toMatchObject({ grantId: "grant-2" });
-    expect(otherWorker.pendingRevocations(4_000).map(({ refreshToken }) => refreshToken))
-      .toContain(token.refreshToken);
+    expect(otherWorker.completeConnect(key, newer, replacement, 4_000)).toMatchObject({ grantId: "grant-2" });
+    expect(fixture.store.completeConnect(key, older, stale, 5_000)).toBeUndefined();
+    expect(otherWorker.active(key, 5_000)).toMatchObject({ grantId: "grant-2", refreshToken: "refresh-2" });
+    expect(otherWorker.pendingRevocations(5_000).map(({ refreshToken }) => refreshToken).sort())
+      .toEqual(["stale-refresh", token.refreshToken].sort());
     otherWorker.close();
     fixture.store.close();
   });
