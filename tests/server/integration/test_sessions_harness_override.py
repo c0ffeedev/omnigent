@@ -270,10 +270,10 @@ async def test_runner_body_stamps_authenticated_turn_actor(
         json={"agent_id": agent["id"], "initial_items": []},
     )
     sid = created.json()["id"]
-    from omnigent.server.routes import sessions as sessions_mod
+    from omnigent.server.routes.sessions import routes_events as sessions_events_mod
 
     monkeypatch.setattr(
-        sessions_mod,
+        sessions_events_mod,
         "_get_user_id",
         lambda _request, _provider: "alice@example.com",
     )
