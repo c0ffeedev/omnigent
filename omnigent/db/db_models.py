@@ -1539,6 +1539,7 @@ class SqlSessionDriverDispatch(ConversationBase):
     actor_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
     generation: Mapped[int] = mapped_column(Integer, nullable=False)
     input_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     event_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     source_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     effect_id: Mapped[str | None] = mapped_column(String(128), nullable=True)

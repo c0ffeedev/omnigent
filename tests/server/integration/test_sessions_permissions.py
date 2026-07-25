@@ -27,6 +27,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.host.frames import HostHelloFrame
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime import session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import presence
@@ -3174,7 +3175,9 @@ async def test_driver_fenced_skill_dispatch_preserves_actor_and_generation(
         async def post(self, path: str, **kwargs: Any) -> httpx.Response:
             request = httpx.Request("POST", f"http://runner{path}")
             if path.endswith("/skills/resolve"):
-                return httpx.Response(200, json={"meta_text": "<skill>review</skill>"}, request=request)
+                return httpx.Response(
+                    200, json={"meta_text": "<skill>review</skill>"}, request=request
+                )
             forwarded.append(kwargs["json"])
             return httpx.Response(202, request=request)
 
@@ -3214,8 +3217,9 @@ async def test_driver_fenced_skill_dispatch_preserves_actor_and_generation(
     claim = forwarded[0].pop("driver_claim")
     assert claim["source_id"] == "skill-dispatch-1"
     assert claim["driver_generation"] == 1
-    assert claim["consumer_generation"] == 1
-    assert all(len(claim[key]) == 32 for key in ("event_id", "effect_id", "consumer_token"))
+    assert "consumer_token" not in claim
+    assert "consumer_generation" not in claim
+    assert all(len(claim[key]) == 32 for key in ("event_id", "effect_id"))
     assert forwarded == [
         {
             "type": "message",
@@ -3229,6 +3233,75 @@ async def test_driver_fenced_skill_dispatch_preserves_actor_and_generation(
             "actor": {"run_as": "alice@example.com"},
         }
     ]
+    duplicate = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "slash_command",
+            "driver_generation": 1,
+            "source_id": "skill-dispatch-1",
+            "data": {"kind": "skill", "name": "review", "arguments": "this"},
+        },
+        headers=headers,
+    )
+    assert duplicate.status_code == 202, duplicate.text
+    assert duplicate.json()["duplicate"] is True
+    assert len(forwarded) == 1
+
+
+async def test_leased_runner_events_require_bound_runner_ingress(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Bearer callers cannot impersonate runner output after lease opt-in."""
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    owner_headers = {"X-Forwarded-Email": "alice@example.com"}
+    binding_token = "runner-binding-token"
+    runner_id = token_bound_runner_id(binding_token)
+    SqlAlchemyConversationStore(db_uri).replace_runner_id(session_id, runner_id)
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers=owner_headers,
+    )
+    assert acquired.status_code == 200, acquired.text
+
+    payload = {
+        "type": "external_session_status",
+        "source_id": "runner-status-1",
+        "data": {"status": "running"},
+    }
+    bearer_only = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=payload,
+        headers=owner_headers,
+    )
+    assert bearer_only.status_code == 403, bearer_only.text
+
+    wrong_runner = await auth_client.post(
+        f"/v1/runners/{runner_id}/sessions/{session_id}/events",
+        json=payload,
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: "wrong-token"},
+    )
+    assert wrong_runner.status_code == 401, wrong_runner.text
+
+    accepted = await auth_client.post(
+        f"/v1/runners/{runner_id}/sessions/{session_id}/events",
+        json=payload,
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+    )
+    assert accepted.status_code == 202, accepted.text
+
+    forged_input = await auth_client.post(
+        f"/v1/runners/{runner_id}/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "source_id": "runner-input-1",
+            "data": {"role": "user", "content": []},
+        },
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+    )
+    assert forged_input.status_code == 403, forged_input.text
 
 
 async def test_lease_free_event_route_preserves_legacy_wire_shape(
