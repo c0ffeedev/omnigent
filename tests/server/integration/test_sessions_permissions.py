@@ -3322,6 +3322,75 @@ async def test_auth_disabled_public_user_can_spend_its_driver_lease(
     )
 
 
+async def test_driver_fenced_skill_dispatch_preserves_actor_and_generation(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skill items and runner input retain the accepted driver's attribution."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    forwarded: list[dict[str, Any]] = []
+
+    class _Runner:
+        async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+            request = httpx.Request("POST", f"http://runner{path}")
+            if path.endswith("/skills/resolve"):
+                return httpx.Response(
+                    200,
+                    json={"meta_text": "<skill>review</skill>"},
+                    request=request,
+                )
+            forwarded.append(kwargs["json"])
+            return httpx.Response(202, request=request)
+
+    async def _runner(*_: Any, **__: Any) -> _Runner:
+        return _Runner()
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    headers = {"X-Forwarded-Email": "alice@example.com"}
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers=headers,
+    )
+    assert acquired.status_code == 200, acquired.text
+
+    response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "slash_command",
+            "driver_generation": 1,
+            "data": {"kind": "skill", "name": "review", "arguments": "this"},
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 202, response.text
+    items = SqlAlchemyConversationStore(db_uri).list_items(session_id).data
+    skill_items = [item for item in items if item.response_id == items[-1].response_id]
+    assert len(skill_items) == 2
+    assert {item.created_by for item in skill_items} == {"alice@example.com"}
+    assert {item.driver_generation for item in skill_items} == {1}
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conversation is not None
+    assert forwarded == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "<skill>review</skill>"}],
+            "agent_id": conversation.agent_id,
+            "model": "test-agent",
+            "has_mcp_servers": False,
+            "persisted_item_id": skill_items[1].id,
+            "driver_generation": 1,
+            "actor": {"run_as": "alice@example.com"},
+        }
+    ]
+
+
 async def test_lease_free_event_route_preserves_legacy_wire_shape(
     auth_client: httpx.AsyncClient,
     db_uri: str,

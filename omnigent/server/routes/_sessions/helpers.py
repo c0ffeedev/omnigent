@@ -1462,6 +1462,7 @@ def _publish_input_consumed(
             type=item.type,
             data=item.data.model_dump() if item.data is not None else {},
             created_by=item.created_by,
+            driver_generation=item.driver_generation,
             cleared_pending_id=cleared_pending_id,
         ),
     )
@@ -5239,6 +5240,7 @@ async def _dispatch_skill_slash_command_to_runner(
             arguments=arguments,
         ),
         created_by=created_by,
+        driver_generation=body.driver_generation,
     )
     meta_item = NewConversationItem(
         type="message",
@@ -5249,6 +5251,7 @@ async def _dispatch_skill_slash_command_to_runner(
             is_meta=True,
         ),
         created_by=created_by,
+        driver_generation=body.driver_generation,
     )
     if side_effect_guard is not None:
         await side_effect_guard("before_item_persistence")
@@ -5284,6 +5287,10 @@ async def _dispatch_skill_slash_command_to_runner(
         # right persisted copy (see _forward_event_to_runner).
         "persisted_item_id": persisted_items[1].id,
     }
+    if body.driver_generation is not None:
+        runner_body["driver_generation"] = body.driver_generation
+    if created_by is not None:
+        runner_body["actor"] = _build_actor(created_by)
     effective_runner_override = (
         body.model_override if body.model_override is not None else conv.model_override
     )

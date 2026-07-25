@@ -237,6 +237,23 @@ def register_events_routes(
             },
         )
 
+    async def _driver_lease_conflict(
+        exc: DriverLeaseConflictError,
+        session_id: str,
+    ) -> OmnigentError:
+        """Build a 409 containing the authoritative lease snapshot."""
+        current = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
+        current_response = _driver_lease_response(current)
+        return OmnigentError(
+            str(exc),
+            code=ErrorCode.CONFLICT,
+            details={
+                "driver_lease": (
+                    current_response.model_dump() if current_response is not None else None
+                )
+            },
+        )
+
     async def _mutate_driver_lease(
         operation: Callable[[], SessionDriverLease],
         session_id: str,
@@ -244,17 +261,7 @@ def register_events_routes(
         try:
             lease = await asyncio.to_thread(operation)
         except DriverLeaseConflictError as exc:
-            current = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
-            current_response = _driver_lease_response(current)
-            raise OmnigentError(
-                str(exc),
-                code=ErrorCode.CONFLICT,
-                details={
-                    "driver_lease": (
-                        current_response.model_dump() if current_response is not None else None
-                    )
-                },
-            ) from exc
+            raise await _driver_lease_conflict(exc, session_id) from exc
         _publish_driver_lease(session_id, lease)
         response = _driver_lease_response(lease)
         assert response is not None
@@ -662,7 +669,7 @@ def register_events_routes(
                     "conversation store cannot atomically begin driver dispatches"
                 ) from exc
             except DriverLeaseConflictError as exc:
-                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+                raise await _driver_lease_conflict(exc, session_id) from exc
             if driver_dispatch_id is None:
                 raise RuntimeError("active driver lease disappeared before acceptance")
             _start_driver_heartbeat()
@@ -712,7 +719,7 @@ def register_events_routes(
             except NotImplementedError as exc:
                 raise RuntimeError("driver-capable store cannot validate driver leases") from exc
             except DriverLeaseConflictError as exc:
-                raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+                raise await _driver_lease_conflict(exc, session_id) from exc
             await _accept_driver_fence()
 
         # ── Policy evaluation (path-agnostic) ────────────────
