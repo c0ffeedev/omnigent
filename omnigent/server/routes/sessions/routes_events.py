@@ -87,6 +87,7 @@ from omnigent.server.schemas import (
     ConversationDeleted,
     DriverDispatchValidationRequest,
     DriverLeaseAcquireRequest,
+    DriverLeaseConflictResponse,
     DriverLeaseGenerationRequest,
     DriverLeaseHandoffRequest,
     DriverLeaseResponse,
@@ -302,6 +303,7 @@ def register_events_routes(
     @router.post(
         "/sessions/{session_id}/driver/acquire",
         response_model=DriverLeaseResponse,
+        responses={409: {"model": DriverLeaseConflictResponse}},
     )
     async def acquire_driver_lease(
         session_id: str,
@@ -327,6 +329,7 @@ def register_events_routes(
     @router.post(
         "/sessions/{session_id}/driver/renew",
         response_model=DriverLeaseResponse,
+        responses={409: {"model": DriverLeaseConflictResponse}},
     )
     async def renew_driver_lease(
         session_id: str,
@@ -348,6 +351,7 @@ def register_events_routes(
     @router.post(
         "/sessions/{session_id}/driver/release",
         response_model=DriverLeaseResponse,
+        responses={409: {"model": DriverLeaseConflictResponse}},
     )
     async def release_driver_lease(
         session_id: str,
@@ -369,6 +373,7 @@ def register_events_routes(
     @router.post(
         "/sessions/{session_id}/driver/handoff",
         response_model=DriverLeaseResponse,
+        responses={409: {"model": DriverLeaseConflictResponse}},
     )
     async def handoff_driver_lease(
         session_id: str,
