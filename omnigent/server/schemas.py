@@ -1159,7 +1159,17 @@ class SessionEventInput(BaseModel):
         ge=1,
         exclude_if=lambda value: value is None,
     )
-    source_id: str | None = Field(default=None, min_length=1, max_length=128)
+    source_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Stable caller-supplied event identity required for lease-fenced sessions. "
+            "Together with the workspace and session, this is the idempotency key; "
+            "retries must preserve the actor, generation, type, and payload."
+        ),
+    )
     _driver_claim: dict[str, Any] | None = PrivateAttr(default=None)
 
 

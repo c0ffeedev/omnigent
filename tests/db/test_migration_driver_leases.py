@@ -50,9 +50,18 @@ def test_driver_lease_migration_round_trip(tmp_path: Path) -> None:
         assert "session_driver_leases" in inspector.get_table_names()
         assert "session_driver_events" in inspector.get_table_names()
         assert "session_driver_dispatches" in inspector.get_table_names()
-        assert "payload_json" in {
-            column["name"] for column in inspector.get_columns("session_driver_dispatches")
+        dispatch_columns = {
+            column["name"]: column for column in inspector.get_columns("session_driver_dispatches")
         }
+        for column_name in (
+            "payload_json",
+            "event_id",
+            "source_id",
+            "effect_id",
+            "consumer_token",
+            "consumer_generation",
+        ):
+            assert dispatch_columns[column_name]["nullable"] is False
         assert inspector.get_pk_constraint("session_driver_leases")["constrained_columns"] == [
             "workspace_id",
             "session_id",
@@ -132,6 +141,12 @@ def test_driver_lease_migration_enforces_lifecycle(tmp_path: Path) -> None:
             "actor_user_id": "alice@example.com",
             "generation": 1,
             "input_type": "message",
+            "payload_json": '{"data":{},"type":"message"}',
+            "event_id": bytes.fromhex("812233445566478890abcdef12345678"),
+            "source_id": "event-1",
+            "effect_id": "effect-1",
+            "consumer_token": bytes.fromhex("912233445566478890abcdef12345678"),
+            "consumer_generation": 1,
             "state": "running",
             "created_at": 100,
             "completed_at": None,
@@ -144,17 +159,20 @@ def test_driver_lease_migration_enforces_lifecycle(tmp_path: Path) -> None:
             {
                 **valid_dispatch,
                 "id": bytes.fromhex("512233445566478890abcdef12345678"),
+                "source_id": "event-2",
                 "claim_expires_at": None,
             },
             {
                 **valid_dispatch,
                 "id": bytes.fromhex("612233445566478890abcdef12345678"),
+                "source_id": "event-3",
                 "state": "completed",
                 "completed_at": 101,
             },
             {
                 **valid_dispatch,
                 "id": bytes.fromhex("712233445566478890abcdef12345678"),
+                "source_id": "event-4",
                 "claim_expires_at": 100,
             },
         )

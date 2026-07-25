@@ -974,13 +974,29 @@ Request body matches `SessionEventInput`:
     against the item-type's Pydantic data class for non-interrupt
     types (400 on schema mismatch).
 
+  driver_generation (integer, optional)
+    Required when the session has a driver lease. Must equal the active
+    holder's fencing generation.
+
+  source_id (string, optional; 1–128 characters)
+    Required when the session has a driver lease. The tuple
+    `(workspace_id, session_id, source_id)` is the idempotency key. A retry
+    must preserve the actor, driver generation, event type, and payload.
+    Retrying a completed event returns its existing result without replaying
+    persistence, enqueue, or runner effects. Reusing a source id with
+    different input, or while its first dispatch is still running, returns
+    409. Failed or claim-expired dispatches retry in place with the same
+    event/effect ids and a newly fenced consumer claim.
+
 202 Accepted
 {"queued": true}                            # regular queued item events
 {"queued": false}                           # "interrupt" and status/control bypasses
 {"queued": false, "item_id": "item_..."}    # "external_conversation_item"
 {"queued": true, "pending_id": "pending_..."} # native-terminal "message" (see below)
+{"queued": false, "duplicate": true}         # completed source-id retry
 
 400 Bad Request — unknown `type`, or `data` fails the per-type schema
+409 Conflict — stale driver fence, missing/reused source id, or active duplicate
 404 Not Found — no session with that id
 422 Unprocessable Entity — request body fails Pydantic validation
 ```

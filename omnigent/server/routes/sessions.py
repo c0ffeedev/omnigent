@@ -30,7 +30,6 @@ import re
 import secrets
 import time
 import urllib.parse
-import uuid
 import weakref
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
@@ -20868,24 +20867,17 @@ def create_sessions_router(
                 raise RuntimeError("conversation store cannot atomically begin driver dispatches")
 
             def _begin() -> DriverDispatchClaim | str | None:
-                try:
-                    return begin_driver_event(
-                        session_id,
-                        user_id or RESERVED_USER_PUBLIC,
-                        body.driver_generation,
-                        body.type,
-                        source_id=body.source_id or uuid.uuid4().hex,
-                        payload=body.model_dump(exclude_none=True),
-                    )
-                except TypeError as exc:
-                    if "source_id" not in str(exc) and "payload" not in str(exc):
-                        raise
-                    return begin_driver_event(
-                        session_id,
-                        user_id or RESERVED_USER_PUBLIC,
-                        body.driver_generation,
-                        body.type,
-                    )
+                return begin_driver_event(
+                    session_id,
+                    user_id or RESERVED_USER_PUBLIC,
+                    body.driver_generation,
+                    body.type,
+                    source_id=body.source_id,
+                    payload=body.model_dump(
+                        exclude={"driver_generation", "source_id"},
+                        exclude_none=True,
+                    ),
+                )
 
             try:
                 acceptance = asyncio.create_task(asyncio.to_thread(_begin))

@@ -70,12 +70,12 @@ def upgrade() -> None:
         sa.Column("actor_user_id", sa.String(length=128), nullable=False),
         sa.Column("generation", sa.Integer(), nullable=False),
         sa.Column("input_type", sa.String(length=64), nullable=False),
-        sa.Column("payload_json", sa.Text(), nullable=True),
-        sa.Column("event_id", Uuid16(), nullable=True),
-        sa.Column("source_id", sa.String(length=128), nullable=True),
-        sa.Column("effect_id", sa.String(length=128), nullable=True),
-        sa.Column("consumer_token", Uuid16(), nullable=True),
-        sa.Column("consumer_generation", sa.Integer(), nullable=True),
+        sa.Column("payload_json", sa.Text(), nullable=False),
+        sa.Column("event_id", Uuid16(), nullable=False),
+        sa.Column("source_id", sa.String(length=128), nullable=False),
+        sa.Column("effect_id", sa.String(length=128), nullable=False),
+        sa.Column("consumer_token", Uuid16(), nullable=False),
+        sa.Column("consumer_generation", sa.Integer(), nullable=False),
         sa.Column("state", sa.String(length=16), nullable=False),
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("completed_at", sa.Integer(), nullable=True),
@@ -84,7 +84,7 @@ def upgrade() -> None:
             "generation > 0", name="ck_session_driver_dispatches_generation_positive"
         ),
         sa.CheckConstraint(
-            "consumer_generation IS NULL OR consumer_generation > 0",
+            "consumer_generation > 0",
             name="ck_session_driver_dispatches_consumer_generation_positive",
         ),
         sa.CheckConstraint(

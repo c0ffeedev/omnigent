@@ -3085,9 +3085,17 @@ async def test_driver_lease_routes_authorize_fence_and_snapshot(
     assert wrong_holder.status_code == 409
     assert wrong_holder.json()["error"]["details"]["driver_lease"] == acquired.json()
 
-    accepted = await auth_client.post(
+    missing_source = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
         json={**message, "driver_generation": 1},
+        headers=alice_headers,
+    )
+    assert missing_source.status_code == 409
+    assert "source_id is required" in missing_source.text
+
+    accepted = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={**message, "driver_generation": 1, "source_id": "lease-fenced-message"},
         headers=alice_headers,
     )
     assert accepted.status_code == 202, accepted.text
@@ -3114,7 +3122,7 @@ async def test_driver_lease_routes_authorize_fence_and_snapshot(
 
     stale = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
-        json={**message, "driver_generation": 1},
+        json={**message, "driver_generation": 1, "source_id": "stale-message"},
         headers=alice_headers,
     )
     assert stale.status_code == 409
@@ -3245,6 +3253,20 @@ async def test_driver_fenced_skill_dispatch_preserves_actor_and_generation(
     )
     assert duplicate.status_code == 202, duplicate.text
     assert duplicate.json()["duplicate"] is True
+    assert len(forwarded) == 1
+
+    conflicting = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "slash_command",
+            "driver_generation": 1,
+            "source_id": "skill-dispatch-1",
+            "data": {"kind": "skill", "name": "review", "arguments": "different"},
+        },
+        headers=headers,
+    )
+    assert conflicting.status_code == 409
+    assert "source identity was reused" in conflicting.text
     assert len(forwarded) == 1
 
 
@@ -3441,12 +3463,23 @@ async def test_driver_takeover_between_fail_fast_check_and_dispatch_rejects_stal
         actor_user_id: str,
         generation: int | None,
         event_type: str,
+        *,
+        source_id: str | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> Any:
         nonlocal took_over
         if not took_over:
             took_over = True
             store.acquire_driver_lease(event_session_id, "bob@example.com", 30, force=True)
-        return original_begin(store, event_session_id, actor_user_id, generation, event_type)
+        return original_begin(
+            store,
+            event_session_id,
+            actor_user_id,
+            generation,
+            event_type,
+            source_id=source_id,
+            payload=payload,
+        )
 
     monkeypatch.setattr(SqlAlchemyConversationStore, "begin_driver_event", _take_over_then_begin)
     response = await auth_client.post(
@@ -3454,6 +3487,7 @@ async def test_driver_takeover_between_fail_fast_check_and_dispatch_rejects_stal
         json={
             "type": "message",
             "driver_generation": 1,
+            "source_id": "takeover-before-begin",
             "data": {
                 "role": "user",
                 "content": [{"type": "input_text", "text": "must be rejected"}],
@@ -3526,6 +3560,7 @@ async def test_expired_dispatch_takeover_after_acceptance_fences_resumed_request
             json={
                 "type": "message",
                 "driver_generation": 1,
+                "source_id": "expired-after-acceptance",
                 "data": {
                     "role": "user",
                     "content": [{"type": "input_text", "text": "must stay fenced"}],
@@ -3616,6 +3651,7 @@ async def test_takeover_after_pre_persist_renewal_rejects_stale_item(
             json={
                 "type": "message",
                 "driver_generation": 1,
+                "source_id": "takeover-before-persist",
                 "data": {
                     "role": "user",
                     "content": [{"type": "input_text", "text": "atomic fence"}],
@@ -3688,6 +3724,7 @@ async def test_driver_event_completes_with_single_default_executor_worker(
                 json={
                     "type": "message",
                     "driver_generation": 1,
+                    "source_id": "single-executor-worker",
                     "data": {
                         "role": "user",
                         "content": [{"type": "input_text", "text": "one worker"}],
@@ -3747,6 +3784,7 @@ async def test_cancelled_driver_event_finishes_dispatch_before_takeover(
             json={
                 "type": "message",
                 "driver_generation": 1,
+                "source_id": "cancelled-driver-event",
                 "data": {
                     "role": "user",
                     "content": [{"type": "input_text", "text": "cancel me"}],
@@ -3829,6 +3867,7 @@ async def test_driver_takeover_is_rejected_at_actual_event_persistence_boundary(
             json={
                 "type": "message",
                 "driver_generation": 1,
+                "source_id": "persistence-boundary",
                 "data": {
                     "role": "user",
                     "content": [{"type": "input_text", "text": "persist first"}],
@@ -3930,6 +3969,7 @@ async def test_driver_takeover_is_rejected_before_actual_pending_input_enqueue(
             json={
                 "type": "message",
                 "driver_generation": 1,
+                "source_id": "pending-input-boundary",
                 "data": {
                     "role": "user",
                     "content": [{"type": "input_text", "text": "pending first"}],
@@ -4035,6 +4075,7 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
             json={
                 "type": "message",
                 "driver_generation": 1,
+                "source_id": "runner-dispatch-boundary",
                 "data": {
                     "role": "user",
                     "content": [{"type": "input_text", "text": "serialized input"}],

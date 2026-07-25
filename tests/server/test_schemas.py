@@ -45,7 +45,7 @@ from omnigent.server.schemas import (
 )
 
 
-def test_session_event_plain_dump_omits_unset_driver_generation() -> None:
+def test_session_event_plain_dump_omits_unset_driver_metadata() -> None:
     """Adding lease support does not change the legacy runner wire payload."""
     event = SessionEventInput(
         type="message",
