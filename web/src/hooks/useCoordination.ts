@@ -240,9 +240,8 @@ export function useCoordination(sessionId: string): UseCoordinationResult {
     (lease: DriverLease, _variables: unknown, actionId: number | undefined) => {
       if (actionId === actionSequence.current) setActionError(null);
       settleLease(lease);
-      void queryClient.invalidateQueries({ queryKey: coordinationAuditQueryKey(sessionId) });
     },
-    [queryClient, sessionId, settleLease],
+    [settleLease],
   );
   const handleLeaseError = useCallback(
     (mutationError: Error, _variables: unknown, actionId: number | undefined) => {

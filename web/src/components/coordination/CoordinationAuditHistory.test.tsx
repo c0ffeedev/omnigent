@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -13,6 +13,7 @@ vi.mock("@/lib/coordinationApi", async (importOriginal) => ({
 }));
 
 import type { CoordinationAuditRecord } from "@/lib/coordinationApi";
+import { coordinationAuditQueryKey } from "@/lib/coordinationState";
 import { ApiError } from "@/lib/sessionsApi";
 import {
   CoordinationAuditHistory,
@@ -63,6 +64,22 @@ describe("CoordinationAuditHistory", () => {
     resolvePage({ records: [], nextCursor: null });
     expect(await screen.findByText("No coordination activity yet")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /load older activity/i })).toBeNull();
+  });
+
+  it("distinguishes a sparse page from terminal empty history", async () => {
+    fetchCoordinationAuditPageMock
+      .mockResolvedValueOnce({ records: [], nextCursor: "cursor-1" })
+      .mockResolvedValueOnce({
+        records: [auditRecord("old", "session.driver_lease.released", 100)],
+        nextCursor: null,
+      });
+
+    render(<CoordinationAuditHistory sessionId="sess-1" />, { wrapper });
+    expect(await screen.findByText("No activity in this page")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /load older activity/i }));
+
+    expect(await screen.findByText(/released control/)).toBeInTheDocument();
+    expect(screen.queryByText("No activity in this page")).toBeNull();
   });
 
   it("renders authoritative records newest first with actor, action, target, and time", async () => {
@@ -186,6 +203,34 @@ describe("CoordinationAuditHistory", () => {
     expect(screen.getByText(/took control/)).toBeInTheDocument();
     expect(alert).toHaveTextContent("Some activity could not be loaded");
     expect(alert).toHaveTextContent("Showing the activity loaded so far");
+  });
+
+  it("keeps loaded records visible and surfaces permission loss on refresh", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    });
+    const localWrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+    fetchCoordinationAuditPageMock
+      .mockResolvedValueOnce({
+        records: [auditRecord("new", "session.driver_lease.acquired", 200)],
+        nextCursor: null,
+      })
+      .mockRejectedValueOnce(new ApiError("internal policy detail", 403, "forbidden"));
+
+    render(<CoordinationAuditHistory sessionId="sess-1" />, { wrapper: localWrapper });
+    await screen.findByText(/took control/);
+    await act(async () => {
+      await client.invalidateQueries({
+        queryKey: [...coordinationAuditQueryKey("sess-1"), "history"],
+      });
+    });
+
+    const alert = await screen.findByRole("alert");
+    expect(screen.getByText(/took control/)).toBeInTheDocument();
+    expect(alert).toHaveTextContent("You do not have permission to view coordination activity");
+    expect(alert).not.toHaveTextContent("internal policy detail");
   });
 });
 

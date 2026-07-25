@@ -168,9 +168,13 @@ export function CoordinationAuditHistory({ sessionId, className }: CoordinationA
     <div className={cn("grid min-h-0 gap-3", className)}>
       {records.length === 0 ? (
         <div className="rounded-lg border border-dashed p-4 text-center">
-          <p className="font-medium">No coordination activity yet</p>
+          <p className="font-medium">
+            {query.hasNextPage ? "No activity in this page" : "No coordination activity yet"}
+          </p>
           <p className="mt-1 text-xs text-muted-foreground">
-            Server-recorded control changes will appear here.
+            {query.hasNextPage
+              ? "Load older activity to continue searching server records."
+              : "Server-recorded control changes will appear here."}
           </p>
         </div>
       ) : (
@@ -183,6 +187,9 @@ export function CoordinationAuditHistory({ sessionId, className }: CoordinationA
 
       {query.isFetchNextPageError && (
         <ActivityError error={query.error} retry={() => void query.fetchNextPage()} partial />
+      )}
+      {query.isRefetchError && !query.isFetchNextPageError && (
+        <ActivityError error={query.error} retry={() => void query.refetch()} partial />
       )}
       {query.hasNextPage && !query.isFetchNextPageError && (
         <Button
