@@ -497,8 +497,8 @@ def register_events_routes(
         await _require_bound_runner(request, runner_id, session_id)
         lease = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
         return {
-            "requires_driver_claim": lease is not None and lease.is_active(),
-            "generation": lease.generation if lease is not None and lease.is_active() else None,
+            "requires_driver_claim": lease is not None,
+            "generation": lease.generation if lease is not None else None,
         }
 
     @router.post(
@@ -691,7 +691,7 @@ def register_events_routes(
                 conversation_store, "supports_driver_leases", False
             ):
                 lease = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
-                if lease is not None and lease.is_active():
+                if lease is not None:
                     raise OmnigentError(
                         "runner-originated events require dedicated runner ingress",
                         code=ErrorCode.FORBIDDEN,

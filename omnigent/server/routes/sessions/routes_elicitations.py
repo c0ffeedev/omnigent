@@ -120,9 +120,9 @@ def register_elicitations_routes(
                 raise _session_not_found()
         if getattr(conversation_store, "supports_driver_leases", False):
             lease = await asyncio.to_thread(conversation_store.get_driver_lease, session_id)
-            if lease is not None and lease.is_active():
+            if lease is not None:
                 raise OmnigentError(
-                    "Leased sessions must resolve approvals through the fenced events endpoint.",
+                    "Driver-managed sessions must resolve approvals through the fenced events endpoint.",
                     code=ErrorCode.CONFLICT,
                 )
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}

@@ -180,6 +180,47 @@ async def test_runner_revalidates_claim_at_background_execution_boundary() -> No
 
 
 @pytest.mark.asyncio
+async def test_runner_revalidates_control_claim_at_side_effect_boundary() -> None:
+    """A control claim lost after ingress cannot act on the harness."""
+    server = _ValidationClient(200, 409)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, object()),
+        server_client=cast(httpx.AsyncClient, server),
+    )
+    observed: list[str] = []
+
+    async def barrier(point: str, _dispatch_id: str) -> None:
+        observed.append(point)
+
+    app.state.driver_fence_test_hook = barrier
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        response = await client.post(
+            "/v1/sessions/session-1/events",
+            json={
+                "type": "interrupt",
+                "driver_claim": {
+                    "dispatch_id": "1" * 32,
+                    "event_id": "2" * 32,
+                    "source_id": "source-control",
+                    "effect_id": "3" * 32,
+                    "driver_generation": 1,
+                    "consumer_token": "4" * 32,
+                    "consumer_generation": 2,
+                    "runner_id": "runner-1",
+                },
+            },
+        )
+
+    assert response.status_code == 409
+    assert observed == ["pre_execute", "control_pre_execute"]
+    assert [path.rsplit("/", 1)[-1] for path, _kwargs in server.posts] == [
+        "validate",
+        "validate",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_native_driver_claim_completes_only_after_forwarded_terminal_status() -> None:
     """A native prompt injection is not terminal completion of its fenced turn."""
     server = _ValidationClient(200, 200, 200)
@@ -232,6 +273,18 @@ async def test_native_driver_claim_completes_only_after_forwarded_terminal_statu
             "validate",
         ]
 
+        for data in (
+            {"status": "idle"},
+            {"status": "idle", "turn_id": "turn-other"},
+        ):
+            unrelated = await client.post(
+                "/v1/sessions/session-native/events",
+                json={"type": "external_session_status", "data": data},
+            )
+            assert unrelated.status_code == 204
+            await asyncio.sleep(0)
+            assert len(server.posts) == 2
+
         terminal = await client.post(
             "/v1/sessions/session-native/events",
             json={
@@ -255,3 +308,191 @@ async def test_native_driver_claim_completes_only_after_forwarded_terminal_statu
         "complete",
     ]
     assert server.posts[-1][1]["params"] == {"succeeded": True}
+
+
+@pytest.mark.asyncio
+async def test_native_driver_heartbeat_loss_stops_and_waits_for_correlated_terminal() -> None:
+    """Fence loss terminates native work before releasing its durable claim."""
+    server = _ValidationClient(200, 200, 409, 200)
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.created", "response": {"id": "resp-native"}})]
+    )
+    process_manager = _FakeProcessManager(harness_client)
+    spec = AgentSpec(
+        spec_version=1,
+        name="native",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, process_manager),
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=cast(httpx.AsyncClient, server),
+    )
+    app.state.driver_heartbeat_interval_seconds = 0.01
+    app.state.driver_termination_timeout_seconds = 1.0
+    stopped = asyncio.Event()
+    claim = {
+        "dispatch_id": "1" * 32,
+        "event_id": "2" * 32,
+        "source_id": "source-native",
+        "effect_id": "3" * 32,
+        "driver_generation": 1,
+        "consumer_token": "4" * 32,
+        "consumer_generation": 2,
+        "runner_id": "runner-1",
+    }
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+
+        async def stop_hook(conv: str) -> None:
+            assert conv == "session-native"
+            stopped.set()
+            response = await client.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "failed", "turn_id": "turn-native"},
+                },
+            )
+            assert response.status_code == 204
+
+        app.state.driver_fence_stop_test_hook = stop_hook
+        response = await client.post(
+            "/v1/sessions/session-native/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "agent-native",
+                "persisted_item_id": "turn-native",
+                "content": [{"type": "input_text", "text": "work"}],
+                "driver_claim": claim,
+            },
+        )
+        assert response.status_code == 202
+        await asyncio.wait_for(stopped.wait(), timeout=2.0)
+        for _ in range(100):
+            if len(server.posts) >= 4:
+                break
+            await asyncio.sleep(0.01)
+
+    assert [path.rsplit("/", 1)[-1] for path, _kwargs in server.posts] == [
+        "validate",
+        "validate",
+        "heartbeat",
+        "complete",
+    ]
+    assert server.posts[-1][1]["params"] == {"succeeded": False}
+
+
+@pytest.mark.asyncio
+async def test_native_driver_heartbeat_loss_retains_claim_without_terminal_proof() -> None:
+    """An unconfirmed native stop must not free the durable execution fence."""
+    server = _ValidationClient(200, 200, 409)
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.created", "response": {"id": "resp-native"}})]
+    )
+    process_manager = _FakeProcessManager(harness_client)
+    spec = AgentSpec(
+        spec_version=1,
+        name="native",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, process_manager),
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=cast(httpx.AsyncClient, server),
+    )
+    app.state.driver_heartbeat_interval_seconds = 0.01
+    app.state.driver_termination_timeout_seconds = 0.01
+    stopped = asyncio.Event()
+
+    async def stop_hook(conv: str) -> None:
+        assert conv == "session-native"
+        stopped.set()
+
+    app.state.driver_fence_stop_test_hook = stop_hook
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        response = await client.post(
+            "/v1/sessions/session-native/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "agent-native",
+                "persisted_item_id": "turn-native",
+                "content": [{"type": "input_text", "text": "work"}],
+                "driver_claim": {
+                    "dispatch_id": "1" * 32,
+                    "event_id": "2" * 32,
+                    "source_id": "source-native",
+                    "effect_id": "3" * 32,
+                    "driver_generation": 1,
+                    "consumer_token": "4" * 32,
+                    "consumer_generation": 2,
+                    "runner_id": "runner-1",
+                },
+            },
+        )
+        assert response.status_code == 202
+        await asyncio.wait_for(stopped.wait(), timeout=2.0)
+        await asyncio.sleep(0.05)
+
+    assert [path.rsplit("/", 1)[-1] for path, _kwargs in server.posts] == [
+        "validate",
+        "validate",
+        "heartbeat",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_driver_semantic_failure_retries_terminal_acknowledgement() -> None:
+    """A failed SSE turn stays failed while an ambiguous completion is retried."""
+    server = _ValidationClient(200, 200, 503, 200)
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.failed", "response": {"status": "failed"}})]
+    )
+    process_manager = _FakeProcessManager(harness_client)
+    spec = AgentSpec(
+        spec_version=1,
+        name="sdk",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "mock"}),
+    )
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, process_manager),
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=cast(httpx.AsyncClient, server),
+    )
+    app.state.driver_completion_retry_interval_seconds = 0.01
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        response = await client.post(
+            "/v1/sessions/session-sdk/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "agent-sdk",
+                "persisted_item_id": "turn-sdk",
+                "content": [{"type": "input_text", "text": "work"}],
+                "driver_claim": {
+                    "dispatch_id": "1" * 32,
+                    "event_id": "2" * 32,
+                    "source_id": "source-sdk",
+                    "effect_id": "3" * 32,
+                    "driver_generation": 1,
+                    "consumer_token": "4" * 32,
+                    "consumer_generation": 2,
+                    "runner_id": "runner-1",
+                },
+            },
+        )
+        assert response.status_code == 202
+        for _ in range(200):
+            if len(server.posts) >= 4:
+                break
+            await asyncio.sleep(0.01)
+
+    actions = [path.rsplit("/", 1)[-1] for path, _kwargs in server.posts]
+    assert actions == ["validate", "validate", "complete", "complete"]
+    assert server.posts[-2][1]["params"] == {"succeeded": False}
+    assert server.posts[-1][1]["params"] == {"succeeded": False}

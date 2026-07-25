@@ -2125,7 +2125,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             if result.rowcount != 1:
                 raise DriverLeaseConflictError("driver dispatch is in progress")
             return True
-        if dispatch.claim_expires_at is None or dispatch.claim_expires_at > now:
+        if (
+            dispatch.state == "executing"
+            or dispatch.claim_expires_at is None
+            or dispatch.claim_expires_at > now
+        ):
             raise DriverLeaseConflictError("driver dispatch is in progress")
         result = session.execute(
             update(SqlSessionDriverDispatch)
@@ -2474,8 +2478,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     payload=payload,
                     completed=True,
                 )
-            if (
-                dispatch.state in {"running", "executing"}
+            if dispatch.state == "executing" or (
+                dispatch.state == "running"
                 and dispatch.claim_expires_at is not None
                 and dispatch.claim_expires_at > now
             ):
@@ -2646,7 +2650,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlSessionDriverDispatch.id == dispatch_id,
                     SqlSessionDriverDispatch.session_id == session_id,
                     SqlSessionDriverDispatch.state.in_(("running", "executing")),
-                    SqlSessionDriverDispatch.claim_expires_at > now,
                     SqlSessionDriverDispatch.consumer_token == consumer_token,
                     SqlSessionDriverDispatch.consumer_generation == consumer_generation,
                 )
@@ -2657,6 +2660,19 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
             if result.rowcount != 1:
+                dispatch = session.get(
+                    SqlSessionDriverDispatch,
+                    (current_workspace_id(), dispatch_id),
+                )
+                expected_state = "completed" if succeeded else "failed"
+                if (
+                    dispatch is not None
+                    and dispatch.session_id == session_id
+                    and dispatch.consumer_token == consumer_token
+                    and dispatch.consumer_generation == consumer_generation
+                    and dispatch.state == expected_state
+                ):
+                    return
                 raise DriverLeaseConflictError("driver dispatch is no longer active")
 
     def acquire_driver_lease(

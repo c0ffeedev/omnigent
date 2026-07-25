@@ -3586,6 +3586,19 @@ async def test_bound_runner_lease_state_is_explicit_and_authenticated(
     assert leased.status_code == 200, leased.text
     assert leased.json() == {"requires_driver_claim": True, "generation": 1}
 
+    released = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/release",
+        json={"generation": 1},
+        headers=headers,
+    )
+    assert released.status_code == 200, released.text
+    released_state = await auth_client.get(
+        f"/v1/runner/sessions/{session_id}/driver-dispatch/lease-state",
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
+    )
+    assert released_state.status_code == 200, released_state.text
+    assert released_state.json() == {"requires_driver_claim": True, "generation": 1}
+
     direct_resolve = await auth_client.post(
         f"/v1/sessions/{session_id}/elicitations/elicit_test/resolve",
         json={"action": "accept"},
@@ -3645,6 +3658,19 @@ async def test_leased_runner_events_require_bound_runner_ingress(
         headers={RUNNER_TUNNEL_TOKEN_HEADER: binding_token},
     )
     assert accepted.status_code == 202, accepted.text
+
+    released = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/release",
+        json={"generation": 1},
+        headers=owner_headers,
+    )
+    assert released.status_code == 200, released.text
+    still_runner_only = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={**payload, "source_id": "runner-status-after-release"},
+        headers=owner_headers,
+    )
+    assert still_runner_only.status_code == 403, still_runner_only.text
 
     forged_input = await auth_client.post(
         f"/v1/runners/{runner_id}/sessions/{session_id}/events",

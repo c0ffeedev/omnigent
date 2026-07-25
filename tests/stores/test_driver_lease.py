@@ -357,6 +357,39 @@ def test_expired_dispatch_is_recovered_after_restart_and_fences_old_owner(
         assert dispatch.claim_expires_at is None
 
 
+def test_expired_executing_dispatch_remains_fenced_until_terminal_confirmation(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Execution-time expiry is poisoned until its exact consumer settles it."""
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    session_id = conversation_store.create_conversation().id
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 100)
+    conversation_store.acquire_driver_lease(session_id, ALICE, 10)
+    claim = _begin_claim(
+        conversation_store,
+        session_id,
+        ALICE,
+        1,
+        claim_ttl_seconds=10,
+    )
+    conversation_store.validate_driver_event(
+        session_id,
+        claim.dispatch_id,
+        consumer_token=claim.consumer_token,
+        consumer_generation=claim.consumer_generation,
+    )
+
+    monkeypatch.setattr(store_module, "now_epoch", lambda: 110)
+    with pytest.raises(DriverLeaseConflictError, match="dispatch is in progress"):
+        conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
+
+    _complete_claim(conversation_store, session_id, claim, succeeded=False)
+    takeover = conversation_store.acquire_driver_lease(session_id, BOB, 30, force=True)
+    assert takeover.generation == 2
+
+
 def test_dispatch_heartbeat_renews_before_boundary_and_expires_at_boundary(
     conversation_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
@@ -631,12 +664,12 @@ def test_generation_round_trips_on_human_input(
 def test_completed_dispatch_completion_is_a_terminal_noop(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """A duplicate completion of a finished dispatch is a terminal conflict.
+    """An exact duplicate completion is an idempotent terminal acknowledgement.
 
     Models an at-least-once outbox consumer redelivering the completion for a
     dispatch that already finished: the second call must not resurrect the
-    claim, flip its terminal state, or mutate ``completed_at`` — it is rejected
-    as a no-op so a stale delivery cannot re-open a settled turn.
+    claim, flip its terminal state, or mutate ``completed_at``. A conflicting
+    terminal result and a renewal remain fenced.
     """
     session_id = conversation_store.create_conversation().id
     conversation_store.acquire_driver_lease(session_id, ALICE, 30)
@@ -652,8 +685,7 @@ def test_completed_dispatch_completion_is_a_terminal_noop(
     assert settled.claim_expires_at is None
 
     for _ in range(2):
-        with pytest.raises(DriverLeaseConflictError, match="no longer active"):
-            _complete_claim(conversation_store, session_id, claim, succeeded=True)
+        _complete_claim(conversation_store, session_id, claim, succeeded=True)
         with pytest.raises(DriverLeaseConflictError, match="no longer active"):
             _complete_claim(conversation_store, session_id, claim, succeeded=False)
         with pytest.raises(DriverLeaseConflictError, match="no longer active"):
