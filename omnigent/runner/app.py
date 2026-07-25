@@ -7349,6 +7349,64 @@ def create_runner_app(
 
         body = await request.json()
         body_type = body.get("type") if isinstance(body, dict) else None
+        if isinstance(body, dict):
+            driver_claim = body.pop("driver_claim", None)
+        else:
+            driver_claim = None
+        if driver_claim is not None:
+            if not isinstance(driver_claim, dict):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_request",
+                        "detail": "driver_claim must be an object",
+                    },
+                )
+            required_claim_fields = {
+                "dispatch_id",
+                "consumer_token",
+                "consumer_generation",
+                "runner_id",
+            }
+            if not required_claim_fields.issubset(driver_claim):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_request",
+                        "detail": "driver_claim is missing consumer fencing fields",
+                    },
+                )
+            test_hook = getattr(app.state, "driver_fence_test_hook", None)
+            if test_hook is not None:
+                await test_hook("pre_execute", driver_claim["dispatch_id"])
+            try:
+                validation = await server_client.post(
+                    "/v1/runners/"
+                    f"{driver_claim['runner_id']}/sessions/{conversation_id}/"
+                    "driver-dispatch/validate",
+                    json={
+                        "dispatch_id": driver_claim["dispatch_id"],
+                        "consumer_token": driver_claim["consumer_token"],
+                        "consumer_generation": driver_claim["consumer_generation"],
+                    },
+                    timeout=10.0,
+                )
+            except httpx.HTTPError:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "driver_validation_unavailable",
+                        "detail": "Could not revalidate the driver dispatch.",
+                    },
+                )
+            if validation.status_code >= 400:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "stale_driver_dispatch",
+                        "detail": "The driver dispatch is no longer authoritative.",
+                    },
+                )
         _logger.info(
             "post_session_events: conv=%s type=%s active=%s buffer_len=%d content_types=%s",
             conversation_id,

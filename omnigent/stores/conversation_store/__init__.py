@@ -250,6 +250,19 @@ class SessionDriverLease:
 
 
 @dataclass(frozen=True)
+class DriverDispatchEnvelope:
+    """Durable payload accepted into the driver outbox."""
+
+    dispatch_id: str
+    event_id: str
+    source_id: str
+    effect_id: str
+    driver_generation: int
+    payload: dict[str, Any]
+    completed: bool = False
+
+
+@dataclass(frozen=True)
 class DriverDispatchClaim:
     """Durable identity and consumer fence for one accepted driver input."""
 
@@ -261,6 +274,7 @@ class DriverDispatchClaim:
     consumer_token: str
     consumer_generation: int
     claim_expires_at: int
+    payload: dict[str, Any]
     completed: bool = False
 
 
@@ -405,6 +419,42 @@ class ConversationStore(ABC):
         ``(workspace_id, session_id, source_id)``; retries must preserve the
         actor, lease generation, event type, and canonical payload.
         """
+        raise NotImplementedError
+
+    def enqueue_driver_event(
+        self,
+        session_id: str,
+        actor_user_id: str,
+        generation: int | None,
+        event_type: str,
+        *,
+        source_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> DriverDispatchEnvelope | None:
+        """Atomically validate and enqueue a payload without claiming it."""
+        raise NotImplementedError
+
+    def claim_driver_event(
+        self,
+        session_id: str,
+        dispatch_id: str,
+        actor_user_id: str,
+        generation: int,
+        *,
+        claim_ttl_seconds: int = DRIVER_DISPATCH_CLAIM_TTL_SECONDS,
+    ) -> DriverDispatchClaim:
+        """Claim pending or recoverable outbox work for one consumer."""
+        raise NotImplementedError
+
+    def validate_driver_event(
+        self,
+        session_id: str,
+        dispatch_id: str,
+        *,
+        consumer_token: str,
+        consumer_generation: int,
+    ) -> None:
+        """Revalidate a claim and lease generation without extending its TTL."""
         raise NotImplementedError
 
     def renew_driver_event(

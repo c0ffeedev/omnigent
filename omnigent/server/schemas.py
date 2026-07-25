@@ -1649,6 +1649,14 @@ class DriverLeaseGenerationRequest(BaseModel):
     ttl_seconds: int = Field(default=30, ge=5, le=300)
 
 
+class DriverDispatchValidationRequest(BaseModel):
+    """Opaque consumer claim revalidated by a bound runner before execution."""
+
+    dispatch_id: str = Field(min_length=32, max_length=32)
+    consumer_token: str = Field(min_length=32, max_length=32)
+    consumer_generation: int = Field(ge=1)
+
+
 class DriverLeaseHandoffRequest(BaseModel):
     """Generation-fenced handoff to a specified collaborator."""
 

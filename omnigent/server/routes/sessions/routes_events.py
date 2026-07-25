@@ -85,6 +85,7 @@ from omnigent.server.routes._sessions.helpers import *
 from omnigent.server.routes._sessions.orchestration import *
 from omnigent.server.schemas import (
     ConversationDeleted,
+    DriverDispatchValidationRequest,
     DriverLeaseAcquireRequest,
     DriverLeaseGenerationRequest,
     DriverLeaseHandoffRequest,
@@ -426,6 +427,47 @@ def register_events_routes(
         return SessionPresenceResponse.model_validate(state)
 
     @router.post(
+        "/runners/{runner_id}/sessions/{session_id}/driver-dispatch/validate",
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def validate_driver_dispatch(
+        request: Request,
+        runner_id: str,
+        session_id: str,
+        body: DriverDispatchValidationRequest,
+    ) -> dict[str, bool]:
+        """Revalidate a bound runner's consumer claim immediately before use."""
+        tunnel_token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+        if not tunnel_token or token_bound_runner_id(tunnel_token) != runner_id:
+            raise OmnigentError(
+                "runner binding token is invalid",
+                code=ErrorCode.UNAUTHORIZED,
+            )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        if conv.runner_id != runner_id:
+            raise OmnigentError(
+                "runner is not bound to this session",
+                code=ErrorCode.FORBIDDEN,
+            )
+        test_hook = getattr(request.app.state, "driver_fence_test_hook", None)
+        if test_hook is not None:
+            await test_hook("pre_execute", body.dispatch_id)
+        try:
+            await asyncio.to_thread(
+                conversation_store.validate_driver_event,
+                session_id,
+                body.dispatch_id,
+                consumer_token=body.consumer_token,
+                consumer_generation=body.consumer_generation,
+            )
+        except DriverLeaseConflictError as exc:
+            raise await _driver_lease_conflict(exc, session_id) from exc
+        return {"valid": True}
+
+    @router.post(
         "/runners/{runner_id}/sessions/{session_id}/events",
         include_in_schema=False,
         status_code=202,
@@ -656,6 +698,7 @@ def register_events_routes(
         driver_heartbeat_task: asyncio.Task[None] | None = None
         driver_lease_active = False
         driver_duplicate = False
+        driver_effect_id: str | None = None
 
         async def _guard_driver_side_effect(point: str) -> None:
             """Renew the durable fence immediately before a driver side effect."""
@@ -713,16 +756,19 @@ def register_events_routes(
             )
 
         async def _accept_driver_fence() -> None:
-            nonlocal driver_dispatch_claim, driver_dispatch_id, driver_duplicate
+            nonlocal body, driver_dispatch_claim, driver_dispatch_id, driver_duplicate
+            nonlocal driver_effect_id
             if not driver_lease_active:
                 return
             if driver_dispatch_id is not None:
                 return
-            begin_driver_event = getattr(conversation_store, "begin_driver_event", None)
-            if begin_driver_event is None:
-                raise RuntimeError("conversation store cannot atomically begin driver dispatches")
-            def _begin() -> DriverDispatchClaim | str | None:
-                return begin_driver_event(
+            enqueue_driver_event = getattr(conversation_store, "enqueue_driver_event", None)
+            claim_driver_event = getattr(conversation_store, "claim_driver_event", None)
+            if enqueue_driver_event is None or claim_driver_event is None:
+                raise RuntimeError("conversation store cannot operate the driver outbox")
+
+            def _enqueue() -> Any:
+                return enqueue_driver_event(
                     session_id,
                     driver_actor_user_id,
                     body.driver_generation,
@@ -734,56 +780,65 @@ def register_events_routes(
                     ),
                 )
 
+            test_hook = getattr(request.app.state, "driver_fence_test_hook", None)
+            if test_hook is not None:
+                await test_hook("pre_enqueue", "")
+
             try:
-                acceptance = asyncio.create_task(asyncio.to_thread(_begin))
+                acceptance = asyncio.create_task(asyncio.to_thread(_enqueue))
                 try:
-                    accepted_dispatch = await asyncio.shield(acceptance)
+                    envelope = await asyncio.shield(acceptance)
                 except asyncio.CancelledError:
                     current_task = asyncio.current_task()
                     if current_task is not None:
                         current_task.uncancel()
-                    accepted_dispatch = await acceptance
-                    driver_dispatch_claim = (
-                        accepted_dispatch
-                        if isinstance(accepted_dispatch, DriverDispatchClaim)
-                        else None
-                    )
-                    driver_dispatch_id = (
-                        accepted_dispatch.dispatch_id
-                        if isinstance(accepted_dispatch, DriverDispatchClaim)
-                        else accepted_dispatch
-                    )
-                    if driver_dispatch_id is not None:
-                        _start_driver_heartbeat()
+                    await acceptance
                     raise
             except NotImplementedError as exc:
-                raise RuntimeError(
-                    "conversation store cannot atomically begin driver dispatches"
-                ) from exc
+                raise RuntimeError("conversation store cannot operate the driver outbox") from exc
             except DriverLeaseConflictError as exc:
                 raise await _driver_lease_conflict(exc, session_id) from exc
-            driver_dispatch_claim = (
-                accepted_dispatch if isinstance(accepted_dispatch, DriverDispatchClaim) else None
-            )
-            driver_dispatch_id = (
-                accepted_dispatch.dispatch_id
-                if isinstance(accepted_dispatch, DriverDispatchClaim)
-                else accepted_dispatch
-            )
-            if driver_dispatch_id is None:
+            if envelope is None:
                 raise RuntimeError("active driver lease disappeared before acceptance")
-            if driver_dispatch_claim is not None and driver_dispatch_claim.completed:
+            driver_dispatch_id = envelope.dispatch_id
+            driver_effect_id = envelope.effect_id
+            if envelope.completed:
                 driver_duplicate = True
                 return
-            if driver_dispatch_claim is not None:
-                body._driver_claim = {
-                    "event_id": driver_dispatch_claim.event_id,
-                    "source_id": driver_dispatch_claim.source_id,
-                    "effect_id": driver_dispatch_claim.effect_id,
+
+            def _claim() -> DriverDispatchClaim:
+                assert body.driver_generation is not None
+                return claim_driver_event(
+                    session_id,
+                    driver_dispatch_id,
+                    driver_actor_user_id,
+                    body.driver_generation,
+                )
+
+            try:
+                driver_dispatch_claim = await asyncio.to_thread(_claim)
+            except DriverLeaseConflictError as exc:
+                raise await _driver_lease_conflict(exc, session_id) from exc
+            body = EventIngestRequest.model_validate(
+                {
+                    **driver_dispatch_claim.payload,
                     "driver_generation": driver_dispatch_claim.driver_generation,
+                    "source_id": driver_dispatch_claim.source_id,
                 }
+            )
+            body._driver_claim = {
+                "dispatch_id": driver_dispatch_claim.dispatch_id,
+                "event_id": driver_dispatch_claim.event_id,
+                "source_id": driver_dispatch_claim.source_id,
+                "effect_id": driver_dispatch_claim.effect_id,
+                "driver_generation": driver_dispatch_claim.driver_generation,
+                "consumer_token": driver_dispatch_claim.consumer_token,
+                "consumer_generation": driver_dispatch_claim.consumer_generation,
+            }
+            if conv is not None and conv.runner_id is not None:
+                body._driver_claim["runner_id"] = conv.runner_id
             _start_driver_heartbeat()
-            await _guard_driver_side_effect("after_acceptance")
+            await _guard_driver_side_effect("after_claim")
 
         async def _finish_driver_response(response: Any) -> Any:
             """Finish durable dispatch state before FastAPI emits a success."""
@@ -842,11 +897,11 @@ def register_events_routes(
                 raise await _driver_lease_conflict(exc, session_id) from exc
             await _accept_driver_fence()
             if driver_duplicate:
-                assert driver_dispatch_claim is not None
+                assert driver_effect_id is not None
                 return {
                     "queued": False,
                     "duplicate": True,
-                    "effect_id": driver_dispatch_claim.effect_id,
+                    "effect_id": driver_effect_id,
                 }
 
         # ── Policy evaluation (path-agnostic) ────────────────
