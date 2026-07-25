@@ -172,6 +172,11 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     expect(page.get_by_test_id("schedule-minute-37")).to_be_visible()
     page.get_by_test_id("schedule-minute-37").click(force=True)
     expect(time_input).to_have_value("09:37 AM")
+    # Picking one column intentionally leaves the three-column picker open so
+    # the hour, minute, and period can be adjusted together. Dismiss it before
+    # submitting; otherwise the popover correctly intercepts the click.
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("schedule-time-picker")).to_be_hidden()
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     created_row = _row_by_name(page, "Typed time daily")
