@@ -23,6 +23,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
+import { CoordinationAuditHistoryDialog } from "@/components/coordination/CoordinationAuditHistory";
 import { CoordinationStatusPopover } from "@/components/coordination/CoordinationStatusPopover";
 import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
@@ -262,6 +263,7 @@ export function ChatHeader({
       <div className="flex items-center gap-1">
         {/* Shared presence, driver ownership, and transport freshness. */}
         {conversationId && <CoordinationStatusPopover sessionId={conversationId} />}
+        {conversationId && <CoordinationAuditHistoryDialog sessionId={conversationId} />}
         {/* Desktop (md+) action buttons. On mobile these collapse into
             the three-dot "Session actions" menu below, which renders
             the same set off the same gating booleans. Clone has no

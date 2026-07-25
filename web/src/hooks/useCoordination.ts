@@ -330,17 +330,26 @@ export function useCoordination(sessionId: string): UseCoordinationResult {
 export interface UseCoordinationAuditResult {
   records: CoordinationAuditRecord[];
   isLoading: boolean;
+  isFetching: boolean;
+  isStale: boolean;
   error: Error | null;
+  refresh(): Promise<void>;
 }
 
 export function useCoordinationAudit(sessionId: string): UseCoordinationAuditResult {
   const query = useQuery({
     queryKey: coordinationAuditQueryKey(sessionId),
-    queryFn: () => listCoordinationAudit(sessionId),
+    queryFn: ({ signal }) => listCoordinationAudit(sessionId, { signal }),
+    retry: false,
   });
   return {
     records: query.data ?? [],
     isLoading: query.isLoading,
+    isFetching: query.isFetching,
+    isStale: query.isStale,
     error: query.error,
+    refresh: async () => {
+      await query.refetch();
+    },
   };
 }

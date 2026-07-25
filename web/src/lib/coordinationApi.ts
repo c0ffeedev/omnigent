@@ -32,11 +32,25 @@ export interface CoordinationAuditRecord {
   actorUserId: string | null;
   holderUserId: string | null;
   generation: number | null;
+  outcome: string | null;
+  /** Server Unix timestamp in seconds. */
   createdAt: number | null;
+}
+
+export interface CoordinationAuditPage {
+  /** Server-authoritative records, newest first. */
+  records: CoordinationAuditRecord[];
+  /** Cursor for the next bounded scan of older session items. */
+  nextCursor: string | null;
 }
 
 export interface CoordinationRequestOptions {
   signal?: AbortSignal;
+}
+
+export interface ListCoordinationAuditOptions extends CoordinationRequestOptions {
+  limit?: number;
+  maxPages?: number;
 }
 
 export interface AcquireDriverLeaseOptions extends CoordinationRequestOptions {
@@ -260,7 +274,12 @@ function auditRecordFromItem(item: ConversationItem): CoordinationAuditRecord | 
     id: item.id,
     eventType: item.event_type,
     sessionId,
-    actorUserId: typeof resource.actor_user_id === "string" ? resource.actor_user_id : null,
+    actorUserId:
+      typeof resource.actor_user_id === "string"
+        ? resource.actor_user_id
+        : typeof item.created_by === "string"
+          ? item.created_by
+          : null,
     holderUserId: typeof resource.holder_user_id === "string" ? resource.holder_user_id : null,
     generation:
       typeof item.driver_generation === "number"
@@ -268,18 +287,94 @@ function auditRecordFromItem(item: ConversationItem): CoordinationAuditRecord | 
         : typeof resource.generation === "number"
           ? resource.generation
           : null,
+    outcome: typeof item.status === "string" && item.status ? item.status : null,
     createdAt: typeof item.created_at === "number" ? item.created_at : null,
   };
+}
+
+const AUDIT_RAW_PAGE_SIZE = 100;
+const MAX_AUDIT_SCAN_PAGES = 4;
+
+/**
+ * Fetch one bounded page of coordination activity.
+ *
+ * Coordination events share the session item stream with messages and tool
+ * calls, so one activity page may inspect several raw item pages. The scan
+ * cap prevents sparse histories from triggering an unbounded crawl while the
+ * cursor keeps older history reachable through an explicit user action.
+ */
+export async function fetchCoordinationAuditPage(
+  sessionId: string,
+  { cursor, limit = 20, signal }: { cursor?: string; limit?: number; signal?: AbortSignal } = {},
+): Promise<CoordinationAuditPage> {
+  const requestedLimit = Number.isFinite(limit) ? Math.floor(limit) : 20;
+  const recordLimit = Math.max(1, Math.min(100, requestedLimit));
+  const records: CoordinationAuditRecord[] = [];
+  let scanCursor = cursor;
+
+  for (let pages = 0; pages < MAX_AUDIT_SCAN_PAGES; pages++) {
+    // The next raw page depends on the preceding page's oldest inspected item.
+    // eslint-disable-next-line no-await-in-loop
+    const page = await fetchSessionItemsPage(sessionId, {
+      limit: AUDIT_RAW_PAGE_SIZE,
+      olderThan: scanCursor,
+      signal,
+    });
+    const newestFirst = [...page.items].reverse();
+
+    for (let index = 0; index < newestFirst.length; index++) {
+      const item = newestFirst[index];
+      scanCursor = item.id;
+      const record = auditRecordFromItem(item);
+      if (record) records.push(record);
+      if (records.length >= recordLimit) {
+        const hasOlderInPage = index < newestFirst.length - 1;
+        return {
+          records,
+          nextCursor: hasOlderInPage || page.hasMore ? scanCursor : null,
+        };
+      }
+    }
+
+    if (!page.hasMore || !scanCursor) return { records, nextCursor: null };
+  }
+
+  return { records, nextCursor: scanCursor ?? null };
 }
 
 /** Return the newest persisted driver-lease transitions from session history. */
 export async function listCoordinationAudit(
   sessionId: string,
-  options: { limit?: number } = {},
+  options: ListCoordinationAuditOptions = {},
 ): Promise<CoordinationAuditRecord[]> {
-  const page = await fetchSessionItemsPage(sessionId, { limit: options.limit ?? 100 });
-  return page.items.flatMap((item) => {
-    const record = auditRecordFromItem(item);
-    return record === null ? [] : [record];
-  });
+  const limit = Math.max(1, Math.min(options.limit ?? 50, 1_000));
+  const maxPages = Math.max(1, Math.min(options.maxPages ?? 10, 100));
+  const records: CoordinationAuditRecord[] = [];
+  let olderThan: string | undefined;
+  let hasMore = true;
+  let pagesScanned = 0;
+
+  while (hasMore && records.length < limit && pagesScanned < maxPages) {
+    // Each page cursor comes from the preceding response.
+    // eslint-disable-next-line no-await-in-loop
+    const page = await fetchSessionItemsPage(sessionId, {
+      limit: 1_000,
+      olderThan,
+      signal: options.signal,
+    });
+    pagesScanned += 1;
+    records.push(
+      ...page.items
+        .flatMap((item) => {
+          const record = auditRecordFromItem(item);
+          return record === null ? [] : [record];
+        })
+        .reverse(),
+    );
+    hasMore = page.hasMore;
+    olderThan = page.items[0]?.id;
+    if (!olderThan) break;
+  }
+
+  return records.slice(0, limit);
 }
