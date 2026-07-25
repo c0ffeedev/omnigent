@@ -34,6 +34,7 @@ from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_run
 from omnigent.runtime import get_caps, session_stream
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.server.routes import sessions as sessions_routes
+from omnigent.server.routes.sessions import routes_agent as sessions_agent_routes
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -616,7 +617,9 @@ async def test_mcp_accepts_runner_actor_in_single_user_mode(
         captured.update(kwargs)
         return JSONResponse({"jsonrpc": "2.0", "id": 1, "result": {}})
 
-    monkeypatch.setattr(sessions_routes, "_handle_mcp_tools_call", _capture_call)
+    # The split sessions architecture resolves MCP handlers from the route
+    # module, rather than from the compatibility facade.
+    monkeypatch.setattr(sessions_agent_routes, "_handle_mcp_tools_call", _capture_call)
     agent = await create_test_agent(client)
     session_id = await _create_session(client, agent["id"])
 

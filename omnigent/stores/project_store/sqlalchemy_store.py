@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import builtins
-from typing import cast
+import json
+from typing import Any, cast
 
 from sqlalchemy import asc, delete, select
 from sqlalchemy.exc import IntegrityError
@@ -19,6 +20,29 @@ from omnigent.db.utils import (
 from omnigent.entities import Project, ProjectResource, ProjectResourceKind
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.project_store import ProjectStore
+
+
+def _encode_config(config: dict[str, Any] | None) -> str | None:
+    """Pack a project's config dict into a compact JSON blob for storage.
+
+    An empty or ``None`` config stores SQL ``NULL`` rather than ``"{}"``, so
+    "no defaults" is one canonical representation.
+
+    :param config: The config object, or ``None``.
+    :returns: Compact JSON object string, or ``None`` when empty.
+    """
+    if not config:
+        return None
+    return json.dumps(config, separators=(",", ":"))
+
+
+def _decode_config(raw: str | None) -> dict[str, Any]:
+    """Unpack the stored ``config`` blob to a dict (``{}`` when unset).
+
+    :param raw: The stored JSON blob, or ``None``.
+    :returns: The decoded object, or an empty dict when ``NULL`` / empty.
+    """
+    return json.loads(raw) if raw else {}
 
 
 def _is_name_conflict(exc: IntegrityError) -> bool:
@@ -48,6 +72,7 @@ def _to_entity(row: SqlProject) -> Project:
         owner_user_id=row.owner_user_id,
         created_at=row.created_at,
         updated_at=row.updated_at,
+        config=_decode_config(row.config),
     )
 
 
@@ -120,6 +145,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         project_id: str,
         name: str,
         owner_user_id: str | None,
+        config: dict[str, Any] | None = None,
     ) -> Project:
         """Insert a new, empty project.
 
@@ -143,6 +169,7 @@ class SqlAlchemyProjectStore(ProjectStore):
                 owner_user_id=owner_user_id,
                 created_at=now_epoch(),
                 updated_at=None,
+                config=_encode_config(config),
             )
             session.add(row)
             try:
@@ -182,11 +209,13 @@ class SqlAlchemyProjectStore(ProjectStore):
         *,
         owner_user_id: str | None,
         name: str | None = None,
+        config: dict[str, Any] | None = None,
     ) -> Project | None:
         """Update mutable fields of an owned project.
 
         ``None`` leaves a field unchanged. Returns ``None`` if the project does
-        not exist or is not owned by ``owner_user_id``.
+        not exist or is not owned by ``owner_user_id``. A ``config`` of ``{}``
+        clears the stored defaults (distinct from ``None`` = leave unchanged).
         """
         with self._session() as session:
             row = session.get(SqlProject, (current_workspace_id(), project_id))
@@ -203,6 +232,11 @@ class SqlAlchemyProjectStore(ProjectStore):
                     )
                 row.name = name
                 changed = True
+            if config is not None:
+                encoded = _encode_config(config)
+                if row.config != encoded:
+                    row.config = encoded
+                    changed = True
             if changed:
                 row.updated_at = now_epoch()
             try:

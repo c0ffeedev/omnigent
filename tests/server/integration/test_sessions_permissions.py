@@ -27,11 +27,19 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.host.frames import HostHelloFrame
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime import session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import presence
 from omnigent.server.app import create_app
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_OWNER, LEVEL_READ
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_MANAGE,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -3157,6 +3165,163 @@ async def test_driver_lease_routes_authorize_fence_and_snapshot(
     assert [item.driver_generation for item in lease_events] == [1, 2, 3, 3]
 
 
+async def test_forwarded_actor_is_the_driver_lease_principal(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trusted runner cannot spend the transport user's driver lease for ``run_as``."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events as routes_events_module
+
+    class _Runner:
+        async def post(self, path: str, **_: Any) -> httpx.Response:
+            return httpx.Response(202, request=httpx.Request("POST", f"http://runner{path}"))
+
+    async def _runner(*_: Any, **__: Any) -> _Runner:
+        return _Runner()
+
+    async def _relay_ready(*_: Any, **__: Any) -> None:
+        return None
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
+    monkeypatch.setattr(routes_events_module, "_ensure_runner_relay_ready", _relay_ready)
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    session_id = (await _create_session_as(auth_client, agent["id"], "alice@example.com"))["id"]
+    grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="alice@example.com",
+        target_user="bob@example.com",
+        level=LEVEL_EDIT,
+    )
+    assert grant.status_code == 200
+
+    tunnel_token = "trusted-runner-driver-actor-token"
+    store = SqlAlchemyConversationStore(db_uri)
+    store.replace_runner_id(session_id, token_bound_runner_id(tunnel_token))
+    alice_headers = {
+        "X-Forwarded-Email": "alice@example.com",
+        RUNNER_TUNNEL_TOKEN_HEADER: tunnel_token,
+    }
+    acquired = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert acquired.status_code == 200, acquired.text
+
+    message = {
+        "type": "message",
+        "actor": {"run_as": "bob@example.com"},
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "forwarded actor"}],
+        },
+    }
+    wrong_principal = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={**message, "driver_generation": 1},
+        headers=alice_headers,
+    )
+    assert wrong_principal.status_code == 409
+
+    handed_off = await auth_client.post(
+        f"/v1/sessions/{session_id}/driver/handoff",
+        json={
+            "generation": 1,
+            "holder_user_id": "bob@example.com",
+            "ttl_seconds": 30,
+        },
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert handed_off.status_code == 200, handed_off.text
+    assert handed_off.json()["generation"] == 2
+
+    accepted = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={**message, "driver_generation": 2},
+        headers=alice_headers,
+    )
+    assert accepted.status_code == 202, accepted.text
+    items = store.list_items(session_id).data
+    assert items[-1].created_by == "bob@example.com"
+    assert items[-1].driver_generation == 2
+
+
+async def _assert_nonforwarded_driver_lease_principal(
+    session_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    expected_holder: str,
+) -> None:
+    """Acquire and spend a lease whose internal holder is a sentinel identity."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    class _Runner:
+        async def post(self, path: str, **_: Any) -> httpx.Response:
+            return httpx.Response(202, request=httpx.Request("POST", f"http://runner{path}"))
+
+    async def _runner(*_: Any, **__: Any) -> _Runner:
+        return _Runner()
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
+    agent = await create_test_agent(session_client, user="driver-sentinel-test")
+    session_id = (await _create_session_as(session_client, agent["id"], None))["id"]
+
+    acquired = await session_client.post(
+        f"/v1/sessions/{session_id}/driver/acquire",
+        json={"ttl_seconds": 30},
+    )
+    assert acquired.status_code == 200, acquired.text
+    assert acquired.json()["holder_user_id"] == expected_holder
+
+    accepted = await session_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "driver_generation": 1,
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "sentinel lease holder"}],
+            },
+        },
+    )
+    assert accepted.status_code == 202, accepted.text
+    items = SqlAlchemyConversationStore(db_uri).list_items(session_id).data
+    assert items[-1].created_by is None
+    assert items[-1].driver_generation == 1
+
+
+async def test_local_single_user_can_spend_its_driver_lease(
+    local_auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The attribution-hidden ``local`` identity remains the lease principal."""
+    await _assert_nonforwarded_driver_lease_principal(
+        local_auth_client,
+        db_uri,
+        monkeypatch,
+        expected_holder=RESERVED_USER_LOCAL,
+    )
+
+
+async def test_auth_disabled_public_user_can_spend_its_driver_lease(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The attribution-hidden ``__public__`` identity remains the lease principal."""
+    await _assert_nonforwarded_driver_lease_principal(
+        client,
+        db_uri,
+        monkeypatch,
+        expected_holder=RESERVED_USER_PUBLIC,
+    )
+
+
 async def test_lease_free_event_route_preserves_legacy_wire_shape(
     auth_client: httpx.AsyncClient,
     db_uri: str,
@@ -3590,6 +3755,7 @@ async def test_driver_takeover_is_rejected_before_actual_pending_input_enqueue(
     """Takeover cannot commit between acceptance and pending-input enqueue."""
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration as sessions_orchestration
 
     class _Runner:
         pass
@@ -3609,9 +3775,9 @@ async def test_driver_takeover_is_rejected_before_actual_pending_input_enqueue(
         return None
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
-    monkeypatch.setattr(sessions_module, "_ensure_native_terminal_ready", _terminal_ready)
+    monkeypatch.setattr(sessions_orchestration, "_ensure_native_terminal_ready", _terminal_ready)
     monkeypatch.setattr(
-        sessions_module,
+        sessions_orchestration,
         "_forward_native_terminal_message",
         _forward_after_pending,
     )
@@ -3696,6 +3862,7 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
 ) -> None:
     """The route renews its bounded fence while the runner POST is in flight."""
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events as sessions_events_routes
     from omnigent.stores.conversation_store import sqlalchemy_store as store_module
 
     runner_entered = asyncio.Event()
@@ -3726,7 +3893,11 @@ async def test_driver_takeover_is_rejected_during_actual_event_route_dispatch(
         heartbeat_renewed.set()
 
     monkeypatch.setattr(store_module, "now_epoch", lambda: clock[0])
-    monkeypatch.setattr(sessions_module, "_DRIVER_DISPATCH_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(
+        sessions_events_routes,
+        "_DRIVER_DISPATCH_HEARTBEAT_INTERVAL_SECONDS",
+        0.01,
+    )
     monkeypatch.setattr(SqlAlchemyConversationStore, "renew_driver_event", _renew_with_signal)
     monkeypatch.setattr(sessions_module, "_get_runner_client", _runner)
     agent = await create_test_agent(auth_client, user="alice@example.com")
