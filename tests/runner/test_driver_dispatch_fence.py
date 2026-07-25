@@ -50,6 +50,42 @@ class _ValidationClient:
         )
 
 
+def _control_claim() -> dict[str, Any]:
+    return {
+        "dispatch_id": "1" * 32,
+        "event_id": "2" * 32,
+        "source_id": "source-control",
+        "effect_id": "3" * 32,
+        "driver_generation": 1,
+        "consumer_token": "4" * 32,
+        "consumer_generation": 2,
+        "runner_id": "runner-1",
+    }
+
+
+class _ControlHarnessClient:
+    def __init__(self, status_code: int = 204) -> None:
+        self.status_code = status_code
+        self.entered = asyncio.Event()
+        self.release: asyncio.Event | None = None
+
+    async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+        del kwargs
+        self.entered.set()
+        if self.release is not None:
+            await self.release.wait()
+        return httpx.Response(
+            self.status_code,
+            request=httpx.Request("POST", f"http://harness{path}"),
+        )
+
+
+class _UncertainControlHarnessClient:
+    async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+        del path, kwargs
+        raise httpx.ReadTimeout("control outcome unknown")
+
+
 @pytest.mark.asyncio
 async def test_runner_rejects_stale_driver_delivery_before_dispatch() -> None:
     """A server-rejected consumer claim never reaches runner execution state."""
@@ -129,7 +165,7 @@ async def test_runner_rejects_missing_claim_when_session_is_leased(
 @pytest.mark.asyncio
 async def test_runner_revalidates_claim_at_background_execution_boundary() -> None:
     """A claim lost after HTTP acceptance cannot reach harness execution."""
-    server = _ValidationClient(200, 409, 200)
+    server = _ValidationClient(200, 409)
     app = create_runner_app(
         process_manager=cast(HarnessProcessManager, object()),
         server_client=cast(httpx.AsyncClient, server),
@@ -167,15 +203,11 @@ async def test_runner_revalidates_claim_at_background_execution_boundary() -> No
         assert response.status_code == 202
         await asyncio.wait_for(entered.wait(), timeout=1)
         release.set()
-        for _ in range(20):
-            if len(server.posts) >= 3:
-                break
-            await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
     assert [path.rsplit("/", 1)[-1] for path, _kwargs in server.posts] == [
         "validate",
         "validate",
-        "complete",
     ]
 
 
@@ -217,6 +249,183 @@ async def test_runner_revalidates_control_claim_at_side_effect_boundary() -> Non
     assert [path.rsplit("/", 1)[-1] for path, _kwargs in server.posts] == [
         "validate",
         "validate",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_driver_control_success_completes_terminal_claim() -> None:
+    """A successful control side effect durably completes its claim."""
+    server = _ValidationClient(200, 200, 200)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, object()),
+        server_client=cast(httpx.AsyncClient, server),
+    )
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        response = await client.post(
+            "/v1/sessions/session-1/events",
+            json={"type": "interrupt", "driver_claim": _control_claim()},
+        )
+
+    assert response.status_code == 204
+    assert [path.rsplit("/", 1)[-1] for path, _kwargs in server.posts] == [
+        "validate",
+        "validate",
+        "complete",
+    ]
+    assert server.posts[-1][1]["params"] == {"succeeded": True}
+
+
+@pytest.mark.asyncio
+async def test_driver_control_semantic_failure_completes_failed_claim() -> None:
+    """A terminal harness error makes the control claim retryable as failed."""
+    server = _ValidationClient(200, 200, 200)
+    harness_client = _ControlHarnessClient(status_code=500)
+    process_manager = _FakeProcessManager(cast(_ScriptedHarnessClient, harness_client))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, process_manager),
+        server_client=cast(httpx.AsyncClient, server),
+    )
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        response = await client.post(
+            "/v1/sessions/session-1/events",
+            json={
+                "type": "tool_result",
+                "call_id": "call-1",
+                "output": "failed",
+                "driver_claim": _control_claim(),
+            },
+        )
+
+    assert response.status_code == 500
+    assert [path.rsplit("/", 1)[-1] for path, _kwargs in server.posts] == [
+        "validate",
+        "validate",
+        "complete",
+    ]
+    assert server.posts[-1][1]["params"] == {"succeeded": False}
+
+
+@pytest.mark.asyncio
+async def test_driver_control_heartbeat_loss_retains_uncertain_claim() -> None:
+    """Fence loss during a control side effect cancels work without completion."""
+    server = _ValidationClient(200, 200, 409)
+    harness_client = _ControlHarnessClient()
+    harness_client.release = asyncio.Event()
+    process_manager = _FakeProcessManager(cast(_ScriptedHarnessClient, harness_client))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, process_manager),
+        server_client=cast(httpx.AsyncClient, server),
+    )
+    app.state.driver_heartbeat_interval_seconds = 0.01
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        request_task = asyncio.create_task(
+            client.post(
+                "/v1/sessions/session-1/events",
+                json={
+                    "type": "tool_result",
+                    "call_id": "call-1",
+                    "output": "blocked",
+                    "driver_claim": _control_claim(),
+                },
+            )
+        )
+        await asyncio.wait_for(harness_client.entered.wait(), timeout=1.0)
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+
+    assert [path.rsplit("/", 1)[-1] for path, _kwargs in server.posts] == [
+        "validate",
+        "validate",
+        "heartbeat",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_driver_control_transport_uncertainty_retains_claim() -> None:
+    """An ambiguous harness transport failure cannot make the effect retryable."""
+    server = _ValidationClient(200, 200)
+    process_manager = _FakeProcessManager(
+        cast(_ScriptedHarnessClient, _UncertainControlHarnessClient())
+    )
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, process_manager),
+        server_client=cast(httpx.AsyncClient, server),
+    )
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        response = await client.post(
+            "/v1/sessions/session-1/events",
+            json={
+                "type": "tool_result",
+                "call_id": "call-1",
+                "output": "unknown",
+                "driver_claim": _control_claim(),
+            },
+        )
+
+    assert response.status_code == 502
+    assert [path.rsplit("/", 1)[-1] for path, _kwargs in server.posts] == [
+        "validate",
+        "validate",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_driver_control_retries_duplicate_terminal_callback() -> None:
+    """An ambiguous terminal callback retries while its heartbeat remains active."""
+    server = _ValidationClient(200, 200, 503, *([200] * 20))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, object()),
+        server_client=cast(httpx.AsyncClient, server),
+    )
+    app.state.driver_completion_retry_interval_seconds = 0.03
+    app.state.driver_heartbeat_interval_seconds = 0.005
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        response = await client.post(
+            "/v1/sessions/session-1/events",
+            json={"type": "interrupt", "driver_claim": _control_claim()},
+        )
+
+    assert response.status_code == 204
+    actions = [path.rsplit("/", 1)[-1] for path, _kwargs in server.posts]
+    assert actions[:3] == ["validate", "validate", "complete"]
+    assert actions.count("complete") == 2
+    assert "heartbeat" in actions[3:-1]
+    completion_kwargs = [kwargs for path, kwargs in server.posts if path.endswith("/complete")]
+    assert completion_kwargs[0] == completion_kwargs[1]
+
+
+@pytest.mark.asyncio
+async def test_driver_control_stale_takeover_stops_terminal_retry() -> None:
+    """A definitive stale completion is fenced instead of retried forever."""
+    server = _ValidationClient(200, 200, 409)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, object()),
+        server_client=cast(httpx.AsyncClient, server),
+    )
+    app.state.driver_completion_retry_interval_seconds = 0.01
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        response = await client.post(
+            "/v1/sessions/session-1/events",
+            json={"type": "interrupt", "driver_claim": _control_claim()},
+        )
+
+    assert response.status_code == 409
+    assert [path.rsplit("/", 1)[-1] for path, _kwargs in server.posts] == [
+        "validate",
+        "validate",
+        "complete",
     ]
 
 

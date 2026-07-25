@@ -39,6 +39,9 @@ class _CaptureClient:
             headers: dict[str, str] = {}
             text = ""
 
+            def raise_for_status(self) -> None:
+                """Match the httpx response contract used by the forwarder."""
+
         return _Resp()
 
     async def get(self, *_: Any, **__: Any) -> Any:
