@@ -86,6 +86,10 @@ function integer(value: string | undefined, fallback: number, name: string, mini
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): TeamsConfig {
+  const configuredGrantLifetime = env.TEAMS_GRANT_MAXIMUM_LIFETIME_DAYS?.trim();
+  if (configuredGrantLifetime && configuredGrantLifetime !== "30") {
+    throw new Error("TEAMS_GRANT_MAXIMUM_LIFETIME_DAYS must match the server lifetime of 30 days");
+  }
   const allowlist = required(env, "TEAMS_ALLOWED_TENANT_IDS")
     .split(",")
     .map((value) => uuid(value.trim(), "TEAMS_ALLOWED_TENANT_IDS"));
@@ -106,13 +110,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): TeamsConfig {
     omnigentDeviceClientSecret: env.OMNIGENT_DEVICE_CLIENT_SECRET?.trim() || undefined,
     grantDatabase: resolve(required(env, "TEAMS_GRANT_DATABASE")),
     tokenEncryptionKey: encryptionKey(env),
-    grantMaximumLifetimeDays: integer(
-      env.TEAMS_GRANT_MAXIMUM_LIFETIME_DAYS,
-      30,
-      "TEAMS_GRANT_MAXIMUM_LIFETIME_DAYS",
-      1,
-      365,
-    ),
+    grantMaximumLifetimeDays: 30,
     dedupeDatabase: resolve(required(env, "TEAMS_DEDUPE_DATABASE")),
     dedupeRetentionDays: integer(env.TEAMS_DEDUPE_RETENTION_DAYS, 7, "TEAMS_DEDUPE_RETENTION_DAYS", 1, 365),
     dedupeMaxRecords: integer(env.TEAMS_DEDUPE_MAX_RECORDS, 100_000, "TEAMS_DEDUPE_MAX_RECORDS", 1, 10_000_000),

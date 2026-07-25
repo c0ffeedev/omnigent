@@ -4,7 +4,7 @@ const DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code";
 const INTERACTIVE_SCOPE = "interactive";
 
 export class OmnigentOAuthError extends Error {
-  constructor(message: string, readonly outcomeMayBeUncertain = false) {
+  constructor(message: string, readonly outcomeMayBeUncertain = true) {
     super(message);
     this.name = "OmnigentOAuthError";
   }
@@ -98,7 +98,7 @@ export class OmnigentDeviceClient {
       throw new OmnigentOAuthError("Omnigent OAuth request failed", true);
     }
     if (response.status >= 300 && response.status < 400) {
-      throw new OmnigentOAuthError("Omnigent OAuth redirects are not accepted");
+      throw new OmnigentOAuthError("Omnigent OAuth redirects are not accepted", true);
     }
     return response;
   }
@@ -194,7 +194,11 @@ export class OmnigentDeviceClient {
         !definitivelyRejected,
       );
     }
-    return tokens(await response.json());
+    try {
+      return tokens(await response.json());
+    } catch {
+      throw new OmnigentOAuthError("Omnigent refresh response is malformed", true);
+    }
   }
 
   async revoke(refreshToken: string): Promise<boolean> {

@@ -48,6 +48,8 @@ describe("loadConfig", () => {
     ["missing SSO connection", { TEAMS_SSO_CONNECTION_NAME: "" }],
     ["missing device client ID", { OMNIGENT_DEVICE_CLIENT_ID: "" }],
     ["invalid encryption key", { TEAMS_TOKEN_ENCRYPTION_KEY: "too-short" }],
+    ["grant lifetime shorter than the server contract", { TEAMS_GRANT_MAXIMUM_LIFETIME_DAYS: "1" }],
+    ["grant lifetime longer than the server contract", { TEAMS_GRANT_MAXIMUM_LIFETIME_DAYS: "365" }],
     ["non-TLS Omnigent origin", { OMNIGENT_ORIGIN: "http://omnigent.example" }],
     ["Omnigent origin with credentials", { OMNIGENT_ORIGIN: "https://user:pass@omnigent.example" }],
     ["Omnigent origin with a path", { OMNIGENT_ORIGIN: "https://omnigent.example/api" }],

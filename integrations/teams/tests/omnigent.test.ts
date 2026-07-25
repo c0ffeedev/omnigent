@@ -102,6 +102,19 @@ describe("OmnigentDeviceClient", () => {
     expect(String(error)).not.toContain("refresh-canary");
   });
 
+  it.each([
+    ["redirect", new Response(null, { headers: { location: "https://evil.example" }, status: 302 })],
+    ["malformed success", json({ access_token: "not-a-complete-token-response" }, 200)],
+  ])("treats a %s after refresh dispatch as uncertain", async (_name, response) => {
+    const error = await client(vi.fn(async () => response) as unknown as typeof fetch)
+      .refresh("refresh-canary")
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(OmnigentOAuthError);
+    expect((error as OmnigentOAuthError).outcomeMayBeUncertain).toBe(true);
+    expect(String(error)).not.toContain("refresh-canary");
+  });
+
   it("treats server errors as uncertain but a signed invalid_grant response as definitive", async () => {
     const uncertain = await client(vi.fn(async () => json({ error: "server_error" }, 500)) as unknown as typeof fetch)
       .refresh("refresh-canary")

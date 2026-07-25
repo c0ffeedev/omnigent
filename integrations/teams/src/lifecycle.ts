@@ -31,12 +31,18 @@ export class GrantLifecycle {
 
   async connect(principal: EntraPrincipal): Promise<ConnectResult> {
     const key = this.key(principal);
-    const pending = await this.client.startLogin();
+    const connectGeneration = this.store.beginConnect(key);
+    const pending = await this.client.startLogin().catch((error: unknown) => {
+      this.store.cancelConnect(key, connectGeneration);
+      throw error;
+    });
     const code = pending.userCode ? ` and enter code ${pending.userCode}` : "";
     return {
       completion: pending.poll().then((tokens) => {
-        this.store.link(key, tokens);
-        return "Omnigent account connected. You can now use `status` or `logout`.";
+        const connected = this.store.completeConnect(key, connectGeneration, tokens);
+        return connected
+          ? "Omnigent account connected. You can now use `status` or `logout`."
+          : "This Omnigent connection was cancelled or replaced. Send `connect` to retry.";
       }).catch(() => {
         return "Omnigent account connection failed. Send `connect` to retry.";
       }),

@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { GrantStore, type GrantTokens } from "../src/grants.js";
 import type { EntraPrincipal } from "../src/identity.js";
 import { GrantLifecycle } from "../src/lifecycle.js";
-import type { OmnigentDeviceClient } from "../src/omnigent.js";
+import { OmnigentOAuthError, type OmnigentDeviceClient } from "../src/omnigent.js";
 
 const appId = "11111111-1111-4111-8111-111111111111";
 const omnigentOrigin = "https://omnigent.example";
@@ -23,18 +23,27 @@ const tokens: GrantTokens = {
 };
 let directory: string | undefined;
 
-async function fixture(client: Partial<OmnigentDeviceClient>): Promise<{ lifecycle: GrantLifecycle; store: GrantStore }> {
+function openStore(path: string): GrantStore {
+  return new GrantStore(path, Buffer.alloc(32, 4), { maximumLifetimeDays: 30 });
+}
+
+async function fixture(client: Partial<OmnigentDeviceClient>): Promise<{
+  lifecycle: GrantLifecycle;
+  path: string;
+  store: GrantStore;
+}> {
   directory = await mkdtemp(join(tmpdir(), "omnigent-teams-lifecycle-"));
-  const store = new GrantStore(join(directory, "grants.sqlite3"), Buffer.alloc(32, 4), {
-    maximumLifetimeDays: 30,
-  });
+  const path = join(directory, "grants.sqlite3");
+  const store = openStore(path);
   return {
     lifecycle: new GrantLifecycle(appId, omnigentOrigin, store, client as OmnigentDeviceClient),
+    path,
     store,
   };
 }
 
 afterEach(async () => {
+  vi.useRealTimers();
   if (directory) await rm(directory, { force: true, recursive: true });
   directory = undefined;
 });
@@ -54,6 +63,84 @@ describe("GrantLifecycle", () => {
     await expect(connected.completion).resolves.toContain("connected");
     expect(test.lifecycle.status(principal)).toContain("connected");
     expect(test.lifecycle.status({ ...principal, objectId: "44444444-4444-4444-8444-444444444444" })).toContain("No Omnigent");
+    test.store.close();
+  });
+
+  it("does not restore authority when another worker logs out before device approval", async () => {
+    let finish!: (value: GrantTokens) => void;
+    const test = await fixture({
+      startLogin: vi.fn(async () => ({
+        poll: () => new Promise<GrantTokens>((resolve) => { finish = resolve; }),
+        userCode: "ABCD",
+        verificationUrl: "https://omnigent.example/activate",
+      })),
+    });
+
+    const pending = await test.lifecycle.connect(principal);
+    const otherStore = openStore(test.path);
+    const otherWorker = new GrantLifecycle(appId, omnigentOrigin, otherStore, {} as OmnigentDeviceClient);
+    expect(otherWorker.logout(principal)).toContain("disconnected locally");
+    finish(tokens);
+    await expect(pending.completion).resolves.toContain("cancelled or replaced");
+    expect(otherStore.active(otherWorker.key(principal))).toBeUndefined();
+    expect(otherStore.pendingRevocations()).toMatchObject([{ refreshToken: tokens.refreshToken }]);
+    otherStore.close();
+    test.store.close();
+  });
+
+  it("keeps the newer worker's connection when approvals complete out of order", async () => {
+    let finishOlder!: (value: GrantTokens) => void;
+    let finishNewer!: (value: GrantTokens) => void;
+    const older = await fixture({
+      startLogin: vi.fn(async () => ({
+        poll: () => new Promise<GrantTokens>((resolve) => { finishOlder = resolve; }),
+        userCode: "OLD1",
+        verificationUrl: "https://omnigent.example/activate",
+      })),
+    });
+    const newerStore = openStore(older.path);
+    const newer = new GrantLifecycle(appId, omnigentOrigin, newerStore, {
+      startLogin: vi.fn(async () => ({
+        poll: () => new Promise<GrantTokens>((resolve) => { finishNewer = resolve; }),
+        userCode: "NEW2",
+        verificationUrl: "https://omnigent.example/activate",
+      })),
+    } as unknown as OmnigentDeviceClient);
+
+    const olderPending = await older.lifecycle.connect(principal);
+    const newerPending = await newer.connect(principal);
+    const replacement = { ...tokens, grantId: "grant-2", refreshToken: "refresh-2" };
+    finishNewer(replacement);
+    await expect(newerPending.completion).resolves.toContain("connected");
+    finishOlder(tokens);
+    await expect(olderPending.completion).resolves.toContain("cancelled or replaced");
+
+    expect(newerStore.active(newer.key(principal))).toMatchObject({ grantId: "grant-2" });
+    expect(newerStore.pendingRevocations().map(({ refreshToken }) => refreshToken))
+      .toContain(tokens.refreshToken);
+    newerStore.close();
+    older.store.close();
+  });
+
+  it("does not restore authority when another worker uninstalls before device approval", async () => {
+    let finish!: (value: GrantTokens) => void;
+    const test = await fixture({
+      startLogin: vi.fn(async () => ({
+        poll: () => new Promise<GrantTokens>((resolve) => { finish = resolve; }),
+        userCode: "ABCD",
+        verificationUrl: "https://omnigent.example/activate",
+      })),
+    });
+
+    const pending = await test.lifecycle.connect(principal);
+    const otherStore = openStore(test.path);
+    const otherWorker = new GrantLifecycle(appId, omnigentOrigin, otherStore, {} as OmnigentDeviceClient);
+    otherWorker.uninstall(principal);
+    finish(tokens);
+    await expect(pending.completion).resolves.toContain("cancelled or replaced");
+    expect(otherStore.active(otherWorker.key(principal))).toBeUndefined();
+    expect(otherStore.pendingRevocations()).toMatchObject([{ refreshToken: tokens.refreshToken }]);
+    otherStore.close();
     test.store.close();
   });
 
@@ -82,19 +169,47 @@ describe("GrantLifecycle", () => {
     test.store.close();
   });
 
-  it("uses generation fencing so a second worker consumes the first worker's rotation", async () => {
+  it("waits beyond six seconds so a second worker consumes the first worker's rotation", async () => {
+    vi.useFakeTimers();
     let finish!: (value: GrantTokens) => void;
     const refresh = vi.fn(() => new Promise<GrantTokens>((resolve) => { finish = resolve; }));
     const test = await fixture({ refresh });
     test.store.link(test.lifecycle.key(principal), tokens);
+    const otherStore = openStore(test.path);
+    const otherWorker = new GrantLifecycle(appId, omnigentOrigin, otherStore, {
+      refresh,
+    } as unknown as OmnigentDeviceClient);
 
     const first = test.lifecycle.refreshAfterUnauthorized(principal, 1);
-    const second = test.lifecycle.refreshAfterUnauthorized(principal, 1);
+    const second = otherWorker.refreshAfterUnauthorized(principal, 1);
+    let secondSettled = false;
+    void second.then(
+      () => { secondSettled = true; },
+      () => { secondSettled = true; },
+    );
+    await vi.advanceTimersByTimeAsync(7_000);
+    expect(secondSettled).toBe(false);
     finish({ ...tokens, accessToken: "access-2", grantId: "grant-2", refreshToken: "refresh-2" });
+    await vi.advanceTimersByTimeAsync(100);
     const [left, right] = await Promise.all([first, second]);
     expect(left.generation).toBe(2);
     expect(right.generation).toBe(2);
     expect(refresh).toHaveBeenCalledTimes(1);
+    otherStore.close();
+    test.store.close();
+  });
+
+  it("fails closed and retains cleanup evidence after an uncertain refresh response", async () => {
+    const test = await fixture({
+      refresh: vi.fn(async () => {
+        throw new OmnigentOAuthError("malformed refresh response", true);
+      }),
+    });
+    test.store.link(test.lifecycle.key(principal), tokens);
+
+    await expect(test.lifecycle.refreshAfterUnauthorized(principal, 1)).rejects.toThrow("malformed");
+    expect(test.store.active(test.lifecycle.key(principal))).toBeUndefined();
+    expect(test.store.pendingRevocations()).toMatchObject([{ refreshToken: tokens.refreshToken }]);
     test.store.close();
   });
 

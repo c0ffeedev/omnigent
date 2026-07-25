@@ -51,6 +51,13 @@ interface GrantRow {
   lease_expires_at: number;
 }
 
+interface PreparedGrant {
+  access: string;
+  accessExpiresAt: number;
+  grantExpiresAt: number;
+  refresh: string;
+}
+
 const BUSY_TIMEOUT_MILLISECONDS = 5_000;
 const DEFAULT_REFRESH_LEASE_MILLISECONDS = 30_000;
 const EXPECTED_DISCONNECT_REASONS = new Set(["logout", "relinked"]);
@@ -102,8 +109,8 @@ export class GrantStore {
     options: { maximumLifetimeDays: number; refreshLeaseMilliseconds?: number },
   ) {
     if (encryptionKey.length !== 32) throw new Error("grant encryption key must be 32 bytes");
-    if (!Number.isSafeInteger(options.maximumLifetimeDays) || options.maximumLifetimeDays < 1) {
-      throw new Error("maximumLifetimeDays must be a positive integer");
+    if (options.maximumLifetimeDays !== 30) {
+      throw new Error("maximumLifetimeDays must match the Omnigent server lifetime of 30 days");
     }
     this.maximumLifetimeMilliseconds = options.maximumLifetimeDays * 24 * 60 * 60 * 1000;
     this.refreshLeaseMilliseconds = options.refreshLeaseMilliseconds ?? DEFAULT_REFRESH_LEASE_MILLISECONDS;
@@ -138,6 +145,16 @@ export class GrantStore {
         ON principal_grants(bot_app_id, tenant_id, object_id, omnigent_origin) WHERE state = 'active';
       CREATE INDEX IF NOT EXISTS principal_grants_revocation
         ON principal_grants(state, next_revocation_at);
+      CREATE TABLE IF NOT EXISTS principal_connect_attempts (
+        bot_app_id TEXT NOT NULL,
+        tenant_id TEXT NOT NULL,
+        object_id TEXT NOT NULL,
+        omnigent_origin TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'cancelled', 'completed')),
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (bot_app_id, tenant_id, object_id, omnigent_origin)
+      );
     `);
   }
 
@@ -165,77 +182,190 @@ export class GrantStore {
     };
   }
 
-  link(key: PrincipalKey, tokens: GrantTokens, now = Date.now()): ActiveGrant {
+  private prepareGrant(key: PrincipalKey, tokens: GrantTokens, now: number): PreparedGrant {
     validateTokens(tokens);
     const associatedData = aad(key, tokens.grantId);
-    const access = encrypt(this.encryptionKey, tokens.accessToken, associatedData);
-    const refresh = encrypt(this.encryptionKey, tokens.refreshToken, associatedData);
-    const expiresAt = now + tokens.expiresIn * 1000;
-    const grantExpiresAt = now + this.maximumLifetimeMilliseconds;
-    const transaction = this.database.transaction(() => {
-      const previous = this.activeRow(key);
-      if (previous) {
-        this.database.prepare(`
-          UPDATE principal_grants
-          SET state = 'revocation_pending', disable_reason = 'relinked', lease_owner = NULL,
-            lease_expires_at = 0, updated_at = @now
-          WHERE id = @id AND state = 'active'
-        `).run({ id: previous.id, now });
-      }
-      const last = this.database.prepare(`
-        SELECT MAX(generation) AS generation FROM principal_grants
+    return {
+      access: encrypt(this.encryptionKey, tokens.accessToken, associatedData),
+      accessExpiresAt: now + tokens.expiresIn * 1000,
+      grantExpiresAt: now + this.maximumLifetimeMilliseconds,
+      refresh: encrypt(this.encryptionKey, tokens.refreshToken, associatedData),
+    };
+  }
+
+  private insertActiveGrant(
+    key: PrincipalKey,
+    tokens: GrantTokens,
+    prepared: PreparedGrant,
+    now: number,
+  ): GrantRow {
+    const previous = this.activeRow(key);
+    if (previous) {
+      this.database.prepare(`
+        UPDATE principal_grants
+        SET state = 'revocation_pending', disable_reason = 'relinked', lease_owner = NULL,
+          lease_expires_at = 0, updated_at = @now
+        WHERE id = @id AND state = 'active'
+      `).run({ id: previous.id, now });
+    }
+    const last = this.database.prepare(`
+      SELECT MAX(generation) AS generation FROM principal_grants
+      WHERE bot_app_id = @botAppId AND tenant_id = @tenantId AND object_id = @objectId
+        AND omnigent_origin = @omnigentOrigin
+    `).get(key) as { generation: number | null };
+    const generation = (last.generation ?? 0) + 1;
+    this.database.prepare(`
+      INSERT INTO principal_grants (
+        bot_app_id, tenant_id, object_id, omnigent_origin, generation, grant_id,
+        access_ciphertext, refresh_ciphertext, access_expires_at, grant_expires_at,
+        state, created_at, updated_at
+      ) VALUES (
+        @botAppId, @tenantId, @objectId, @omnigentOrigin, @generation, @grantId,
+        @access, @refresh, @accessExpiresAt, @grantExpiresAt, 'active', @now, @now
+      )
+    `).run({ ...key, ...prepared, generation, grantId: tokens.grantId, now });
+    return this.activeRow(key)!;
+  }
+
+  private insertRevocationTombstone(
+    key: PrincipalKey,
+    tokens: GrantTokens,
+    prepared: PreparedGrant,
+    reason: string,
+    now: number,
+  ): void {
+    const last = this.database.prepare(`
+      SELECT MAX(generation) AS generation FROM principal_grants
+      WHERE bot_app_id = @botAppId AND tenant_id = @tenantId AND object_id = @objectId
+        AND omnigent_origin = @omnigentOrigin
+    `).get(key) as { generation: number | null };
+    this.database.prepare(`
+      INSERT INTO principal_grants (
+        bot_app_id, tenant_id, object_id, omnigent_origin, generation, grant_id,
+        access_ciphertext, refresh_ciphertext, access_expires_at, grant_expires_at,
+        state, disable_reason, created_at, updated_at
+      ) VALUES (
+        @botAppId, @tenantId, @objectId, @omnigentOrigin, @generation, @grantId,
+        @access, @refresh, @accessExpiresAt, @grantExpiresAt,
+        'revocation_pending', @reason, @now, @now
+      )
+    `).run({
+      ...key,
+      ...prepared,
+      generation: (last.generation ?? 0) + 1,
+      grantId: tokens.grantId,
+      now,
+      reason,
+    });
+  }
+
+  beginConnect(key: PrincipalKey, now = Date.now()): number {
+    return this.database.transaction(() => {
+      const current = this.database.prepare(`
+        SELECT generation FROM principal_connect_attempts
         WHERE bot_app_id = @botAppId AND tenant_id = @tenantId AND object_id = @objectId
           AND omnigent_origin = @omnigentOrigin
-      `).get(key) as { generation: number | null };
-      const generation = (last.generation ?? 0) + 1;
+      `).get(key) as { generation: number } | undefined;
+      const generation = (current?.generation ?? 0) + 1;
       this.database.prepare(`
-        INSERT INTO principal_grants (
-          bot_app_id, tenant_id, object_id, omnigent_origin, generation, grant_id,
-          access_ciphertext, refresh_ciphertext, access_expires_at, grant_expires_at,
-          state, created_at, updated_at
+        INSERT INTO principal_connect_attempts (
+          bot_app_id, tenant_id, object_id, omnigent_origin, generation, state, updated_at
         ) VALUES (
-          @botAppId, @tenantId, @objectId, @omnigentOrigin, @generation, @grantId,
-          @access, @refresh, @expiresAt, @grantExpiresAt, 'active', @now, @now
+          @botAppId, @tenantId, @objectId, @omnigentOrigin, @generation, 'pending', @now
         )
-      `).run({ ...key, access, expiresAt, generation, grantExpiresAt, grantId: tokens.grantId, now, refresh });
-      return this.activeRow(key)!;
+        ON CONFLICT (bot_app_id, tenant_id, object_id, omnigent_origin) DO UPDATE SET
+          generation = excluded.generation, state = 'pending', updated_at = excluded.updated_at
+      `).run({ ...key, generation, now });
+      return generation;
+    }).immediate();
+  }
+
+  cancelConnect(key: PrincipalKey, generation: number, now = Date.now()): boolean {
+    const result = this.database.prepare(`
+      UPDATE principal_connect_attempts SET state = 'cancelled', updated_at = @now
+      WHERE bot_app_id = @botAppId AND tenant_id = @tenantId AND object_id = @objectId
+        AND omnigent_origin = @omnigentOrigin AND generation = @generation AND state = 'pending'
+    `).run({ ...key, generation, now });
+    return result.changes === 1;
+  }
+
+  completeConnect(
+    key: PrincipalKey,
+    connectGeneration: number,
+    tokens: GrantTokens,
+    now = Date.now(),
+  ): ActiveGrant | undefined {
+    const prepared = this.prepareGrant(key, tokens, now);
+    const row = this.database.transaction(() => {
+      const claimed = this.database.prepare(`
+        UPDATE principal_connect_attempts SET state = 'completed', updated_at = @now
+        WHERE bot_app_id = @botAppId AND tenant_id = @tenantId AND object_id = @objectId
+          AND omnigent_origin = @omnigentOrigin
+          AND generation = @connectGeneration AND state = 'pending'
+      `).run({ ...key, connectGeneration, now });
+      if (claimed.changes !== 1) {
+        this.insertRevocationTombstone(key, tokens, prepared, "stale_connect_completion", now);
+        return undefined;
+      }
+      return this.insertActiveGrant(key, tokens, prepared, now);
+    }).immediate();
+    return row ? this.toGrant(key, row) : undefined;
+  }
+
+  link(key: PrincipalKey, tokens: GrantTokens, now = Date.now()): ActiveGrant {
+    const prepared = this.prepareGrant(key, tokens, now);
+    const transaction = this.database.transaction(() => {
+      this.database.prepare(`
+        UPDATE principal_connect_attempts SET state = 'cancelled', updated_at = @now
+        WHERE bot_app_id = @botAppId AND tenant_id = @tenantId AND object_id = @objectId
+          AND omnigent_origin = @omnigentOrigin AND state = 'pending'
+      `).run({ ...key, now });
+      return this.insertActiveGrant(key, tokens, prepared, now);
     });
     return this.toGrant(key, transaction.immediate());
   }
 
   status(key: PrincipalKey, now = Date.now()): GrantStatus {
-    const active = this.activeRow(key);
-    if (active) {
-      if (active.grant_expires_at <= now) {
-        this.queueRevocation(key, "maximum_lifetime_exceeded", now);
-        return { reason: "maximum_lifetime_exceeded", state: "relink_required" };
+    return this.database.transaction(() => {
+      const active = this.activeRow(key);
+      if (active) {
+        if (active.grant_expires_at <= now) {
+          this.database.prepare(`
+            UPDATE principal_grants
+            SET state = 'revocation_pending', disable_reason = 'maximum_lifetime_exceeded',
+              lease_owner = NULL, lease_expires_at = 0, updated_at = @now
+            WHERE id = @id AND generation = @generation AND state = 'active'
+          `).run({ generation: active.generation, id: active.id, now });
+          return { reason: "maximum_lifetime_exceeded", state: "relink_required" };
+        }
+        return {
+          accessExpiresAt: active.access_expires_at,
+          generation: active.generation,
+          grantExpiresAt: active.grant_expires_at,
+          grantId: active.grant_id,
+          state: "connected",
+        };
       }
-      return {
-        accessExpiresAt: active.access_expires_at,
-        generation: active.generation,
-        grantExpiresAt: active.grant_expires_at,
-        grantId: active.grant_id,
-        state: "connected",
-      };
-    }
-    const disabled = this.database.prepare(`
-      SELECT disable_reason FROM principal_grants
-      WHERE bot_app_id = @botAppId AND tenant_id = @tenantId AND object_id = @objectId
-        AND omnigent_origin = @omnigentOrigin
-        AND state IN ('disabled', 'revocation_pending')
-      ORDER BY generation DESC LIMIT 1
-    `).get(key) as { disable_reason: string | null } | undefined;
-    if (disabled?.disable_reason && EXPECTED_DISCONNECT_REASONS.has(disabled.disable_reason)) {
-      return { state: "not_connected" };
-    }
-    return disabled
-      ? { reason: disabled.disable_reason ?? "grant_disabled", state: "relink_required" }
-      : { state: "not_connected" };
+      const disabled = this.database.prepare(`
+        SELECT disable_reason FROM principal_grants
+        WHERE bot_app_id = @botAppId AND tenant_id = @tenantId AND object_id = @objectId
+          AND omnigent_origin = @omnigentOrigin
+          AND state IN ('disabled', 'revocation_pending')
+        ORDER BY generation DESC LIMIT 1
+      `).get(key) as { disable_reason: string | null } | undefined;
+      if (disabled?.disable_reason && EXPECTED_DISCONNECT_REASONS.has(disabled.disable_reason)) {
+        return { state: "not_connected" };
+      }
+      return disabled
+        ? { reason: disabled.disable_reason ?? "grant_disabled", state: "relink_required" }
+        : { state: "not_connected" };
+    }).immediate() as GrantStatus;
   }
 
   active(key: PrincipalKey, now = Date.now()): ActiveGrant | undefined {
     if (this.status(key, now).state !== "connected") return undefined;
-    return this.toGrant(key, this.activeRow(key)!);
+    const row = this.activeRow(key);
+    return row ? this.toGrant(key, row) : undefined;
   }
 
   acquireRefresh(key: PrincipalKey, owner: string, expectedGeneration: number, now = Date.now()): RefreshClaim {
@@ -368,7 +498,14 @@ export class GrantStore {
   }
 
   logout(key: PrincipalKey, now = Date.now()): boolean {
-    return this.queueRevocation(key, "logout", now);
+    return this.database.transaction(() => {
+      const cancelled = this.database.prepare(`
+        UPDATE principal_connect_attempts SET state = 'cancelled', updated_at = @now
+        WHERE bot_app_id = @botAppId AND tenant_id = @tenantId AND object_id = @objectId
+          AND omnigent_origin = @omnigentOrigin AND state = 'pending'
+      `).run({ ...key, now });
+      return this.queueRevocation(key, "logout", now) || cancelled.changes === 1;
+    }).immediate();
   }
 
   private queueRevocation(key: PrincipalKey, reason: string, now: number): boolean {

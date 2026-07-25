@@ -52,5 +52,5 @@ The template is `appPackage/manifest.json`; required 192x192 color and 32x32 tra
 
 - Health/public diagnostic endpoints, public deployment, sessions, Graph reads, and proactive delivery are intentionally outside this slice.
 - The dedupe database contains opaque routing IDs and bounded response metadata. The separate grant database contains encrypted access/refresh tokens plus opaque principal and grant metadata; the encryption key remains external.
-- `logout`, uninstall, relink, maximum-lifetime expiry, refresh uncertainty, and refresh CAS loss immediately remove runtime authority and queue remote revocation. Failed cleanup uses bounded exponential backoff; encrypted tombstones remain only until revocation succeeds or the configured maximum lifetime elapses.
+- `logout`, uninstall, relink, maximum-lifetime expiry, refresh uncertainty, and refresh CAS loss immediately remove runtime authority and queue remote revocation. Failed cleanup uses bounded exponential backoff; encrypted tombstones remain only until revocation succeeds or the server's fixed 30-day maximum grant lifetime elapses.
 - Stop with `SIGINT` or `SIGTERM` so the SDK server and database close cleanly.
