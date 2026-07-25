@@ -23,7 +23,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
-import { PresenceAvatars } from "@/components/PresenceAvatars";
+import { CoordinationAuditHistoryDialog } from "@/components/coordination/CoordinationAuditHistory";
+import { CoordinationStatusPopover } from "@/components/coordination/CoordinationStatusPopover";
 import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
@@ -260,10 +261,9 @@ export function ChatHeader({
       </div>
 
       <div className="flex items-center gap-1">
-        {/* Other users currently viewing this session (presence).
-            Self-contained — reads the chat store directly, renders
-            nothing when the user is alone. */}
-        {conversationId && <PresenceAvatars />}
+        {/* Shared presence, driver ownership, and transport freshness. */}
+        {conversationId && <CoordinationStatusPopover sessionId={conversationId} />}
+        {conversationId && <CoordinationAuditHistoryDialog sessionId={conversationId} />}
         {/* Desktop (md+) action buttons. On mobile these collapse into
             the three-dot "Session actions" menu below, which renders
             the same set off the same gating booleans. Clone has no

@@ -4,7 +4,7 @@
 // The page composes several live data sources, so we mock at their seams:
 //  - `useConversations` (the session list + its paging drain),
 //  - `useCommentInbox` (the comment side of the inbox),
-//  - `getSession` / `approve` (per-session snapshot fetch + the verdict POST).
+//  - `getSession` / coordinated events (snapshot fetch + the verdict POST).
 // The pure assembly helper `collectInboxItems` and the display helpers are
 // left REAL, so raw `response.elicitation_request` event dicts flow through
 // the same parse path the app uses. `ApprovalCard` is stubbed to a minimal
@@ -19,12 +19,13 @@ import { InboxPage } from "./InboxPage";
 import type { Conversation } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
+import * as coordinatedEvents from "@/lib/coordinatedEvents";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type { CommentInbox } from "@/hooks/useCommentInbox";
 
 // Minimal ApprovalCard stub: renders the message and an Accept button that
 // forwards to the page's submit handler. The real card's form/preview UX is
-// out of scope here — we only need to exercise `makeSubmit` → `approve`.
+// out of scope here — we only need to exercise the page's submit callback.
 vi.mock("@/components/blocks/ApprovalCard", () => ({
   ApprovalCard: ({
     elicitationId,
@@ -51,7 +52,11 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   useConversations: vi.fn(),
 }));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));
-vi.mock("@/lib/sessionsApi", () => ({ getSession: vi.fn(), approve: vi.fn() }));
+vi.mock("@/lib/sessionsApi", () => ({ getSession: vi.fn() }));
+vi.mock("@/lib/coordinatedEvents", () => ({
+  nextDriverSourceId: vi.fn(() => "web:test:approval:1"),
+  postCoordinatedEvent: vi.fn().mockResolvedValue({ queued: false }),
+}));
 
 function conversation(overrides: Partial<Conversation> = {}): Conversation {
   return {
@@ -119,9 +124,9 @@ beforeEach(() => {
   vi.mocked(sessionsApi.getSession).mockResolvedValue({
     pendingElicitations: [],
   } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
-  vi.mocked(sessionsApi.approve).mockResolvedValue(
-    {} as Awaited<ReturnType<typeof sessionsApi.approve>>,
-  );
+  vi.mocked(coordinatedEvents.postCoordinatedEvent).mockResolvedValue({
+    queued: false,
+  });
 });
 
 afterEach(() => {
@@ -218,9 +223,9 @@ describe("InboxPage approval items", () => {
     expect(screen.queryByTestId("approval-card")).not.toBeInTheDocument();
   });
 
-  it("submits an approve verdict via approve() and flips the card to responded", async () => {
+  it("submits an approve verdict as a coordinated event and flips the card to responded", async () => {
     // WHY: clicking Accept optimistically marks responded then POSTs the
-    // verdict through `approve()` to the resolve-target session.
+    // verdict through the coordinated event path to the target session.
     const row = conversation({ id: "sess_1" });
     vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
     vi.mocked(sessionsApi.getSession).mockResolvedValue({
@@ -231,14 +236,19 @@ describe("InboxPage approval items", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
 
     await waitFor(() =>
-      expect(sessionsApi.approve).toHaveBeenCalledWith("sess_1", "eli_1", { action: "accept" }),
+      expect(coordinatedEvents.postCoordinatedEvent).toHaveBeenCalledWith(
+        expect.anything(),
+        "sess_1",
+        { type: "approval", data: { elicitation_id: "eli_1", action: "accept" } },
+        "web:test:approval:1",
+      ),
     );
     await waitFor(() =>
       expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded"),
     );
   });
 
-  it("rolls back the optimistic verdict when approve() rejects", async () => {
+  it("rolls back the optimistic verdict when the coordinated event rejects", async () => {
     // WHY: a failed resolve POST deletes the responded entry so the card
     // returns to pending and the user can retry.
     const row = conversation({ id: "sess_1" });
@@ -246,7 +256,7 @@ describe("InboxPage approval items", () => {
     vi.mocked(sessionsApi.getSession).mockResolvedValue({
       pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
     } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
-    vi.mocked(sessionsApi.approve).mockRejectedValue(new Error("nope"));
+    vi.mocked(coordinatedEvents.postCoordinatedEvent).mockRejectedValueOnce(new Error("nope"));
     renderPage();
 
     fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
@@ -307,7 +317,7 @@ describe("InboxPage approval items", () => {
   });
 
   it("routes the verdict to the child session when the prompt is mirrored", async () => {
-    // WHY: a mirrored child prompt carries target_session_id; the resolve POST
+    // WHY: a mirrored child prompt carries target_session_id; the event POST
     // must target that session, not the row it surfaced under.
     const row = conversation({ id: "parent" });
     vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
@@ -320,7 +330,12 @@ describe("InboxPage approval items", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
     await waitFor(() =>
-      expect(sessionsApi.approve).toHaveBeenCalledWith("child", "eli_child", { action: "accept" }),
+      expect(coordinatedEvents.postCoordinatedEvent).toHaveBeenCalledWith(
+        expect.anything(),
+        "child",
+        { type: "approval", data: { elicitation_id: "eli_child", action: "accept" } },
+        "web:test:approval:1",
+      ),
     );
   });
 });

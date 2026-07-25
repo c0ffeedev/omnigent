@@ -366,6 +366,11 @@ def _expire_leave(root_id: str, user_id: str) -> None:
         del users[user_id]
         if not users:
             _viewers.pop(root_id, None)
+        heartbeat_rows = _heartbeats.get(root_id)
+        if heartbeat_rows is not None:
+            heartbeat_rows.pop(user_id, None)
+            if not heartbeat_rows:
+                _heartbeats.pop(root_id, None)
     _broadcast(root_id)
 
 

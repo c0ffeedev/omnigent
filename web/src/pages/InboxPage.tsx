@@ -50,10 +50,11 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { useConversations } from "@/hooks/useConversations";
+import { nextDriverSourceId, postCoordinatedEvent } from "@/lib/coordinatedEvents";
 import { collectInboxItems, type InboxItem, type InboxSource } from "@/lib/inbox";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
-import { approve, getSession } from "@/lib/sessionsApi";
+import { getSession } from "@/lib/sessionsApi";
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
@@ -163,10 +164,18 @@ export function InboxPage() {
         ...prev,
         [elicitationId]: content === undefined ? { action } : { action, content },
       }));
-      void approve(
+      void postCoordinatedEvent(
+        queryClient,
         item.resolveSessionId,
-        elicitationId,
-        content === undefined ? { action } : { action, content },
+        {
+          type: "approval",
+          data: {
+            elicitation_id: elicitationId,
+            action,
+            ...(content === undefined ? {} : { content }),
+          },
+        },
+        nextDriverSourceId("approval"),
       ).then(
         () => {
           void queryClient.invalidateQueries({ queryKey: ["conversations"] });

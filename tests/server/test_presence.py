@@ -141,6 +141,11 @@ async def test_leave_broadcasts_after_grace(monkeypatch: pytest.MonkeyPatch) -> 
     try:
         token = presence.connect(CONV, CONV, ALICE, idle=False)
         await collector.next_event()
+        # The coordination adapter heartbeats while the stream is open.
+        # That TTL entry must not resurrect the viewer after the stream's
+        # authoritative leave grace expires.
+        presence.heartbeat(CONV, CONV, ALICE, ttl_seconds=60)
+        await collector.next_event()
         presence.disconnect(CONV, ALICE, token)
         # Inside the grace window the viewer is still present (frozen),
         # so co-viewers and snapshot-on-connect joiners don't see a

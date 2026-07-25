@@ -59,15 +59,12 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
   ApiError,
-  approve as approveElicitation,
   bindOnlyOnlineRunner,
   createSession,
   getSessionSlim,
   fetchInitialHistoryWindow,
   fetchSessionItemsPage,
-  interrupt as interruptSession,
   openSessionStream,
-  postEvent,
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
@@ -105,6 +102,11 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
 import { isCodexNativeModel } from "@/lib/codexNativeModels";
 import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
+import {
+  applyDriverLeaseToCoordinationCache,
+  applyPresenceToCoordinationCache,
+} from "@/lib/coordinationState";
+import { nextDriverSourceId, postCoordinatedEvent } from "@/lib/coordinatedEvents";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
 
@@ -1123,10 +1125,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ...fileBlocks,
           ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
         ];
-        await postEvent(conversationId, {
-          type: "message",
-          data: { role: "user", content },
-        });
+        await postCoordinatedEvent(
+          queryClient,
+          conversationId,
+          {
+            type: "message",
+            data: { role: "user", content },
+          },
+          nextDriverSourceId("queue", head.queueId),
+        );
       })()
         .catch(() => {
           backgroundFlushCooldownUntil.set(
@@ -1252,13 +1259,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
         }));
       }
 
-      const postResult = await postEvent(sessionId, {
-        type: "message",
-        data: {
-          role: "user",
-          content: serverContent,
+      const postResult = await postCoordinatedEvent(
+        queryClient,
+        sessionId,
+        {
+          type: "message",
+          data: {
+            role: "user",
+            content: serverContent,
+          },
         },
-      });
+        nextDriverSourceId("message", tempId),
+      );
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
@@ -1414,10 +1426,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Same wire shape the REPL sends (repl/_repl.py). The server resolves
       // the skill, persists a visible receipt + hidden `<skill>` meta
       // message, and forwards the meta to the runner.
-      const postResult = await postEvent(sessionId, {
-        type: "slash_command",
-        data: { kind: "skill", name, arguments: args },
-      });
+      const postResult = await postCoordinatedEvent(
+        queryClient,
+        sessionId,
+        {
+          type: "slash_command",
+          data: { kind: "skill", name, arguments: args },
+        },
+        nextDriverSourceId("slash-command"),
+      );
       if (postResult.denied) {
         // Denied commands publish no receipt, so nothing will pop the
         // optimistic echo — roll it back here alongside the status
@@ -1499,7 +1516,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // do NOT abort the local SSE stream — it remains open across
     // turns; switchTo or tab unload is the only thing that tears it
     // down.
-    void interruptSession(sessionId).catch(() => {
+    void postCoordinatedEvent(
+      queryClient,
+      sessionId,
+      { type: "interrupt", data: {} },
+      nextDriverSourceId("interrupt"),
+    ).catch(() => {
       // Interrupt is best-effort. A network failure here means the
       // user's cancel won't reach the server, but the local UI already
       // reflects the user's stop request below.
@@ -1676,10 +1698,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
       ),
     }));
     try {
-      await approveElicitation(
+      await postCoordinatedEvent(
+        queryClient,
         targetSessionId,
-        elicitationId,
-        content === undefined ? { action } : { action, content },
+        {
+          type: "approval",
+          data: {
+            elicitation_id: elicitationId,
+            action,
+            ...(content === undefined ? {} : { content }),
+          },
+        },
+        nextDriverSourceId("approval"),
       );
     } catch {
       // Roll back to pending so the user can retry. Surfacing the
@@ -1717,7 +1747,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
   compact: async () => {
     const { conversationId } = get();
     if (!conversationId) return;
-    await postEvent(conversationId, { type: "compact", data: {} });
+    await postCoordinatedEvent(
+      queryClient,
+      conversationId,
+      { type: "compact", data: {} },
+      nextDriverSourceId("compact"),
+    );
   },
 
   refreshSessionState: async (conversationId) => {
@@ -4199,6 +4234,14 @@ export function handleSessionEvent(event: StreamEvent): void {
       useChatStore.setState((s) =>
         s.conversationId === event.conversationId ? { viewers: event.viewers } : {},
       );
+      if (queryClient && useChatStore.getState().conversationId === event.conversationId) {
+        applyPresenceToCoordinationCache(queryClient, event.conversationId, event.viewers);
+      }
+      return;
+    case "session_driver_lease":
+      if (queryClient) {
+        applyDriverLeaseToCoordinationCache(queryClient, event.conversationId, event.driverLease);
+      }
       return;
     case "session_agent_changed":
       // The session's bound agent was switched in place (switch-agent

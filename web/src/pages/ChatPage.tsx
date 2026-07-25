@@ -56,6 +56,7 @@ import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks/BlockRenderer";
 import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
+import { DriverControl } from "@/components/coordination/DriverControl";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
@@ -1827,6 +1828,9 @@ function MainAgentSurface({
         onReply={(text) => setReplyQuotes((prev) => [...prev, text])}
       />
 
+      {conversationId && (
+        <DriverControl sessionId={conversationId} permissionLevel={permissionLevel} />
+      )}
       <Composer
         disabled={disabled}
         status={status}

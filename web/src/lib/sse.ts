@@ -38,6 +38,7 @@ import type {
   SessionCreatedEvent,
   SessionInputConsumedEvent,
   SessionInterruptedEvent,
+  SessionDriverLeaseEvent,
   SessionPresenceEvent,
   SessionResource,
   SessionResourceCreatedEvent,
@@ -67,6 +68,7 @@ import type {
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
+import { driverLeaseFromWire, type DriverLeaseWire } from "./coordinationApi";
 import type { ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
 
 /**
@@ -809,6 +811,31 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       viewers,
     } satisfies SessionPresenceEvent;
+  }
+  if (eventType === "session.driver_lease") {
+    const conversationId = data.conversation_id;
+    const rawLease = data.driver_lease;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    if (rawLease === null) {
+      return {
+        type: "session_driver_lease",
+        conversationId,
+        driverLease: null,
+      } satisfies SessionDriverLeaseEvent;
+    }
+    if (!rawLease || typeof rawLease !== "object" || Array.isArray(rawLease)) return null;
+    const lease = rawLease as Record<string, unknown>;
+    if (lease.session_id !== conversationId) return null;
+    if (typeof lease.generation !== "number" || typeof lease.active !== "boolean") return null;
+    if (lease.holder_user_id !== null && typeof lease.holder_user_id !== "string") return null;
+    for (const field of ["acquired_at", "renewed_at", "expires_at", "released_at"] as const) {
+      if (lease[field] !== null && typeof lease[field] !== "number") return null;
+    }
+    return {
+      type: "session_driver_lease",
+      conversationId,
+      driverLease: driverLeaseFromWire(lease as unknown as DriverLeaseWire),
+    } satisfies SessionDriverLeaseEvent;
   }
 
   // Embedded-browser action request: asks the desktop relay to run the agent's

@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { coordinationQueryKey } from "@/lib/coordinationState";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
@@ -47,7 +48,12 @@ const fetchMock = vi.fn();
 beforeEach(() => {
   fetchMock.mockReset();
   vi.mocked(useSessionUpdatesConnected).mockReturnValue(false);
-  vi.stubGlobal("fetch", fetchMock);
+  vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input).match(/\/v1\/sessions\/[^/]+\/driver$/)) {
+      return Promise.resolve(mockResponse(null));
+    }
+    return fetchMock(input, init);
+  });
 });
 
 afterEach(() => {
@@ -926,8 +932,37 @@ describe("useStopSession invalidation", () => {
   it("invalidates the conversations list AND the per-session snapshot", async () => {
     // The endpoint answers POST /v1/sessions/{id}/events → {queued:false}.
     fetchMock.mockResolvedValueOnce(mockResponse({ queued: false }));
+    const activeLease = {
+      session_id: "conv_x",
+      holder_user_id: "alice@example.com",
+      generation: 17,
+      acquired_at: 100,
+      renewed_at: 100,
+      expires_at: 1_000,
+      released_at: null,
+      active: true,
+    };
+    vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).match(/\/v1\/sessions\/[^/]+\/driver$/)) {
+        return Promise.resolve(mockResponse(activeLease));
+      }
+      return fetchMock(input, init);
+    });
     const queryClient = new QueryClient({
       defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(coordinationQueryKey("conv_x"), {
+      driverLease: {
+        sessionId: "conv_x",
+        holderUserId: "alice@example.com",
+        generation: 17,
+        acquiredAt: 100,
+        renewedAt: 100,
+        expiresAt: 1_000,
+        releasedAt: null,
+        active: true,
+      },
+      presence: null,
     });
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
     const wrapper = ({ children }: { children: ReactNode }) =>
@@ -936,6 +971,14 @@ describe("useStopSession invalidation", () => {
     const { result } = renderHook(() => useStopSession(), { wrapper });
     result.current.mutate("conv_x");
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const [, stopInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(stopInit.body as string)).toMatchObject({
+      type: "stop_session",
+      data: {},
+      driver_generation: 17,
+      source_id: expect.stringMatching(/^web:.*:stop-session:/),
+    });
 
     // The list refresh keeps the sidebar badge current.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
