@@ -242,6 +242,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
   if (url.match(/\/v1\/sessions\/[^/]+\/events$/)) {
     return mockResponse({ queued: true, item_id: "ci_mock" });
   }
+  if (url.match(/\/v1\/sessions\/[^/]+\/driver$/)) return mockResponse(null);
   // URL-based elicitation resolve endpoint (the approve button's
   // target). Returns the {queued: false} ack the server sends.
   if (url.match(/\/v1\/sessions\/[^/]+\/elicitations\/[^/]+\/resolve$/)) {
@@ -1107,10 +1108,10 @@ describe("chatStore — switchTo", () => {
     await useChatStore.getState().submitApproval("elicit_waiting", "accept");
 
     const childCalls = fetchMock.mock.calls.filter(([u]) =>
-      String(u).endsWith("/v1/sessions/conv_child_waiting/elicitations/elicit_waiting/resolve"),
+      String(u).endsWith("/v1/sessions/conv_child_waiting/events"),
     );
     const parentCalls = fetchMock.mock.calls.filter(([u]) =>
-      String(u).endsWith("/v1/sessions/conv_waiting/elicitations/elicit_waiting/resolve"),
+      String(u).endsWith("/v1/sessions/conv_waiting/events"),
     );
     expect(childCalls).toHaveLength(1);
     expect(parentCalls).toHaveLength(0);
@@ -5045,22 +5046,53 @@ function elicitationBlock(id: string): ElicitationBlock {
 }
 
 describe("chatStore — submitApproval", () => {
-  it("posts the verdict to the elicitation resolve URL and optimistically marks responded", async () => {
+  it("posts a generation-fenced approval event and optimistically marks responded", async () => {
     useChatStore.setState({
       conversationId: "conv_abc",
       blocks: [elicitationBlock("elic_xyz")],
     });
+    client.setQueryData(coordinationQueryKey("conv_abc"), {
+      driverLease: {
+        sessionId: "conv_abc",
+        holderUserId: "alice@example.com",
+        generation: 11,
+        acquiredAt: 100,
+        renewedAt: 100,
+        expiresAt: 1_000,
+        releasedAt: null,
+        active: true,
+      },
+      presence: null,
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).match(/\/v1\/sessions\/conv_abc\/driver$/)) {
+        return mockResponse({
+          session_id: "conv_abc",
+          holder_user_id: "alice@example.com",
+          generation: 11,
+          acquired_at: 100,
+          renewed_at: 100,
+          expires_at: 1_000,
+          released_at: null,
+          active: true,
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
 
     await useChatStore.getState().submitApproval("elic_xyz", "accept");
 
-    // URL-based elicitation: verdict goes to the dedicated resolve
-    // URL (elicitation id in the path), with the bare MCP body.
     const events = fetchMock.mock.calls.filter(([u]) =>
-      String(u).endsWith("/v1/sessions/conv_abc/elicitations/elic_xyz/resolve"),
+      String(u).endsWith("/v1/sessions/conv_abc/events"),
     );
     expect(events).toHaveLength(1);
     const body = JSON.parse((events[0]![1] as RequestInit).body as string);
-    expect(body).toEqual({ action: "accept" });
+    expect(body).toMatchObject({
+      type: "approval",
+      data: { elicitation_id: "elic_xyz", action: "accept" },
+      driver_generation: 11,
+      source_id: expect.stringMatching(/^web:.*:approval:/),
+    });
 
     const block = useChatStore.getState().blocks[0];
     if (block?.type === "elicitation") {
@@ -5081,13 +5113,17 @@ describe("chatStore — submitApproval", () => {
     });
 
     const events = fetchMock.mock.calls.filter(([u]) =>
-      String(u).endsWith("/v1/sessions/conv_abc/elicitations/elic_cmd/resolve"),
+      String(u).endsWith("/v1/sessions/conv_abc/events"),
     );
     expect(events).toHaveLength(1);
     const body = JSON.parse((events[0]![1] as RequestInit).body as string);
     expect(body).toEqual({
-      action: "accept",
-      content: { execpolicy_amendment: amendment },
+      type: "approval",
+      data: {
+        elicitation_id: "elic_cmd",
+        action: "accept",
+        content: { execpolicy_amendment: amendment },
+      },
     });
 
     const block = useChatStore.getState().blocks[0];
@@ -5102,7 +5138,7 @@ describe("chatStore — submitApproval", () => {
     });
   });
 
-  it("posts mirrored child elicitation verdicts to the child session resolve URL", async () => {
+  it("posts mirrored child elicitation verdicts to the child session event URL", async () => {
     useChatStore.setState({
       conversationId: "conv_parent",
       blocks: [{ ...elicitationBlock("elic_child"), targetSessionId: "conv_child" }],
@@ -5111,15 +5147,18 @@ describe("chatStore — submitApproval", () => {
     await useChatStore.getState().submitApproval("elic_child", "accept");
 
     const childCalls = fetchMock.mock.calls.filter(([u]) =>
-      String(u).endsWith("/v1/sessions/conv_child/elicitations/elic_child/resolve"),
+      String(u).endsWith("/v1/sessions/conv_child/events"),
     );
     const parentCalls = fetchMock.mock.calls.filter(([u]) =>
-      String(u).endsWith("/v1/sessions/conv_parent/elicitations/elic_child/resolve"),
+      String(u).endsWith("/v1/sessions/conv_parent/events"),
     );
     expect(childCalls).toHaveLength(1);
     expect(parentCalls).toHaveLength(0);
     const body = JSON.parse((childCalls[0]![1] as RequestInit).body as string);
-    expect(body).toEqual({ action: "accept" });
+    expect(body).toEqual({
+      type: "approval",
+      data: { elicitation_id: "elic_child", action: "accept" },
+    });
   });
 
   it("rolls back to 'pending' when the network call fails", async () => {

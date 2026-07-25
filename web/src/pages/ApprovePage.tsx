@@ -16,11 +16,13 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useParams } from "@/lib/routing";
 import { CheckIcon, MessageCircleQuestionMark, XIcon } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { authenticatedFetch } from "@/lib/identity";
+import { nextDriverSourceId, postCoordinatedEvent } from "@/lib/coordinatedEvents";
 import { formatPreview } from "@/lib/previewFormat";
 
 interface ElicitationData {
@@ -43,6 +45,7 @@ export function ApprovePage() {
     sessionId: string;
     elicitationId: string;
   }>();
+  const queryClient = useQueryClient();
   const [state, setState] = useState<PageState>({ kind: "loading" });
 
   useEffect(() => {
@@ -83,22 +86,17 @@ export function ApprovePage() {
       if (!sessionId || !elicitationId) return;
       setState({ kind: "submitted", action });
       try {
-        const res = await authenticatedFetch(
-          `/v1/sessions/${encodeURIComponent(sessionId)}/elicitations/${encodeURIComponent(elicitationId)}/resolve`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ action }),
-          },
+        await postCoordinatedEvent(
+          queryClient,
+          sessionId,
+          { type: "approval", data: { elicitation_id: elicitationId, action } },
+          nextDriverSourceId("approval"),
         );
-        if (!res.ok) {
-          setState({ kind: "error", message: `Resolve failed: ${res.status}` });
-        }
       } catch (err) {
         setState({ kind: "error", message: `Network error: ${String(err)}` });
       }
     },
-    [sessionId, elicitationId],
+    [queryClient, sessionId, elicitationId],
   );
 
   return (

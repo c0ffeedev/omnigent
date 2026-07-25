@@ -28,7 +28,7 @@ import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
-import { stopSession } from "@/lib/sessionsApi";
+import { nextDriverSourceId, postCoordinatedEvent } from "@/lib/coordinatedEvents";
 import {
   createProject as apiCreateProject,
   deleteProject as apiDeleteProject,
@@ -561,7 +561,12 @@ export function useStopAndDeleteConversation() {
   return useMutation({
     mutationFn: async ({ id, deleteBranch = false }: { id: string; deleteBranch?: boolean }) => {
       try {
-        await stopSession(id);
+        await postCoordinatedEvent(
+          queryClient,
+          id,
+          { type: "stop_session", data: {} },
+          nextDriverSourceId("stop-session"),
+        );
       } catch {
         // Best-effort: proceed with delete even if the stop didn't land.
       }
@@ -615,7 +620,13 @@ export function useStopAndDeleteConversation() {
 export function useStopSession() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => stopSession(id),
+    mutationFn: (id: string) =>
+      postCoordinatedEvent(
+        queryClient,
+        id,
+        { type: "stop_session", data: {} },
+        nextDriverSourceId("stop-session"),
+      ),
     onSuccess: (_data, id) => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["session", id] });
@@ -674,7 +685,12 @@ export function useBulkDeleteConversations() {
       const results = await Promise.allSettled(
         ids.map(async (id) => {
           try {
-            await stopSession(id);
+            await postCoordinatedEvent(
+              queryClient,
+              id,
+              { type: "stop_session", data: {} },
+              nextDriverSourceId("stop-session"),
+            );
           } catch {
             // Best-effort stop
           }
@@ -746,7 +762,16 @@ export function useBulkStopSessions() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (ids: string[]) => {
-      const results = await Promise.allSettled(ids.map((id) => stopSession(id)));
+      const results = await Promise.allSettled(
+        ids.map((id) =>
+          postCoordinatedEvent(
+            queryClient,
+            id,
+            { type: "stop_session", data: {} },
+            nextDriverSourceId("stop-session"),
+          ),
+        ),
+      );
       const succeeded: string[] = [];
       const failed: string[] = [];
       for (let i = 0; i < results.length; i++) {

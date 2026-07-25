@@ -59,14 +59,12 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
   ApiError,
-  approve as approveElicitation,
   bindOnlyOnlineRunner,
   createSession,
   getSessionSlim,
   fetchInitialHistoryWindow,
   fetchSessionItemsPage,
   openSessionStream,
-  postEvent,
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
@@ -95,7 +93,6 @@ import type {
   PendingInput,
   SandboxStatus,
   Session,
-  SessionEventInput,
   SessionStatus,
   SkillSummary,
 } from "@/lib/types";
@@ -108,9 +105,8 @@ import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
 import {
   applyDriverLeaseToCoordinationCache,
   applyPresenceToCoordinationCache,
-  coordinationQueryKey,
-  type CoordinationSnapshot,
 } from "@/lib/coordinationState";
+import { nextDriverSourceId, postCoordinatedEvent } from "@/lib/coordinatedEvents";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
 
@@ -683,33 +679,6 @@ export interface ChatState {
 }
 
 let queryClient: QueryClient | null = null;
-const driverSourceClientId =
-  typeof globalThis.crypto?.randomUUID === "function"
-    ? globalThis.crypto.randomUUID()
-    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-let driverSourceSequence = 0;
-
-function nextDriverSourceId(kind: string): string {
-  driverSourceSequence += 1;
-  return `web:${driverSourceClientId}:${kind}:${driverSourceSequence}`;
-}
-
-/** Attach the current authoritative lease token to turn-controlling events. */
-function postCoordinatedEvent(
-  sessionId: string,
-  event: SessionEventInput,
-  sourceId: string,
-): ReturnType<typeof postEvent> {
-  const lease = queryClient?.getQueryData<CoordinationSnapshot>(
-    coordinationQueryKey(sessionId),
-  )?.driverLease;
-  return postEvent(
-    sessionId,
-    lease?.active === true
-      ? { ...event, driver_generation: lease.generation, source_id: sourceId }
-      : event,
-  );
-}
 
 // Catalogs that resolved while their bind snapshot was still hydrating.
 const racedNativeModelOptions = new Map<string, NativeModelOption[]>();
@@ -1157,12 +1126,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
         ];
         await postCoordinatedEvent(
+          queryClient,
           conversationId,
           {
             type: "message",
             data: { role: "user", content },
           },
-          `web:${driverSourceClientId}:queue:${head.queueId}`,
+          nextDriverSourceId("queue", head.queueId),
         );
       })()
         .catch(() => {
@@ -1290,6 +1260,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
 
       const postResult = await postCoordinatedEvent(
+        queryClient,
         sessionId,
         {
           type: "message",
@@ -1298,7 +1269,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             content: serverContent,
           },
         },
-        `web:${driverSourceClientId}:message:${tempId}`,
+        nextDriverSourceId("message", tempId),
       );
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
@@ -1456,6 +1427,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // the skill, persists a visible receipt + hidden `<skill>` meta
       // message, and forwards the meta to the runner.
       const postResult = await postCoordinatedEvent(
+        queryClient,
         sessionId,
         {
           type: "slash_command",
@@ -1545,6 +1517,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // turns; switchTo or tab unload is the only thing that tears it
     // down.
     void postCoordinatedEvent(
+      queryClient,
       sessionId,
       { type: "interrupt", data: {} },
       nextDriverSourceId("interrupt"),
@@ -1725,10 +1698,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
       ),
     }));
     try {
-      await approveElicitation(
+      await postCoordinatedEvent(
+        queryClient,
         targetSessionId,
-        elicitationId,
-        content === undefined ? { action } : { action, content },
+        {
+          type: "approval",
+          data: {
+            elicitation_id: elicitationId,
+            action,
+            ...(content === undefined ? {} : { content }),
+          },
+        },
+        nextDriverSourceId("approval"),
       );
     } catch {
       // Roll back to pending so the user can retry. Surfacing the
@@ -1767,6 +1748,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const { conversationId } = get();
     if (!conversationId) return;
     await postCoordinatedEvent(
+      queryClient,
       conversationId,
       { type: "compact", data: {} },
       nextDriverSourceId("compact"),

@@ -1,7 +1,7 @@
 // Tests for the standalone URL-mode ApprovePage
 // (`/approve/:sessionId/:elicitationId`). The page is driven entirely by a
-// single `authenticatedFetch` helper (mocked here) for both the initial GET
-// and the resolve POST, and by route params via react-router (a real
+// `authenticatedFetch` for the initial GET and `postCoordinatedEvent` for the
+// fenced approval event. Route params come from react-router (a real
 // MemoryRouter + Route supplies them, since `@/lib/routing` falls back to
 // react-router-dom). Each test pins one of the page's state-machine branches:
 // loading, pending, resolved, submitted (approve/reject), and the error paths
@@ -9,12 +9,18 @@
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApprovePage } from "./ApprovePage";
+import * as coordinatedEvents from "@/lib/coordinatedEvents";
 import * as identity from "@/lib/identity";
 
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
+}));
+vi.mock("@/lib/coordinatedEvents", () => ({
+  nextDriverSourceId: vi.fn(() => "web:test:approval:1"),
+  postCoordinatedEvent: vi.fn(),
 }));
 
 /** A Response-like stub: only `ok`, `status`, and `json()` are read. */
@@ -28,12 +34,17 @@ function jsonResponse(body: unknown, { ok = true, status = 200 } = {}): Response
 
 /** Render the page at a concrete `/approve/:sessionId/:elicitationId` route. */
 function renderPage(sessionId = "sess_1", elicitationId = "eli_1") {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   return render(
-    <MemoryRouter initialEntries={[`/approve/${sessionId}/${elicitationId}`]}>
-      <Routes>
-        <Route path="/approve/:sessionId/:elicitationId" element={<ApprovePage />} />
-      </Routes>
-    </MemoryRouter>,
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={[`/approve/${sessionId}/${elicitationId}`]}>
+        <Routes>
+          <Route path="/approve/:sessionId/:elicitationId" element={<ApprovePage />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 
@@ -44,6 +55,7 @@ afterEach(() => {
 
 describe("ApprovePage states", () => {
   beforeEach(() => {
+    vi.mocked(coordinatedEvents.postCoordinatedEvent).mockResolvedValue({ queued: false });
     // Default: a never-resolving fetch so the initial render is observable
     // before any test overrides the resolution.
     vi.mocked(identity.authenticatedFetch).mockReturnValue(new Promise(() => {}));
@@ -104,56 +116,49 @@ describe("ApprovePage states", () => {
 
 describe("ApprovePage submission", () => {
   beforeEach(() => {
-    // First call (GET) returns a pending prompt; later calls (POST) are set
-    // per-test below.
+    vi.mocked(coordinatedEvents.postCoordinatedEvent).mockResolvedValue({ queued: false });
     vi.mocked(identity.authenticatedFetch).mockResolvedValue(
       jsonResponse({ status: "pending", message: "Run the migration?" }),
     );
   });
 
-  it("approves: posts accept and shows the Approved confirmation", async () => {
-    // WHY: clicking Approve POSTs `{action: "accept"}` to the resolve endpoint
-    // and lands on the `submitted` (Approved) state.
+  it("approves: posts a fenced accept event and shows the Approved confirmation", async () => {
     renderPage("sess_a", "eli_a");
     fireEvent.click(await screen.findByRole("button", { name: /Approve/ }));
 
     await waitFor(() => expect(screen.getByText("Approved")).toBeInTheDocument());
-    const resolveCall = vi
-      .mocked(identity.authenticatedFetch)
-      .mock.calls.find(([url]) => String(url).includes("/resolve"));
-    expect(resolveCall).toBeDefined();
-    expect(String(resolveCall![0])).toContain("/v1/sessions/sess_a/elicitations/eli_a/resolve");
-    expect(JSON.parse(String(resolveCall![1]!.body))).toEqual({ action: "accept" });
+    expect(coordinatedEvents.postCoordinatedEvent).toHaveBeenCalledWith(
+      expect.any(QueryClient),
+      "sess_a",
+      { type: "approval", data: { elicitation_id: "eli_a", action: "accept" } },
+      "web:test:approval:1",
+    );
   });
 
-  it("rejects: posts decline and shows the Rejected confirmation", async () => {
-    // WHY: clicking Reject POSTs `{action: "decline"}` and lands on the
-    // `submitted` (Rejected) state.
+  it("rejects: posts a fenced decline event and shows the Rejected confirmation", async () => {
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: /Reject/ }));
 
     await waitFor(() => expect(screen.getByText("Rejected")).toBeInTheDocument());
-    const resolveCall = vi
-      .mocked(identity.authenticatedFetch)
-      .mock.calls.find(([url]) => String(url).includes("/resolve"));
-    expect(JSON.parse(String(resolveCall![1]!.body))).toEqual({ action: "decline" });
+    expect(coordinatedEvents.postCoordinatedEvent).toHaveBeenCalledWith(
+      expect.any(QueryClient),
+      "sess_1",
+      { type: "approval", data: { elicitation_id: "eli_1", action: "decline" } },
+      "web:test:approval:1",
+    );
   });
 
-  it("shows a resolve error when the POST returns a non-ok status", async () => {
-    // WHY: a failed resolve POST routes to the `error` branch with the status.
-    vi.mocked(identity.authenticatedFetch)
-      .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
-      .mockResolvedValueOnce(jsonResponse(null, { ok: false, status: 409 }));
+  it("shows an error when the coordinated approval is rejected", async () => {
+    vi.mocked(coordinatedEvents.postCoordinatedEvent).mockRejectedValueOnce(
+      new Error("Driver lease conflict: 409"),
+    );
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: /Approve/ }));
-    expect(await screen.findByText("Resolve failed: 409")).toBeInTheDocument();
+    expect(await screen.findByText(/Driver lease conflict: 409/)).toBeInTheDocument();
   });
 
-  it("shows a network error when the resolve POST throws", async () => {
-    // WHY: a thrown resolve POST routes to the `error` branch (network error).
-    vi.mocked(identity.authenticatedFetch)
-      .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
-      .mockRejectedValueOnce(new Error("boom"));
+  it("shows a network error when the coordinated event throws", async () => {
+    vi.mocked(coordinatedEvents.postCoordinatedEvent).mockRejectedValueOnce(new Error("boom"));
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: /Reject/ }));
     expect(await screen.findByText(/Network error:/)).toBeInTheDocument();
