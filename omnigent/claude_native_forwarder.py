@@ -29,6 +29,7 @@ from omnigent.claude_native_bridge import (
     ClaudeTranscriptItem,
     HookReadResult,
     TranscriptReadResult,
+    _strip_inline_image_data,
     compute_transcript_cumulative_cost,
     read_active_session_id,
     read_bridge_id,
@@ -4383,7 +4384,11 @@ async def _persist_native_compaction_item(
         if claude_sid:
             msgs = get_session_messages(claude_sid)
             compacted_messages = [
-                {"type": "message", "role": m.type, "content": m.message.get("content", [])}
+                {
+                    "type": "message",
+                    "role": m.type,
+                    "content": _strip_inline_image_data(m.message.get("content", [])),
+                }
                 for m in msgs
                 if isinstance(m.message, dict)
             ]

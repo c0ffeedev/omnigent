@@ -6336,6 +6336,80 @@ async def test_persist_native_compaction_item_posts_compaction_event(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_persist_native_compaction_item_strips_inline_base64(tmp_path: Path) -> None:
+    """Compaction persistence drops inline image bytes before storing replay context."""
+    get_response = MagicMock()
+    get_response.raise_for_status = MagicMock()
+    get_response.json.return_value = {"data": [{"id": "item_123"}]}
+    post_response = MagicMock()
+    post_response.raise_for_status = MagicMock()
+    client = AsyncMock()
+    client.get.return_value = get_response
+    client.post.return_value = post_response
+
+    fake_msg = MagicMock()
+    fake_msg.type = "user"
+    fake_msg.message = {
+        "content": [
+            {
+                "type": "tool_result",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "sensitive-image-bytes",
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+
+    with (
+        patch(
+            "omnigent.claude_native_forwarder.read_claude_session_id",
+            return_value="claude-uuid-1",
+        ),
+        patch(
+            "claude_agent_sdk.get_session_messages",
+            return_value=[fake_msg],
+        ),
+    ):
+        await _persist_native_compaction_item(
+            client,
+            session_id="conv_test",
+            bridge_dir=tmp_path / "bridge",
+        )
+
+    body = client.post.call_args.kwargs["json"]
+    serialized = json.dumps(body)
+    assert "sensitive-image-bytes" not in serialized
+    assert body["data"]["compacted_messages"] == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "[image/png image omitted from history to save context — "
+                                "re-run the tool call above "
+                                "(e.g. Read the same path) to view it again]"
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_persist_native_compaction_item_empty_items_uses_fallback(tmp_path: Path) -> None:
     """
     When no items exist, ``last_item_id`` falls back to a generated boundary id.
