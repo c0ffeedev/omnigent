@@ -32,6 +32,124 @@ def _migrate(engine: sa.Engine, uri: str, revision: str, *, downgrade: bool = Fa
         operation(config, revision)
 
 
+def _stamp(engine: sa.Engine, uri: str, revision: str) -> None:
+    config = _build_alembic_config(uri)
+    with engine.begin() as connection:
+        config.attributes["connection"] = connection
+        command.stamp(config, revision)
+
+
+def test_driver_outbox_migration_repairs_deployed_legacy_schema(tmp_path: Path) -> None:
+    """Upgrade repairs the pre-release schema already stamped at the merged head."""
+    uri = f"sqlite:///{tmp_path / 'legacy-driver-outbox.db'}"
+    engine = sa.create_engine(uri)
+    dispatch_id = bytes.fromhex("212233445566478890abcdef12345678")
+    session_id = bytes.fromhex("112233445566478890abcdef12345678")
+    try:
+        _migrate(engine, uri, _PRIOR_REVISION)
+        metadata = sa.MetaData()
+        events = sa.Table(
+            "session_driver_events",
+            metadata,
+            sa.Column("workspace_id", sa.Integer(), nullable=False),
+            sa.Column("id", sa.LargeBinary(16), nullable=False),
+            sa.Column("session_id", sa.LargeBinary(16), nullable=False),
+            sa.Column("event_type", sa.String(32), nullable=False),
+            sa.Column("actor_user_id", sa.String(128), nullable=True),
+            sa.Column("holder_user_id", sa.String(128), nullable=True),
+            sa.Column("previous_holder_user_id", sa.String(128), nullable=True),
+            sa.Column("generation", sa.Integer(), nullable=False),
+            sa.Column("input_type", sa.String(64), nullable=True),
+            sa.Column("created_at", sa.Integer(), nullable=False),
+            sa.PrimaryKeyConstraint("workspace_id", "id"),
+        )
+        dispatches = sa.Table(
+            "session_driver_dispatches",
+            metadata,
+            sa.Column("workspace_id", sa.Integer(), nullable=False),
+            sa.Column("id", sa.LargeBinary(16), nullable=False),
+            sa.Column("session_id", sa.LargeBinary(16), nullable=False),
+            sa.Column("actor_user_id", sa.String(128), nullable=False),
+            sa.Column("generation", sa.Integer(), nullable=False),
+            sa.Column("input_type", sa.String(64), nullable=False),
+            sa.Column("state", sa.String(16), nullable=False),
+            sa.Column("created_at", sa.Integer(), nullable=False),
+            sa.Column("completed_at", sa.Integer(), nullable=True),
+            sa.Column("claim_expires_at", sa.Integer(), nullable=True),
+            sa.CheckConstraint(
+                "generation > 0", name="ck_session_driver_dispatches_generation_positive"
+            ),
+            sa.CheckConstraint(
+                "state IN ('running', 'completed', 'failed')",
+                name="ck_session_driver_dispatches_state",
+            ),
+            sa.CheckConstraint(
+                "(state = 'running' AND completed_at IS NULL AND claim_expires_at IS NOT NULL) "
+                "OR (state IN ('completed', 'failed') AND completed_at IS NOT NULL "
+                "AND claim_expires_at IS NULL)",
+                name="ck_session_driver_dispatches_lifecycle",
+            ),
+            sa.PrimaryKeyConstraint("workspace_id", "id"),
+        )
+        metadata.create_all(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                events.insert().values(
+                    workspace_id=0,
+                    id=bytes.fromhex("312233445566478890abcdef12345678"),
+                    session_id=session_id,
+                    event_type="acquired",
+                    actor_user_id="alice@example.com",
+                    holder_user_id="alice@example.com",
+                    previous_holder_user_id=None,
+                    generation=1,
+                    input_type="message",
+                    created_at=100,
+                )
+            )
+            connection.execute(
+                dispatches.insert().values(
+                    workspace_id=0,
+                    id=dispatch_id,
+                    session_id=session_id,
+                    actor_user_id="alice@example.com",
+                    generation=1,
+                    input_type="message",
+                    state="running",
+                    created_at=100,
+                    completed_at=None,
+                    claim_expires_at=130,
+                )
+            )
+        _stamp(engine, uri, _THIS_REVISION)
+
+        _migrate(engine, uri, _OUTBOX_REVISION)
+
+        inspector = sa.inspect(engine)
+        assert "source_id" in {column["name"] for column in inspector.get_columns(events.name)}
+        dispatch_columns = {
+            column["name"]: column for column in inspector.get_columns(dispatches.name)
+        }
+        assert {
+            "payload_json",
+            "event_id",
+            "source_id",
+            "effect_id",
+            "consumer_token",
+            "consumer_generation",
+        } <= dispatch_columns.keys()
+        repaired_dispatches = sa.Table(dispatches.name, sa.MetaData(), autoload_with=engine)
+        with engine.connect() as connection:
+            repaired = connection.execute(sa.select(repaired_dispatches)).mappings().one()
+        assert repaired["state"] == "failed"
+        assert repaired["completed_at"] is not None
+        assert repaired["claim_expires_at"] is None
+        assert repaired["consumer_generation"] == 1
+        assert repaired["source_id"] == f"legacy:{dispatch_id.hex()}"
+    finally:
+        engine.dispose()
+
+
 def test_driver_lease_migration_round_trip(tmp_path: Path) -> None:
     """Upgrade creates lease/fencing schema and downgrade removes it."""
     uri = f"sqlite:///{tmp_path / 'driver-lease.db'}"
@@ -195,6 +313,7 @@ def test_driver_outbox_migration_preserves_claims_and_round_trips_pending_work(
     running_id = bytes.fromhex("212233445566478890abcdef12345678")
     pending_id = bytes.fromhex("312233445566478890abcdef12345678")
     executing_id = bytes.fromhex("412233445566478890abcdef12345678")
+    failed_id = bytes.fromhex("a12233445566478890abcdef12345678")
     try:
         _migrate(engine, uri, _THIS_REVISION)
         dispatches = sa.Table(
@@ -285,6 +404,24 @@ def test_driver_outbox_migration_preserves_claims_and_round_trips_pending_work(
                         "completed_at": None,
                         "claim_expires_at": 132,
                     },
+                    {
+                        "workspace_id": 0,
+                        "id": failed_id,
+                        "session_id": session_id,
+                        "actor_user_id": "alice@example.com",
+                        "generation": 1,
+                        "input_type": "message",
+                        "payload_json": '{"data":{"text":"failed"},"type":"message"}',
+                        "event_id": bytes.fromhex("b12233445566478890abcdef12345678"),
+                        "source_id": "failed-unclaimed-work",
+                        "effect_id": "effect-failed-unclaimed",
+                        "consumer_token": None,
+                        "consumer_generation": 0,
+                        "state": "failed",
+                        "created_at": 103,
+                        "completed_at": 104,
+                        "claim_expires_at": None,
+                    },
                 ],
             )
 
@@ -305,6 +442,9 @@ def test_driver_outbox_migration_preserves_claims_and_round_trips_pending_work(
         assert rows["pending-work"]["consumer_token"] is not None
         assert rows["pending-work"]["consumer_generation"] == 1
         assert rows["pending-work"]["completed_at"] >= 101
+        assert rows["failed-unclaimed-work"]["state"] == "failed"
+        assert rows["failed-unclaimed-work"]["consumer_token"] is not None
+        assert rows["failed-unclaimed-work"]["consumer_generation"] == 1
 
         _migrate(engine, uri, _OUTBOX_REVISION)
         dispatches = sa.Table(
